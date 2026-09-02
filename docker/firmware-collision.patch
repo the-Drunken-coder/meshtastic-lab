@@ -1,0 +1,33 @@
+diff --git a/variants/native/portduino/platformio.ini b/variants/native/portduino/platformio.ini
+--- a/variants/native/portduino/platformio.ini
++++ b/variants/native/portduino/platformio.ini
+@@ -12,8 +12,9 @@ build_src_filter = ${portduino_base.build_src_filter}
+ [env:native]
+ extends = native_base
+ ; The pkg-config commands below optionally add link flags.
+ ; the || : is just a "or run the null command" to avoid returning an error code
+ build_flags = ${native_base.build_flags}
++  -DUSERPREFS_SIMRADIO_EMULATE_COLLISIONS=1
+   !pkg-config --libs libulfius --silence-errors || :
+   !pkg-config --libs openssl --silence-errors || :
+   !pkg-config --cflags --libs sdl2 --silence-errors || :
+diff --git a/src/platform/portduino/SimRadio.cpp b/src/platform/portduino/SimRadio.cpp
+--- a/src/platform/portduino/SimRadio.cpp
++++ b/src/platform/portduino/SimRadio.cpp
+@@ -258,6 +258,6 @@ void SimRadio::startReceive(meshtastic_MeshPacket *p)
+         LOG_WARN("Collision detected, dropping current and previous packet!");
+         rxBad++;
+-        airTime->logAirtime(RX_ALL_LOG, getPacketTime(receivingPacket, true));
++        airTime->logAirtime(RX_ALL_LOG, RadioInterface::getPacketTime(receivingPacket, true));
+         packetPool.release(receivingPacket);
+         receivingPacket = nullptr;
+         return;
+@@ -275,7 +275,7 @@ void SimRadio::startReceive(meshtastic_MeshPacket *p)
+     }
+     isReceiving = true;
+     receivingPacket = packetPool.allocCopy(*p);
+-    uint32_t airtimeMsec = getPacketTime(p, true);
++    uint32_t airtimeMsec = RadioInterface::getPacketTime(p, true);
+     notifyLater(airtimeMsec, ISR_RX, false); // Model the time it is busy receiving
+ #else
+     isReceiving = true;

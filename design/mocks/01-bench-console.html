@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Meshtastic Lab Mock 1: Bench Console</title><link rel="stylesheet" href="base.css">
+  <style>
+    .app{min-width:1080px;min-height:100vh;display:grid;grid-template-rows:46px 1fr 220px}
+    header{display:flex;align-items:center;gap:16px;padding:0 14px;border-bottom:1px solid var(--line-strong);background:var(--panel)}
+    header h1{margin:0;font-size:16px} header .state{margin-left:auto;font-weight:700}
+    .workspace{display:grid;grid-template-columns:230px minmax(540px,1fr) 250px;min-height:0}
+    aside{border-right:1px solid var(--line-strong);background:var(--panel)} .right{border:0;border-left:1px solid var(--line-strong)}
+    .block{padding:11px;border-bottom:1px solid var(--line)} .block .section-title{margin-bottom:9px}
+    .fields{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions{display:flex;gap:6px;flex-wrap:wrap}
+    main{display:grid;grid-template-rows:auto 1fr;min-height:0}.matrix-wrap{padding:12px;border-bottom:1px solid var(--line-strong)}
+    .matrix-head{display:flex;align-items:center;margin-bottom:8px}.matrix-head .actions{margin-left:auto}
+    .metrics{display:grid;grid-template-columns:1fr 1fr}.metric{padding:9px 10px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+    .log{background:#20211c;color:#d8dbc9;font:11px/1.5 "SFMono-Regular",monospace;padding:9px;height:124px;overflow:hidden}
+    .bottom{display:grid;grid-template-columns:320px 1fr;border-top:1px solid var(--line-strong);background:var(--panel);min-height:0}
+    .traffic{border-right:1px solid var(--line-strong);padding:10px}.traffic-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin:9px 0}
+    .events{min-width:0}.event-head{display:flex;align-items:center;gap:7px;padding:8px;border-bottom:1px solid var(--line)}.event-head select{width:140px}
+  </style>
+</head><body><div class="app">
+  <header><h1>Meshtastic Lab</h1><span class="mono muted">three-node-relay.json</span><span class="mono">fw 2.7.26 · collision/native</span><span class="state ok"><span class="status-dot"></span>RUNNING</span><button disabled>Start</button><button class="danger">Stop</button><button>Reset</button></header>
+  <div class="workspace">
+    <aside>
+      <section class="block"><h2 class="section-title">RF configuration</h2><div class="fields">
+        <div class="field"><label>Nodes</label><input value="3" disabled></div><div class="field"><label>Region</label><select disabled><option>US</option></select></div>
+        <div class="field"><label>Preset</label><select disabled><option>LONG_FAST</option></select></div><div class="field"><label>Slot</label><input value="20" disabled></div>
+        <div class="field"><label>Hop limit</label><input value="4" disabled></div><div class="field"><label>Channel</label><input value="Simulator" disabled></div>
+      </div><p class="muted">Stop to edit identities, RF, and channel settings.</p></section>
+      <section class="block"><h2 class="section-title">Node roles</h2><table><tbody><tr><td>Node 1</td><td>CLIENT</td></tr><tr><td>Node 2</td><td>ROUTER</td></tr><tr><td>Node 3</td><td>CLIENT</td></tr></tbody></table></section>
+      <section class="block"><h2 class="section-title">Startup</h2><div class="ok">Configuration verified</div><div class="muted">3 processes · 3 gateways</div></section>
+    </aside>
+    <main>
+      <section class="matrix-wrap"><div class="matrix-head"><div><h2 class="section-title">Directed RF matrix</h2><span class="muted">row transmits, column receives</span></div><div class="actions"><button>Full mesh</button><button class="primary">Line</button><button>Star</button><button>Isolate</button></div></div>
+        <table class="matrix"><thead><tr><th>TX \ RX</th><th>Node 1</th><th>Node 2</th><th>Node 3</th></tr></thead><tbody>
+          <tr><th>Node 1</th><td class="diag">·</td><td><button class="toggle on">ON</button></td><td><button class="toggle">OFF</button></td></tr>
+          <tr><th>Node 2</th><td><button class="toggle on">ON</button></td><td class="diag">·</td><td><button class="toggle on focus-note">ON</button></td></tr>
+          <tr><th>Node 3</th><td><button class="toggle">OFF</button></td><td><button class="toggle on">ON</button></td><td class="diag">·</td></tr>
+        </tbody></table><div class="ok" style="margin-top:7px">Link node-2 → node-3 restored at 14:32:18</div>
+      </section>
+      <section class="scroll"><table><thead><tr><th>Node</th><th>Role</th><th>Firmware</th><th>Gateway</th><th>Client</th><th>Endpoint</th><th>TX</th><th>RX</th><th>Util</th></tr></thead><tbody>
+        <tr><td><b>Node 1</b></td><td>CLIENT</td><td class="ok">RUNNING</td><td class="ok">RUNNING</td><td>connected</td><td class="mono">127.0.0.1:45001 <button>Copy</button></td><td>18</td><td>11</td><td>3.2%</td></tr>
+        <tr><td><b>Node 2</b></td><td>ROUTER</td><td class="ok">RUNNING</td><td class="ok">RUNNING</td><td>disconnected</td><td class="mono">127.0.0.1:45002 <button>Copy</button></td><td>25</td><td>21</td><td>4.8%</td></tr>
+        <tr><td><b>Node 3</b></td><td>CLIENT</td><td class="ok">RUNNING</td><td class="ok">RUNNING</td><td>connected</td><td class="mono">127.0.0.1:45003 <button>Copy</button></td><td>12</td><td>10</td><td>2.9%</td></tr>
+      </tbody></table></section>
+    </main>
+    <aside class="right"><section class="block"><h2 class="section-title">Run metrics</h2></section><div class="metrics">
+      <div class="metric"><div class="metric-value">20</div><div class="metric-label">Generated</div></div><div class="metric"><div class="metric-value">18</div><div class="metric-label">Delivered</div></div>
+      <div class="metric"><div class="metric-value">90%</div><div class="metric-label">Delivery</div></div><div class="metric"><div class="metric-value">16/18</div><div class="metric-label">ACK success</div></div>
+      <div class="metric"><div class="metric-value">812ms</div><div class="metric-label">Median</div></div><div class="metric"><div class="metric-value">2.4s</div><div class="metric-label">P95</div></div>
+      <div class="metric"><div class="metric-value">N/A</div><div class="metric-label">P99</div></div><div class="metric"><div class="metric-value">47</div><div class="metric-label">RF TX</div></div>
+      <div class="metric"><div class="metric-value">12</div><div class="metric-label">Relays</div></div><div class="metric"><div class="metric-value">0</div><div class="metric-label">Bad RX</div></div>
+    </div><section class="block"><h2 class="section-title">Node 2 daemon</h2></section><div class="log">[Router] rebroadcast 0x9a8311<br>[SimRadio] TX complete 518ms<br>[ServerAPI] packet to phone<br>[Router] ACK request 18</div></aside>
+  </div>
+  <div class="bottom"><section class="traffic"><h2 class="section-title">Traffic run</h2><div class="traffic-grid">
+    <div class="field"><label>Mode</label><select><option>Direct text</option></select></div><div class="field"><label>Destination</label><select><option>Round robin</option></select></div>
+    <div class="field"><label>Messages/min</label><input value="12"></div><div class="field"><label>Payload bytes</label><input value="48"></div>
+    <div class="field"><label>Duration</label><input value="60s"></div><div class="field"><label>Seed</label><input value="731"></div>
+  </div><div class="actions"><button class="primary">Start run</button><button disabled>Stop run</button><label><input type="checkbox" checked style="width:auto;min-height:auto"> Request ACK</label></div></section>
+  <section class="events scroll"><div class="event-head"><h2 class="section-title">Packet events</h2><select><option>All nodes</option></select><select><option>All events</option></select><span class="muted">247 retained</span></div>
+    <table><thead><tr><th>Time</th><th>Event</th><th>TX</th><th>Destination</th><th>RX</th><th>Packet</th><th>Seq</th><th>Hops</th><th>RSSI/SNR</th><th>Result</th></tr></thead><tbody>
+      <tr><td>14:32:19.114</td><td>rf_transmit</td><td>node-2</td><td>node-3</td><td>node-3</td><td class="mono">9a8311</td><td>18</td><td>3/4</td><td>-85 / 8</td><td class="ok">delivered</td></tr>
+      <tr><td>14:32:18.006</td><td>link_updated</td><td>node-2</td><td>node-3</td><td>node-3</td><td>·</td><td>·</td><td>·</td><td>·</td><td class="ok">enabled</td></tr>
+      <tr><td>14:32:16.782</td><td>link_disabled</td><td>node-2</td><td>node-3</td><td>·</td><td class="mono">9a830d</td><td>17</td><td>3/4</td><td>·</td><td class="bad">dropped</td></tr>
+    </tbody></table></section></div>
+</div></body></html>

@@ -1,0 +1,50 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  --bg: #f3f0e8;
+  --panel: #fffef9;
+  --ink: #20211c;
+  --muted: #66685f;
+  --line: #c9c8be;
+  --line-strong: #77796e;
+  --accent: #e46f2e;
+  --ok: #276d46;
+  --warn: #9a5b08;
+  --bad: #a7352c;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); }
+button, input, select { font: inherit; color: inherit; }
+button, input, select {
+  min-height: 28px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--panel);
+}
+button { padding: 4px 10px; font-weight: 650; cursor: pointer; }
+button.primary { background: var(--ink); color: #fff; }
+button.danger { color: var(--bad); border-color: var(--bad); }
+input, select { padding: 4px 7px; width: 100%; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 7px; text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.muted { color: var(--muted); }
+.status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: currentColor; }
+.section-title { margin: 0; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; }
+.field { display: grid; gap: 4px; }
+.field label { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.toggle { width: 24px; height: 20px; min-height: 20px; padding: 0; font-size: 11px; }
+.toggle.on { background: var(--ok); border-color: var(--ok); color: white; }
+.matrix th, .matrix td { padding: 5px; text-align: center; }
+.matrix th:first-child { text-align: left; }
+.diag { color: var(--line-strong); background: color-mix(in srgb, var(--line) 25%, transparent); }
+.metric-value { font: 700 18px "SFMono-Regular", Consolas, monospace; }
+.metric-label { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.scroll { overflow: auto; }
+.focus-note { outline: 2px solid #2274d4; outline-offset: 1px; }

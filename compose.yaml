@@ -1,0 +1,15 @@
+services:
+  meshtastic-lab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: meshtastic-lab:0.1.0
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:45001-45010:45001-45010"
+    volumes:
+      - meshtastic-lab-data:/data
+    stop_grace_period: 20s
+
+volumes:
+  meshtastic-lab-data:
