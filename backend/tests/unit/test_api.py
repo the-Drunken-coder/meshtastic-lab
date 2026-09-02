@@ -7,7 +7,7 @@ from backend.app.main import create_app
 from backend.app.metrics import EventBroker
 from backend.app.models import default_scenario
 from backend.app.runtime import ProcessRecord
-from backend.app.simulator import SimulatorService
+from backend.app.simulator import LifecycleState, SimulatorService
 from backend.app.traffic import TrafficController, TrafficRunRequest
 
 
@@ -103,30 +103,42 @@ def test_unpersisted_terminal_result_survives_cleanup_and_exports(tmp_path: Path
         settle_seconds=0,
     )
 
-    async def finish_and_cleanup() -> str:
+    async def finish_replace_and_cleanup() -> tuple[str, str]:
         if service.traffic is None:
             raise AssertionError("traffic controller missing")
-        run_id = service.traffic.start(
-            TrafficRunRequest(
-                sourceNodes=["node-1"],
-                messagesPerMinute=600,
-                durationSeconds=0.01,
-                payloadBytes=64,
-            )
-        )
-        result = await service.traffic.wait(deadline_seconds=2)
-        assert result.failure is not None and "result persistence failed" in result.failure
-        await service._cleanup_resources()
-        return run_id
+        service.state = LifecycleState.RUNNING
 
-    run_id = asyncio.run(finish_and_cleanup())
+        async def sample_local_stats() -> dict[str, int]:
+            return {"node-1": 0, "node-2": 0}
+
+        service._sample_local_stats = sample_local_stats  # type: ignore[method-assign]
+        request = TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+        first_run_id = await service.start_traffic(request)
+        first = await service.traffic.wait(deadline_seconds=2)
+        assert first.failure is not None and "result persistence failed" in first.failure
+
+        second_run_id = await service.start_traffic(request)
+        assert service.traffic_result(first_run_id).run_id == first_run_id
+        second = await service.traffic.wait(deadline_seconds=2)
+        assert second.failure is not None and "result persistence failed" in second.failure
+        await service._cleanup_resources()
+        service.state = LifecycleState.STOPPED
+        return first_run_id, second_run_id
+
+    first_run_id, second_run_id = asyncio.run(finish_replace_and_cleanup())
     assert service.traffic is None
+    assert set(service.completed_runs()) == {first_run_id, second_run_id}
 
     with TestClient(create_app(service)) as client:
-        summary = client.get(f"/api/traffic/runs/{run_id}")
-        exported = client.get(f"/api/traffic/runs/{run_id}/export")
+        summary = client.get(f"/api/traffic/runs/{first_run_id}")
+        exported = client.get(f"/api/traffic/runs/{first_run_id}/export")
 
     assert summary.status_code == 200
     assert summary.json()["state"] == "FAILED"
     assert exported.status_code == 200
-    assert exported.json()["runId"] == run_id
+    assert exported.json()["runId"] == first_run_id

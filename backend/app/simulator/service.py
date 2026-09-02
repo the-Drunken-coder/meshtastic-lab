@@ -423,6 +423,7 @@ class SimulatorService:
                     "LOCAL_STATS_UNAVAILABLE", f"could not capture native local statistics: {exc}"
                 ) from exc
             try:
+                self._archive_unpersisted_traffic_result()
                 return self.traffic.start(
                     request,
                     scenario_snapshot=self.scenario.model_copy(deep=True),
@@ -469,6 +470,20 @@ class SimulatorService:
             else set()
         )
         return sorted(persisted | self._volatile_results.keys())
+
+    def _archive_unpersisted_traffic_result(self) -> None:
+        if self.traffic is None:
+            return
+        result = self.traffic.result()
+        if (
+            result is None
+            or result.finished_at is None
+            or (self.results_root / f"{result.run_id}.json").is_file()
+        ):
+            return
+        self._volatile_results[result.run_id] = result
+        while len(self._volatile_results) > MAX_VOLATILE_RESULTS:
+            self._volatile_results.pop(next(iter(self._volatile_results)))
 
     def nodes(self) -> list[NodeView]:
         views: list[NodeView] = []
@@ -761,15 +776,7 @@ class SimulatorService:
             await asyncio.gather(lag_task, return_exceptions=True)
         if self.traffic is not None:
             await self.traffic.stop()
-            result = self.traffic.result()
-            if (
-                result is not None
-                and result.finished_at is not None
-                and not (self.results_root / f"{result.run_id}.json").is_file()
-            ):
-                self._volatile_results[result.run_id] = result
-                while len(self._volatile_results) > MAX_VOLATILE_RESULTS:
-                    self._volatile_results.pop(next(iter(self._volatile_results)))
+            self._archive_unpersisted_traffic_result()
         if self.medium is not None:
             await self.medium.stop()
         if self.gateways:
