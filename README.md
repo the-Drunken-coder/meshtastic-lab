@@ -42,11 +42,11 @@ node_1 = TCPInterface(hostname="127.0.0.1", portNumber=45001)
 node_1.sendText("hello from an ordinary client", wantAck=False)
 ```
 
-V1 permits one external client per node. A second client to that same node is rejected without disturbing the first. Different nodes support simultaneous clients.
+V1 permits one external client per node. A second client to that same node is rejected without disturbing the first. Different nodes support simultaneous clients. During startup, configuration uses a separate loopback-only control endpoint and public clients are admitted only after the simulation reaches `RUNNING`.
 
 ## Scenarios and runs
 
-Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running.
+Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running between traffic runs.
 
 The checked-in JSON scenarios under `scenarios/` are valid API payloads. To load one without the UI:
 
@@ -56,7 +56,7 @@ curl -X PUT http://127.0.0.1:8080/api/scenario \
   --data-binary @scenarios/five-node-line.json
 ```
 
-Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`.
+Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
 
 ## Metrics
 
@@ -95,7 +95,7 @@ The supported container paths are Linux `amd64` and Linux `arm64`. Docker Deskto
 - **Startup becomes FAILED:** select the named node and `stderr` in Daemon diagnostics. Startup is all-or-nothing and preserves recent child output.
 - **Client is rejected:** another external client is already attached to that node. Disconnect it or select another node endpoint.
 - **Ports are occupied:** stop another stack or local Meshtastic process using `8080` or `45001` through `45010`. `docker compose down` removes the application container without deleting the result volume.
-- **Slow first start:** every node receives and verifies the requested firmware configuration, reboots, reconnects, and exchanges NodeInfo over the configured topology. Readiness uses those observations, not a fixed sleep.
+- **Warm-up reports missing pairs:** local firmware configuration is the readiness gate. NodeInfo exchange is timed and best effort because hop limits, non-relaying roles, and collisions can make graph-connected pairs unobservable. Missing pairs remain visible in the lifecycle message but do not invalidate a correctly configured simulation.
 - **Apple Silicon build pressure:** the native firmware builder is large. Increase Docker Desktop’s memory limit if the compiler is killed.
 
 Architecture details are in [architecture](docs/architecture.md), and the gateway contract is in [client connections](docs/client-connections.md).

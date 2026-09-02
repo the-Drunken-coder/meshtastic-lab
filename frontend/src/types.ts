@@ -23,7 +23,13 @@ export interface Capability {
   collisionDetail: string;
   maximumNodes: number;
   supportedContainerArchitectures: string[];
-  firmwareImageDigest: string;
+  provenanceAvailable: boolean;
+  firmwareCommit: string;
+  collisionPatchSha256: string;
+  firmwareBinarySha256: string;
+  buildArchitecture: string;
+  clientLibraryVersion: string;
+  upstreamBaseImageDigest: string;
 }
 
 export interface ScenarioNode {
@@ -83,7 +89,6 @@ export interface Metrics {
   deliveryRatio: number | null;
   receiverDeliveries: number;
   receiverDeliveryRatio: number | null;
-  receiversPerBroadcast: Record<string, number>;
   acknowledgmentSuccessRatio: number | null;
   medianLatencyMs: number | null;
   p95LatencyMs: number | null;
@@ -101,17 +106,44 @@ export interface Metrics {
 
 export type TrafficState = "IDLE" | "RUNNING" | "STOPPING" | "COMPLETED" | "CANCELLED" | "FAILED";
 
-export interface TrafficResult {
-  runId?: string;
-  state: TrafficState;
-  requested?: number;
-  submitted?: number;
-  submissionFailed?: number;
-  transmitted?: number;
-  delivered?: number;
-  metrics?: Metrics;
-  failure?: string | null;
+interface IdleTrafficResult {
+  state: "IDLE";
+  runId?: never;
+  requested?: never;
+  submitted?: never;
+  submissionFailed?: never;
+  transmitted?: never;
+  delivered?: never;
+  metrics?: never;
+  failure?: never;
 }
+
+interface TrafficRunSummary {
+  runId: string;
+  state: Exclude<TrafficState, "IDLE">;
+  request: TrafficRequest;
+  scenarioSnapshot: Scenario;
+  firmwareCommit: string;
+  collisionPatchSha256: string;
+  firmwareBinarySha256: string;
+  buildArchitecture: string;
+  upstreamBaseImageDigest: string;
+  meshtasticatorCommit: string;
+  clientLibraryVersion: string;
+  collisionModel: "native";
+  startedAt: string;
+  finishedAt: string | null;
+  randomSeed: number;
+  requested: number;
+  submitted: number;
+  submissionFailed: number;
+  transmitted: number;
+  delivered: number;
+  metrics: Metrics;
+  failure: string | null;
+}
+
+export type TrafficResult = IdleTrafficResult | TrafficRunSummary;
 
 export interface PacketEvent {
   sequence: number;

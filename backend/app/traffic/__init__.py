@@ -7,6 +7,8 @@ from .controller import (
     TrafficRunRequest,
     TrafficRunResult,
     TrafficRunState,
+    TrafficRunSummary,
+    summarize_result,
 )
 
 __all__ = [
@@ -16,4 +18,6 @@ __all__ = [
     "TrafficRunRequest",
     "TrafficRunResult",
     "TrafficRunState",
+    "TrafficRunSummary",
+    "summarize_result",
 ]

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,7 +17,7 @@ from backend.app.logging_config import configure_logging
 from backend.app.metrics import EventType
 from backend.app.models import DirectedLink, Scenario, TopologyPreset
 from backend.app.simulator import SimulationConflict, SimulatorService
-from backend.app.traffic import TrafficRunRequest, TrafficRunState
+from backend.app.traffic import TrafficRunRequest, TrafficRunState, TrafficRunSummary
 
 
 class TopologyRequest(BaseModel):
@@ -31,6 +31,12 @@ class TrafficStarted(BaseModel):
 
     run_id: str = Field(alias="runId")
     state: TrafficRunState
+
+
+class IdleTraffic(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal[TrafficRunState.IDLE] = TrafficRunState.IDLE
 
 
 class HealthView(BaseModel):
@@ -147,38 +153,45 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
 
     @app.post("/api/traffic/runs", response_model=TrafficStarted)
     async def start_traffic(request: TrafficRunRequest) -> TrafficStarted:
-        run_id = simulator.start_traffic(request)
+        run_id = await simulator.start_traffic(request)
         return TrafficStarted(runId=run_id, state=TrafficRunState.RUNNING)
 
-    @app.post("/api/traffic/runs/stop")
-    async def stop_traffic() -> object:
+    @app.post(
+        "/api/traffic/runs/stop", response_model=TrafficRunSummary | IdleTraffic
+    )
+    async def stop_traffic() -> TrafficRunSummary | IdleTraffic:
         await simulator.stop_traffic()
-        snapshot = simulator.traffic.snapshot() if simulator.traffic is not None else None
-        return snapshot or {"state": TrafficRunState.IDLE}
+        summary = simulator.traffic.summary() if simulator.traffic is not None else None
+        return summary or IdleTraffic()
 
-    @app.get("/api/traffic/runs/current")
-    async def current_traffic() -> object:
-        snapshot = simulator.traffic.snapshot() if simulator.traffic is not None else None
-        return snapshot or {"state": TrafficRunState.IDLE}
+    @app.get(
+        "/api/traffic/runs/current", response_model=TrafficRunSummary | IdleTraffic
+    )
+    async def current_traffic() -> TrafficRunSummary | IdleTraffic:
+        summary = simulator.traffic.summary() if simulator.traffic is not None else None
+        return summary or IdleTraffic()
 
     @app.get("/api/traffic/runs")
     async def completed_runs() -> object:
         return {"runIds": simulator.completed_runs()}
 
-    @app.get("/api/traffic/runs/{run_id}")
-    async def traffic_result(run_id: str) -> object:
-        return simulator.traffic_result(run_id)
+    @app.get("/api/traffic/runs/{run_id}", response_model=TrafficRunSummary)
+    async def traffic_result(run_id: str) -> TrafficRunSummary:
+        return simulator.traffic_summary(run_id)
 
     @app.get("/api/traffic/runs/{run_id}/export")
     async def export_traffic_result(run_id: str) -> FileResponse:
-        simulator.traffic_result(run_id)
         path = simulator.results_root / f"{run_id}.json"
         if not path.is_file():
-            snapshot = simulator.traffic.snapshot() if simulator.traffic is not None else None
-            if snapshot is None or snapshot.run_id != run_id:
-                raise FileNotFoundError(run_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(snapshot.model_dump_json(by_alias=True, indent=2) + "\n", encoding="utf-8")
+            if (
+                simulator.traffic is not None
+                and simulator.traffic.current is not None
+                and simulator.traffic.current.run_id == run_id
+            ):
+                raise SimulationConflict(
+                    "TRAFFIC_RUN_NOT_COMPLETE", "traffic results can be exported after the run finishes"
+                )
+            raise FileNotFoundError(run_id)
         return FileResponse(path, media_type="application/json", filename=f"{run_id}.json")
 
     @app.get("/api/events")

@@ -75,6 +75,18 @@ def test_duplicate_directed_link_is_rejected() -> None:
         Scenario.model_validate(data)
 
 
+@pytest.mark.parametrize("node_count", [2, 3])
+def test_incomplete_directed_link_matrix_is_rejected(node_count: int) -> None:
+    data = default_scenario(node_count).model_dump(by_alias=True)
+    missing = data["links"].pop()
+
+    with pytest.raises(
+        ValidationError,
+        match=f"missing directed links: {missing['from']} -> {missing['to']}",
+    ):
+        Scenario.model_validate(data)
+
+
 def test_bundled_scenarios_validate_and_define_complete_matrices() -> None:
     for path in Path("scenarios").glob("*.json"):
         scenario = Scenario.model_validate_json(path.read_text(encoding="utf-8"))

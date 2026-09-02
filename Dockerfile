@@ -10,6 +10,8 @@ RUN pnpm build
 
 FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1 AS firmware-builder
 ARG FIRMWARE_COMMIT=54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb
+ARG CLIENT_LIBRARY_VERSION=2.7.11
+ARG UPSTREAM_BASE_IMAGE_DIGEST=sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -38,6 +40,13 @@ RUN git apply --check /tmp/firmware-collision.patch \
     && strings /tmp/meshtasticd | grep -F 'Collision detected, dropping current and previous packet!'
 RUN install -d /tmp/capability \
     && printf '%s\n' "firmware=${FIRMWARE_COMMIT}" "flag=USERPREFS_SIMRADIO_EMULATE_COLLISIONS=1" > /tmp/capability/native-collision-enabled
+RUN patch_sha256="$(sha256sum /tmp/firmware-collision.patch | cut -d' ' -f1)" \
+    && binary_sha256="$(sha256sum /tmp/meshtasticd | cut -d' ' -f1)" \
+    && architecture="$(uname -m)" \
+    && printf '{"firmwareCommit":"%s","collisionPatchSha256":"%s","firmwareBinarySha256":"%s","buildArchitecture":"%s","clientLibraryVersion":"%s","upstreamBaseImageDigest":"%s"}\n' \
+      "${FIRMWARE_COMMIT}" "${patch_sha256}" "${binary_sha256}" "${architecture}" \
+      "${CLIENT_LIBRARY_VERSION}" "${UPSTREAM_BASE_IMAGE_DIGEST}" \
+      > /tmp/capability/build-metadata.json
 
 FROM python:3.13.7-slim-trixie@sha256:5f55cdf0c5d9dc1a415637a5ccc4a9e18663ad203673173b8cda8f8dcacef689 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
@@ -46,6 +55,7 @@ ENV PYTHONUNBUFFERED=1
 ENV MESHTASTICD_BIN=/usr/bin/meshtasticd
 ENV MESHTASTIC_LAB_DATA=/data
 ENV MESHTASTIC_COLLISION_MARKER=/usr/share/meshtastic-lab/native-collision-enabled
+ENV MESHTASTIC_BUILD_METADATA=/usr/share/meshtastic-lab/build-metadata.json
 RUN apt-get update && apt-get install --no-install-recommends -y \
       libgpiod3 libi2c0 libinput10 liborcania2.3 libsdl2-2.0-0 libssl3t64 \
       libulfius2.7t64 libusb-1.0-0 libuv1t64 libx11-6 libxkbcommon-x11-0 \
@@ -63,6 +73,7 @@ COPY scenarios/ ./scenarios/
 COPY --from=frontend-builder /src/frontend/dist ./frontend/dist/
 COPY --from=firmware-builder /tmp/meshtasticd /usr/bin/meshtasticd
 COPY --from=firmware-builder /tmp/capability/native-collision-enabled /usr/share/meshtastic-lab/native-collision-enabled
+COPY --from=firmware-builder /tmp/capability/build-metadata.json /usr/share/meshtastic-lab/build-metadata.json
 RUN chmod 0755 /usr/bin/meshtasticd \
     && /usr/bin/meshtasticd --help >/dev/null \
     && chown -R lab:lab /app /data

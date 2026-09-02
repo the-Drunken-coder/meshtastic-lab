@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 
 from meshtastic.protobuf import mesh_pb2
 
@@ -14,7 +14,8 @@ from backend.app.metrics import EventBroker, EventType, PacketEvent, airtime_ms,
 from backend.app.models import DirectedLink, Scenario
 
 TransmissionHandler = Callable[[str, mesh_pb2.MeshPacket, int], None]
-DropHandler = Callable[[str], None]
+DropHandler = Callable[[str, mesh_pb2.MeshPacket, str], None]
+FailureHandler = Callable[[str, Exception], Awaitable[None]]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -30,6 +31,7 @@ class DirectedMedium:
         hardware_ids: Mapping[str, int],
         transmission_handler: TransmissionHandler | None = None,
         drop_handler: DropHandler | None = None,
+        failure_handler: FailureHandler | None = None,
     ) -> None:
         self._scenario = scenario
         self._gateways = gateways
@@ -37,6 +39,7 @@ class DirectedMedium:
         self._hardware_ids = hardware_ids
         self._transmission_handler = transmission_handler
         self._drop_handler = drop_handler
+        self._failure_handler = failure_handler
         self._links = scenario.link_map()
         self._link_lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
@@ -45,16 +48,21 @@ class DirectedMedium:
         if self._tasks:
             return
         self._tasks = [
-            asyncio.create_task(self._node_loop(node_id, gateway), name=f"medium-{node_id}")
+            asyncio.create_task(
+                self._supervised_node_loop(node_id, gateway), name=f"medium-{node_id}"
+            )
             for node_id, gateway in self._gateways.items()
         ]
 
     async def stop(self) -> None:
         tasks, self._tasks = self._tasks, []
+        current_task = asyncio.current_task()
         for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if task is not current_task:
+                task.cancel()
+        waiters = [task for task in tasks if task is not current_task]
+        if waiters:
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     async def update_link(self, link: DirectedLink) -> None:
         key = (link.from_node, link.to_node)
@@ -143,7 +151,7 @@ class DirectedMedium:
                     )
                 )
                 if self._drop_handler is not None:
-                    self._drop_handler("link-disabled")
+                    self._drop_handler(transmitter, packet, "link-disabled")
                 continue
             received = mesh_pb2.MeshPacket()
             received.CopyFrom(packet)
@@ -162,6 +170,34 @@ class DirectedMedium:
         while True:
             packet = await gateway.rf_frames.get()
             await self.transmit(node_id, packet)
+
+    async def _supervised_node_loop(self, node_id: str, gateway: NodeGateway) -> None:
+        """Keep permanent RF workers observable when a transmit fails."""
+
+        try:
+            await self._node_loop(node_id, gateway)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._report_failure(node_id, exc)
+        else:
+            await self._report_failure(node_id, RuntimeError("medium worker exited unexpectedly"))
+
+    async def _report_failure(self, node_id: str, exc: Exception) -> None:
+        if self._failure_handler is None:
+            LOGGER.error(
+                "directed medium worker failed",
+                extra={"node_id": node_id, "error_category": "medium-worker-failed"},
+                exc_info=exc,
+            )
+            return
+        try:
+            await self._failure_handler(node_id, exc)
+        except Exception:
+            LOGGER.exception(
+                "directed medium failure handler failed",
+                extra={"node_id": node_id, "error_category": "medium-failure-handler"},
+            )
 
     async def _inject(
         self, link: DirectedLink, packet: mesh_pb2.MeshPacket, monotonic_now: float

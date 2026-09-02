@@ -72,6 +72,7 @@ async def send_until_received(
     expected: str,
     destination_id: int,
     *,
+    want_ack: bool = False,
     attempts: int = 3,
     attempt_timeout_seconds: float = 15,
 ) -> None:
@@ -81,7 +82,7 @@ async def send_until_received(
             interface.sendText,
             expected,
             destinationId=destination_id,
-            wantAck=False,
+            wantAck=want_ack,
         )
         try:
             while True:
@@ -121,13 +122,15 @@ async def test_two_clients_on_different_nodes_broadcast_and_direct() -> None:
         await asyncio.to_thread(first.sendText, "native-broadcast", wantAck=False)
         assert await receive_text(cluster, received, "native-broadcast", 20) == "native-broadcast"
 
-        await asyncio.to_thread(
-            first.sendText,
+        await send_until_received(
+            cluster,
+            first,
+            received,
             "native-direct",
-            destinationId=cluster.verifications["node-2"].node_number,
-            wantAck=True,
+            cluster.verifications["node-2"].node_number,
+            want_ack=True,
+            attempt_timeout_seconds=20,
         )
-        assert await receive_text(cluster, received, "native-direct", 20) == "native-direct"
     finally:
         pub.unsubscribe(on_text, "meshtastic.receive.text")
         for interface in (first, second):

@@ -133,6 +133,15 @@ class Scenario(BaseModel):
             if key in link_keys:
                 raise ValueError(f"duplicate directed link: {link.from_node} -> {link.to_node}")
             link_keys.add(key)
+
+        missing = [
+            f"{source} -> {target}"
+            for source in node_ids
+            for target in node_ids
+            if source != target and (source, target) not in link_keys
+        ]
+        if missing:
+            raise ValueError(f"missing directed links: {', '.join(missing)}")
         return self
 
     def link_map(self) -> dict[tuple[str, str], DirectedLink]:

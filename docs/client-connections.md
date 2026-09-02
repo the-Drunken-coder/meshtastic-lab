@@ -12,6 +12,8 @@ The parser buffers arbitrary TCP boundaries and resynchronizes after invalid byt
 
 V1 accepts one external connection per gateway. A second connection is rejected before it can affect the active stream. This is a deliberate product limit, not a limitation across the network: node 1 and node 2 can each have a client at the same time.
 
+Startup configuration and NodeInfo requests use a separate ephemeral listener bound to `127.0.0.1` inside the application container. Public admission remains disabled through `STARTING` and `WARMING_UP`. A host application may keep retrying a published node port, but it cannot claim the internal configuration slot and is admitted only after the lifecycle reaches `RUNNING`.
+
 When the client disconnects, the gateway retains its downstream daemon connection and RF-control path. A new external connection receives a fresh normal Client API configuration exchange. If the downstream daemon disconnects, the gateway enters `FAILED`; while the simulation is running, the lifecycle also fails and performs bounded cleanup.
 
 ## Shared downstream writer

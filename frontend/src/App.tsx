@@ -48,7 +48,6 @@ const emptyMetrics: Metrics = {
   deliveryRatio: null,
   receiverDeliveries: 0,
   receiverDeliveryRatio: null,
-  receiversPerBroadcast: {},
   acknowledgmentSuccessRatio: null,
   medianLatencyMs: null,
   p95LatencyMs: null,
@@ -467,8 +466,9 @@ function App() {
           <section>
             <h2>Runtime facts</h2>
             <dl className="facts">
-              <div><dt>Firmware</dt><dd className="mono">{firmwareVersion ?? "2.7.26 · 54e0d8d"}</dd></div>
-              <div><dt>Image</dt><dd className="mono">{shortDigest(capability.firmwareImageDigest)}</dd></div>
+              <div><dt>Firmware</dt><dd className="mono">{firmwareVersion ?? "Unavailable"} · {capability.firmwareCommit.slice(0, 7)}</dd></div>
+              <div><dt>Binary</dt><dd className="mono">{shortDigest(capability.firmwareBinarySha256)}</dd></div>
+              <div><dt>Build</dt><dd className="mono">{capability.buildArchitecture} · client {capability.clientLibraryVersion}</dd></div>
               <div><dt>Collision</dt><dd className={capability.collisionAvailable ? "good" : "bad"}>{capability.collisionModel} · {capability.collisionAvailable ? "available" : "unavailable"}</dd></div>
               <div><dt>Event stream</dt><dd className={streamConnected ? "good" : "warn"}>{streamConnected ? "connected" : "reconnecting"}</dd></div>
               <div><dt>Loop lag</dt><dd>{formatMilliseconds(metrics.eventLoopLagMs)}</dd></div>
@@ -491,7 +491,7 @@ function App() {
             <div className="section-toolbar">
               <div><h2>Directed topology</h2><p>Rows transmit. Columns receive. RSSI −85 dBm · SNR 8 dB.</p></div>
               <label className="inline-check"><input type="checkbox" checked={symmetric} onChange={(event) => setSymmetric(event.currentTarget.checked)} /> Edit symmetrically</label>
-              <div className="preset-actions">{presets.map(([label, preset]) => <button key={preset} onClick={() => applyPreset(preset)} disabled={busy !== null || (!stopped && !running)}>{label}</button>)}</div>
+              <div className="preset-actions">{presets.map(([label, preset]) => <button key={preset} onClick={() => applyPreset(preset)} disabled={busy !== null || trafficActive || (!stopped && !running)}>{label}</button>)}</div>
             </div>
             <div className="matrix-scroll">
               <table className="topology-matrix">
@@ -500,7 +500,7 @@ function App() {
                   if (source.id === target.id) return <td className="diagonal" key={target.id}>·</td>;
                   const link = scenario.links.find((candidate) => candidate.from === source.id && candidate.to === target.id);
                   if (!link) return <td key={target.id}>Missing</td>;
-                  return <td key={target.id}><button className={`link-toggle ${link.enabled ? "enabled" : "disabled"}`} aria-label={`${link.enabled ? "Disable" : "Enable"} link from ${source.displayName} to ${target.displayName}`} onClick={() => toggleLink(link)} disabled={busy !== null || (!stopped && !running)}>{link.enabled ? "ON" : "OFF"}</button></td>;
+                  return <td key={target.id}><button className={`link-toggle ${link.enabled ? "enabled" : "disabled"}`} aria-label={`${link.enabled ? "Disable" : "Enable"} link from ${source.displayName} to ${target.displayName}`} onClick={() => toggleLink(link)} disabled={busy !== null || trafficActive || (!stopped && !running)}>{link.enabled ? "ON" : "OFF"}</button></td>;
                 })}</tr>)}</tbody>
               </table>
             </div>
@@ -533,7 +533,7 @@ function App() {
                 <div><dt>RF TX / delivery</dt><dd>{metrics.rfTransmissionsPerDelivery?.toFixed(2) ?? "Unavailable"}</dd></div>
                 <div><dt>Receiver deliveries</dt><dd>{metrics.receiverDeliveries}</dd></div>
                 <div><dt>Receiver delivery</dt><dd>{formatRatio(metrics.receiverDeliveryRatio)}</dd></div>
-                <div><dt>Receivers / broadcast</dt><dd>{Object.keys(metrics.receiversPerBroadcast).length ? Object.entries(metrics.receiversPerBroadcast).map(([sequence, count]) => `${sequence}: ${count}`).join(", ") : "Not a broadcast run"}</dd></div>
+                <div><dt>Receivers / broadcast</dt><dd>Completed export</dd></div>
                 <div><dt>Relay TX</dt><dd>{metrics.relayTransmissions}</dd></div>
                 <div><dt>Duplicate RX</dt><dd>{metrics.duplicateReceptions}</dd></div>
                 <div><dt>Failed/bad RX</dt><dd>{metrics.failedReceptions}</dd></div>

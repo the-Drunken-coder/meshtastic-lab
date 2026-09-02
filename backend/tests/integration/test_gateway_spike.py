@@ -68,7 +68,9 @@ async def test_official_client_gateway_handshake_rf_and_reconnect() -> None:
         downstream_port=daemon_port,
         public_host="127.0.0.1",
         public_port=public_port,
+        public_clients_enabled=False,
     )
+    internal: tcp_interface.TCPInterface | None = None
     first: tcp_interface.TCPInterface | None = None
     second: tcp_interface.TCPInterface | None = None
     received: queue.Queue[dict[str, object]] = queue.Queue()
@@ -82,6 +84,24 @@ async def test_official_client_gateway_handshake_rf_and_reconnect() -> None:
     pub.subscribe(on_receive, "meshtastic.receive.text")
     try:
         await gateway.start()
+
+        blocked_reader, blocked_writer = await asyncio.open_connection("127.0.0.1", public_port)
+        assert await asyncio.wait_for(blocked_reader.read(1), timeout=2) == b""
+        blocked_writer.close()
+        await blocked_writer.wait_closed()
+
+        internal = await asyncio.to_thread(
+            tcp_interface.TCPInterface,
+            hostname=gateway.control_host,
+            portNumber=gateway.control_port,
+            timeout=20,
+        )
+        assert internal.myInfo is not None
+        assert not gateway.external_connected
+        await asyncio.to_thread(internal.close)
+        internal = None
+        await asyncio.wait_for(gateway.client_disconnected.wait(), timeout=5)
+        await gateway.enable_public_clients()
 
         first = await asyncio.to_thread(
             tcp_interface.TCPInterface,
@@ -104,7 +124,7 @@ async def test_official_client_gateway_handshake_rf_and_reconnect() -> None:
         assert await asyncio.wait_for(extra_reader.read(1), timeout=2) == b""
         extra_writer.close()
         await extra_writer.wait_closed()
-        assert gateway.rejected_clients == 1
+        assert gateway.rejected_clients == 2
 
         compressed = mesh_pb2.Compressed(portnum=portnums_pb2.TEXT_MESSAGE_APP, data=b"inbound-spike")
         injected = mesh_pb2.MeshPacket(
@@ -151,7 +171,7 @@ async def test_official_client_gateway_handshake_rf_and_reconnect() -> None:
         assert verification.channel_name == "Simulator"
     finally:
         pub.unsubscribe(on_receive, "meshtastic.receive.text")
-        for interface in (first, second):
+        for interface in (internal, first, second):
             if interface is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(interface.close)

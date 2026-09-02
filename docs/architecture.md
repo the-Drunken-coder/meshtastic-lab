@@ -13,7 +13,7 @@ Official client :45002 ──> NodeGateway 2 ──> meshtasticd 2 :46002
                                                └── ToRadio injection to receivers
 ```
 
-Only the gateway ports are published. A daemon has one internal Client API connection owned by its gateway. Publishing the daemon directly would let a second internal controller connection replace the external connection because the upstream native server stores one active API connection.
+Only the gateway ports are published. A daemon has one internal Client API connection owned by its gateway. Publishing the daemon directly would let a second internal controller connection replace the external connection because the upstream native server stores one active API connection. Each gateway also opens an ephemeral loopback-only control endpoint for startup configuration. Public admission stays closed until configuration and warm-up finish, so a reconnecting host client cannot take the startup slot.
 
 ## Gateway data flow
 
@@ -34,16 +34,16 @@ Injections to different receivers are concurrent. Medium node loops are independ
 ## Lifecycle
 
 ```text
-STOPPED ── start ──> STARTING ── configured ──> WARMING_UP ── routes observed ──> RUNNING
+STOPPED ── start ──> STARTING ── configured ──> WARMING_UP ── timed observation ──> RUNNING
    ▲                       │                         │                               │
    │                       └──────── failure ────────┴──────── failure ─────────> FAILED
    │                                                                                 │
    └──────────────────────────── stop <── STOPPING <──────────── stop ────────────────┘
 ```
 
-The lifecycle lock serializes commands. Node identity, roles, RF configuration, and channel configuration change only in `STOPPED`. Directed links use a copy-on-write map under an async lock and can change in `RUNNING`. Start is all-or-nothing. Configuration writes use the official settings transaction, intentionally reboot once, reconnect the gateway, read effective values back, and fail if they differ.
+The lifecycle lock serializes commands. Node identity, roles, RF configuration, and channel configuration change only in `STOPPED`. Directed links use a copy-on-write map under an async lock and can change in `RUNNING` between traffic runs. A run rejects topology changes so its captured scenario remains the topology used for its full duration. Start is all-or-nothing. Configuration writes use the official settings transaction, intentionally reboot once, reconnect the gateway, read effective values back, and fail if they differ.
 
-Warm-up sends NodeInfo requests through every gateway and waits for firmware observations for every reachable directed pair. Missing observations trigger a bounded per-source retry. The overall deadline scales from 50 to 120 seconds with node count. After reachability is proven, a five-second secondary stabilization interval lets firmware queues drain before traffic controls become available. The fixed interval is not the primary readiness mechanism.
+Warm-up sends one best-effort NodeInfo request through each private gateway endpoint, then allows a bounded stabilization interval. Process readiness, gateway readiness, and verified local configuration are hard gates. Network-wide NodeInfo observations are evidence, not a readiness proof. The lifecycle message reports missing graph-connected pairs because hop limits, non-relaying roles, collisions, and transient contention can make them unobservable.
 
 ## Processes and concurrency
 
@@ -53,9 +53,9 @@ The backend event loop owns gateways, medium loops, traffic scheduling, lifecycl
 
 ## Failure handling
 
-A child exit or gateway failure identifies the node, moves the simulator to `FAILED`, retains recent daemon output, stops traffic and medium tasks, closes gateways, and terminates the remaining children. Graceful child shutdown has an eight-second deadline followed by force-kill. Gateway startup and shutdown also have deadlines. Stop cancels an active traffic run before dismantling the RF path.
+A child exit, gateway failure, RF queue overflow, or unexpected medium-worker exit identifies the node and moves the simulator to `FAILED`. Transport overload uses the explicit `SIMULATOR_OVERLOAD` category so it cannot masquerade as mesh congestion. Failure cleanup freezes an active traffic result, retains recent daemon output, stops traffic and medium tasks, closes gateways, and terminates the remaining children. Graceful child shutdown has an eight-second deadline followed by force-kill. Gateway startup and shutdown also have deadlines. Stop cancels an active traffic run before dismantling the RF path.
 
-Results use a temporary file followed by an atomic rename under `/data/runs`. No packet or UI queue is unbounded.
+Results use a temporary file followed by an atomic rename under `/data/runs`. Terminal results are frozen before that rename, and later firmware packets cannot change them. The polled live summary contains only bounded counters and aggregate maps; full generated-message records stay in the completed export. No packet or UI queue is unbounded.
 
 ## Extension seams
 

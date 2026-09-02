@@ -8,8 +8,10 @@ import logging
 import random
 import time
 import uuid
+from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
@@ -18,14 +20,18 @@ from meshtastic.protobuf import mesh_pb2, portnums_pb2
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.gateway import NodeGateway
-from backend.app.metrics import EventBroker, EventType, MetricsSnapshot, PacketEvent, calculate_metrics
+from backend.app.metrics import (
+    EventBroker,
+    EventType,
+    MetricsSnapshot,
+    MetricsSummary,
+    PacketEvent,
+    calculate_metrics,
+)
 from backend.app.models import Scenario
+from backend.app.provenance import BuildMetadata
 
 TRAFFIC_PREFIX = "ML1"
-FIRMWARE_COMMIT = "54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb"
-FIRMWARE_IMAGE_DIGEST = "sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4"
-MESHTASTICATOR_COMMIT = "17ceb8231079d87b070abc6132181e4c6b20202d"
-CLIENT_LIBRARY_VERSION = "2.7.11"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -91,18 +97,41 @@ class GeneratedMessage(BaseModel):
     acknowledged: bool = False
 
 
-class TrafficRunResult(BaseModel):
+class _ProvenanceFields(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    firmware_commit: str = Field(alias="firmwareCommit")
+    collision_patch_sha256: str = Field(alias="collisionPatchSha256")
+    firmware_binary_sha256: str = Field(alias="firmwareBinarySha256")
+    build_architecture: str = Field(alias="buildArchitecture")
+    upstream_base_image_digest: str = Field(alias="upstreamBaseImageDigest")
+    meshtasticator_commit: str = Field(alias="meshtasticatorCommit")
+    client_library_version: str = Field(alias="clientLibraryVersion")
+    collision_model: Literal["native"] = Field(default="native", alias="collisionModel")
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_provenance(cls, values: object) -> object:
+        """Keep pre-provenance result files readable without inventing artifact identity."""
+
+        if not isinstance(values, Mapping) or "firmwareImageDigest" not in values:
+            return values
+        migrated = dict(values)
+        legacy_digest = migrated.pop("firmwareImageDigest")
+        migrated.setdefault("collisionPatchSha256", "unavailable")
+        migrated.setdefault("firmwareBinarySha256", "unavailable")
+        migrated.setdefault("buildArchitecture", "unavailable")
+        migrated.setdefault("upstreamBaseImageDigest", legacy_digest)
+        return migrated
+
+
+class TrafficRunResult(_ProvenanceFields):
     model_config = ConfigDict(extra="forbid")
 
     run_id: str = Field(alias="runId")
     state: TrafficRunState
     request: TrafficRunRequest
     scenario_snapshot: dict[str, object] = Field(alias="scenarioSnapshot")
-    firmware_commit: str = Field(default=FIRMWARE_COMMIT, alias="firmwareCommit")
-    firmware_image_digest: str = Field(default=FIRMWARE_IMAGE_DIGEST, alias="firmwareImageDigest")
-    meshtasticator_commit: str = Field(default=MESHTASTICATOR_COMMIT, alias="meshtasticatorCommit")
-    client_library_version: str = Field(default=CLIENT_LIBRARY_VERSION, alias="clientLibraryVersion")
-    collision_model: Literal["native"] = Field(default="native", alias="collisionModel")
     started_at: datetime = Field(alias="startedAt")
     finished_at: datetime | None = Field(default=None, alias="finishedAt")
     random_seed: int = Field(alias="randomSeed")
@@ -116,6 +145,38 @@ class TrafficRunResult(BaseModel):
     failure: str | None = None
 
 
+class TrafficRunSummary(_ProvenanceFields):
+    """Bounded status for the live endpoint; generated records are export-only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(alias="runId")
+    state: TrafficRunState
+    request: TrafficRunRequest
+    scenario_snapshot: dict[str, object] = Field(alias="scenarioSnapshot")
+    started_at: datetime = Field(alias="startedAt")
+    finished_at: datetime | None = Field(default=None, alias="finishedAt")
+    random_seed: int = Field(alias="randomSeed")
+    requested: int = 0
+    submitted: int = 0
+    submission_failed: int = Field(default=0, alias="submissionFailed")
+    transmitted: int = 0
+    delivered: int = 0
+    metrics: MetricsSummary
+    failure: str | None = None
+
+
+def summarize_result(result: TrafficRunResult) -> TrafficRunSummary:
+    """Strip export-only records and per-message metrics from a terminal result."""
+
+    values = result.model_dump(mode="python", by_alias=True, exclude={"generated_messages"})
+    metrics = values["metrics"]
+    if not isinstance(metrics, dict):
+        raise TypeError("traffic result metrics did not serialize as an object")
+    metrics.pop("receiversPerBroadcast", None)
+    return TrafficRunSummary.model_validate(values)
+
+
 class TrafficController:
     """Own at most one run and keep metrics independent of the UI event buffer."""
 
@@ -127,6 +188,7 @@ class TrafficController:
         hardware_ids: Mapping[str, int],
         event_broker: EventBroker,
         results_root: Path,
+        build_metadata: BuildMetadata | None = None,
         settle_seconds: float = 3.0,
     ) -> None:
         self.scenario = scenario
@@ -134,13 +196,18 @@ class TrafficController:
         self.hardware_ids = hardware_ids
         self.event_broker = event_broker
         self.results_root = results_root
+        self.build_metadata = build_metadata or BuildMetadata.unavailable()
         self.settle_seconds = settle_seconds
         self.state = TrafficRunState.IDLE
         self.current: TrafficRunResult | None = None
+        self._frozen_result: TrafficRunResult | None = None
         self._task: asyncio.Task[None] | None = None
+        self._run_scenario = scenario
         self._sequence = 0
-        self._messages_by_packet: dict[int, GeneratedMessage] = {}
+        self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
         self._messages_by_key: dict[tuple[str, int], GeneratedMessage] = {}
+        self._packet_ids_by_source: dict[str, set[int]] = {}
+        self._delivered_sequences: set[int] = set()
         self._latencies_ms: list[float] = []
         self._rf_transmitters: list[str] = []
         self._airtimes_ms: list[int] = []
@@ -149,29 +216,55 @@ class TrafficController:
         self._failed_receptions = 0
         self._latest_failed_receptions: dict[str, int] = {}
         self._drop_reasons: list[str] = []
+        self._drop_counts: Counter[str] = Counter()
         self._event_loop_lag_ms: float | None = None
+        self._generated_count = 0
+        self._submitted_count = 0
+        self._submission_failed_count = 0
+        self._transmitted_count = 0
+        self._unique_deliveries = 0
+        self._receiver_deliveries = 0
+        self._receiver_opportunities = 0
+        self._acknowledgments = 0
+        self._rf_transmission_count = 0
+        self._observed_airtime_ms = 0
+        self._per_node_transmit_counts: Counter[str] = Counter()
+        self._metrics: MetricsSnapshot | None = None
 
-    def start(self, request: TrafficRunRequest) -> str:
+    def start(
+        self, request: TrafficRunRequest, *, scenario_snapshot: Scenario | None = None
+    ) -> str:
         if self._task is not None and not self._task.done():
             raise RuntimeError("a traffic run is already active")
-        self._validate_request_nodes(request)
+        self._validate_request_nodes(request, scenario_snapshot=scenario_snapshot)
         run_id = str(uuid.uuid4())
-        marker_size = len(f"{TRAFFIC_PREFIX}:{run_id}:1:".encode())
+        snapshot = (scenario_snapshot or self.scenario).model_copy(deep=True)
+        max_sequence = self._maximum_sequence(request)
+        marker_size = len(f"{TRAFFIC_PREFIX}:{run_id}:{max_sequence}:")
         if request.payload_bytes < marker_size:
             raise ValueError(
                 f"payloadBytes {request.payload_bytes} is smaller than encoded traffic identifier "
-                f"{marker_size}"
+                f"{marker_size} for sequence {max_sequence}"
             )
         self._reset_accumulators()
+        self._run_scenario = snapshot
         self.current = TrafficRunResult(
             runId=run_id,
             state=TrafficRunState.RUNNING,
             request=request,
-            scenarioSnapshot=self.scenario.model_dump(by_alias=True),
+            scenarioSnapshot=snapshot.model_dump(by_alias=True),
+            firmwareCommit=self.build_metadata.firmware_commit,
+            collisionPatchSha256=self.build_metadata.collision_patch_sha256,
+            firmwareBinarySha256=self.build_metadata.firmware_binary_sha256,
+            buildArchitecture=self.build_metadata.build_architecture,
+            upstreamBaseImageDigest=self.build_metadata.upstream_base_image_digest,
+            meshtasticatorCommit=self.build_metadata.meshtasticator_commit,
+            clientLibraryVersion=self.build_metadata.client_library_version,
             startedAt=datetime.now(UTC),
             randomSeed=request.seed,
-            metrics=self._snapshot_metrics(),
+            metrics=self._live_metrics_snapshot(),
         )
+        self._frozen_result = None
         self.state = TrafficRunState.RUNNING
         self._task = asyncio.create_task(self._run(), name=f"traffic-{run_id}")
         LOGGER.info("traffic run started", extra={"traffic_run_id": run_id})
@@ -183,6 +276,27 @@ class TrafficController:
         self.state = TrafficRunState.STOPPING
         self._task.cancel()
         await asyncio.gather(self._task, return_exceptions=True)
+        if self._frozen_result is None:
+            await self._finish(TrafficRunState.CANCELLED)
+
+    async def fail(self, reason: str) -> None:
+        """Fail an active run, preserving FAILED when its task observes cancellation."""
+
+        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+            return
+        self.state = TrafficRunState.FAILED
+        self.current.failure = reason
+        task = self._task
+        if task is None or task.done():
+            await self._finish(TrafficRunState.FAILED)
+            return
+        if task is asyncio.current_task():
+            await self._finish(TrafficRunState.FAILED)
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if self._frozen_result is None:
+            await self._finish(TrafficRunState.FAILED)
 
     async def wait(self, *, deadline_seconds: float | None = None) -> TrafficRunResult:
         if self._task is not None:
@@ -190,68 +304,129 @@ class TrafficController:
                 await self._task
             else:
                 await asyncio.wait_for(asyncio.shield(self._task), timeout=deadline_seconds)
-        if self.current is None:
+        result = self.result()
+        if result is None:
             raise RuntimeError("no traffic run exists")
-        return self.current
+        return result
 
-    def snapshot(self) -> TrafficRunResult | None:
+    def summary(self) -> TrafficRunSummary | None:
         if self.current is None:
             return None
-        delivered_keys = self._delivered_keys()
-        self.current.transmitted = sum(message.transmitted for message in self.current.generated_messages)
-        self.current.delivered = len(delivered_keys)
-        self.current.metrics = self._snapshot_metrics(delivered_keys=delivered_keys)
+        result = self._frozen_result or self.current
+        if self._frozen_result is not None:
+            return summarize_result(result)
+        metrics = self._live_metrics()
+        return TrafficRunSummary(
+            runId=result.run_id,
+            state=result.state,
+            request=result.request,
+            scenarioSnapshot=result.scenario_snapshot,
+            firmwareCommit=result.firmware_commit,
+            collisionPatchSha256=result.collision_patch_sha256,
+            firmwareBinarySha256=result.firmware_binary_sha256,
+            buildArchitecture=result.build_architecture,
+            upstreamBaseImageDigest=result.upstream_base_image_digest,
+            meshtasticatorCommit=result.meshtasticator_commit,
+            clientLibraryVersion=result.client_library_version,
+            startedAt=result.started_at,
+            finishedAt=result.finished_at,
+            randomSeed=result.random_seed,
+            requested=self._generated_count if self._frozen_result is None else result.requested,
+            submitted=self._submitted_count if self._frozen_result is None else result.submitted,
+            submissionFailed=(
+                self._submission_failed_count if self._frozen_result is None else result.submission_failed
+            ),
+            transmitted=self._transmitted_count if self._frozen_result is None else result.transmitted,
+            delivered=self._unique_deliveries if self._frozen_result is None else result.delivered,
+            metrics=metrics,
+            failure=result.failure,
+        )
+
+    def result(self) -> TrafficRunResult | None:
+        if self._frozen_result is not None:
+            return self._frozen_result.model_copy(deep=True)
+        if self.current is None:
+            return None
         return self.current.model_copy(deep=True)
+
+    def snapshot(self) -> TrafficRunResult | None:
+        """Return the full result for compatibility; live endpoints should use summary()."""
+
+        return self.result()
 
     def record_rf_transmission(
         self, transmitter: str, packet: mesh_pb2.MeshPacket, packet_airtime_ms: int
     ) -> None:
         if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
             return
-        message = self._messages_by_packet.get(packet.id)
+        message = self._message_for_packet_identity(packet)
         if message is None:
             return
-        message.transmitted = True
+        origin = self._packet_origin(packet)
+        if not message.transmitted:
+            message.transmitted = True
+            self._transmitted_count += 1
         self._rf_transmitters.append(transmitter)
         self._airtimes_ms.append(packet_airtime_ms)
-        if getattr(packet, "from") != self.hardware_ids[transmitter]:
+        self._rf_transmission_count += 1
+        self._observed_airtime_ms += packet_airtime_ms
+        self._per_node_transmit_counts[transmitter] += 1
+        if origin != self.hardware_ids[transmitter]:
             self._relay_transmissions += 1
 
-    def record_drop(self, reason: str) -> None:
-        if self.current is not None:
-            self._drop_reasons.append(reason)
+    def record_drop(self, transmitter: str, packet: mesh_pb2.MeshPacket, reason: str) -> None:
+        del transmitter
+        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+            return
+        if self._message_for_packet_identity(packet) is None:
+            return
+        self._drop_reasons.append(reason)
+        self._drop_counts[reason] += 1
 
     def record_failed_receptions(self, node_id: str, total: int) -> None:
+        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+            return
         previous = self._latest_failed_receptions.get(node_id)
         self._latest_failed_receptions[node_id] = total
-        if (
-            previous is not None
-            and self.current is not None
-            and self.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}
-        ):
+        if previous is not None:
             self._failed_receptions += max(0, total - previous)
 
     def set_event_loop_lag(self, lag_ms: float) -> None:
-        self._event_loop_lag_ms = lag_ms
+        if self.current is not None and self.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+            self._event_loop_lag_ms = lag_ms
 
     async def handle_from_radio(self, node_id: str, message: mesh_pb2.FromRadio) -> None:
-        if self.current is None or message.WhichOneof("payload_variant") != "packet":
+        if (
+            self.current is None
+            or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}
+            or message.WhichOneof("payload_variant") != "packet"
+        ):
             return
         packet = message.packet
         if packet.WhichOneof("payload_variant") != "decoded":
             return
         if packet.decoded.portnum == portnums_pb2.TEXT_MESSAGE_APP:
-            parsed = self._parse_identifier(bytes(packet.decoded.payload))
-            if parsed is None or parsed[0] != self.current.run_id:
-                return
-            _, sequence = parsed
-            generated = self._messages_by_key.get((self.current.run_id, sequence))
+            generated = self._correlated_delivery_message(packet)
             if generated is None:
                 return
+            sequence = generated.sequence
             if node_id in generated.delivered_to:
                 self._duplicates += 1
                 return
             generated.delivered_to.append(node_id)
+            if node_id != generated.source_node:
+                self._receiver_deliveries += 1
+                if (
+                    self.current.request.kind == TrafficKind.DIRECT_TEXT
+                    and node_id == generated.destination_node
+                ):
+                    if sequence not in self._delivered_sequences:
+                        self._delivered_sequences.add(sequence)
+                        self._unique_deliveries += 1
+                elif self.current.request.kind == TrafficKind.BROADCAST_TEXT:
+                    if sequence not in self._delivered_sequences:
+                        self._delivered_sequences.add(sequence)
+                        self._unique_deliveries += 1
             self._latencies_ms.append((time.monotonic() - generated.generated_monotonic) * 1000)
             self.event_broker.publish(
                 PacketEvent(
@@ -267,19 +442,33 @@ class TrafficController:
                 )
             )
         elif packet.decoded.portnum == portnums_pb2.ROUTING_APP and packet.decoded.request_id:
-            generated = self._messages_by_packet.get(packet.decoded.request_id)
-            if generated is None:
+            acknowledgment_origin = self.hardware_ids.get(node_id)
+            if acknowledgment_origin is None:
+                return
+            generated = self._messages_by_packet.get(
+                (acknowledgment_origin, packet.decoded.request_id)
+            )
+            if generated is None or not generated.submitted or not generated.transmitted:
                 return
             routing = mesh_pb2.Routing()
             routing.ParseFromString(packet.decoded.payload)
             if routing.error_reason == mesh_pb2.Routing.Error.NONE:
-                generated.acknowledged = True
+                response_origin = self._packet_origin(packet)
+                if self.current.request.kind == TrafficKind.DIRECT_TEXT:
+                    if response_origin != self.hardware_ids[generated.destination_node]:
+                        return
+                elif response_origin == acknowledgment_origin:
+                    return
+                if not generated.acknowledged:
+                    generated.acknowledged = True
+                    self._acknowledgments += 1
                 event_type = EventType.ACKNOWLEDGMENT
                 result = "acknowledged"
             else:
                 event_type = EventType.ROUTING_ERROR
                 result = mesh_pb2.Routing.Error.Name(routing.error_reason)
                 self._drop_reasons.append(result)
+                self._drop_counts[result] += 1
             self.event_broker.publish(
                 PacketEvent(
                     monotonicSeconds=time.monotonic(),
@@ -299,30 +488,38 @@ class TrafficController:
         randomizer = random.Random(request.seed)
         interval = 60 / request.messages_per_minute
         started = time.monotonic()
-        next_send = {source: started for source in request.source_nodes}
+        messages_per_source = self._messages_per_source(request)
+        next_tick = {source: 0 for source in request.source_nodes}
         round_robin = {source: 0 for source in request.source_nodes}
         try:
-            while True:
-                source = min(next_send, key=next_send.__getitem__)
-                scheduled = next_send[source]
-                if scheduled - started >= request.duration_seconds:
-                    break
+            while next_tick:
+                source = min(next_tick, key=next_tick.__getitem__)
+                tick = next_tick[source]
+                scheduled = started + tick * interval
                 await asyncio.sleep(max(0, scheduled - time.monotonic()))
                 destination = self._destination_for(
                     request, source, randomizer=randomizer, round_robin=round_robin
                 )
                 await self._submit(source, destination, randomizer)
-                next_send[source] += interval
+                if tick + 1 == messages_per_source:
+                    del next_tick[source]
+                else:
+                    next_tick[source] = tick + 1
             await asyncio.sleep(self.settle_seconds)
             self.state = TrafficRunState.COMPLETED
             await self._finish(TrafficRunState.COMPLETED)
         except asyncio.CancelledError:
-            self.state = TrafficRunState.CANCELLED
-            await self._finish(TrafficRunState.CANCELLED)
+            final_state = (
+                TrafficRunState.FAILED
+                if self.state == TrafficRunState.FAILED
+                else TrafficRunState.CANCELLED
+            )
+            await self._finish(final_state)
             raise
         except Exception as exc:
             self.state = TrafficRunState.FAILED
-            self.current.failure = str(exc)
+            if self.current is not None:
+                self.current.failure = str(exc)
             await self._finish(TrafficRunState.FAILED)
 
     async def _submit(self, source: str, destination: str, randomizer: random.Random) -> None:
@@ -336,12 +533,12 @@ class TrafficController:
                 f"payloadBytes {requested_size} is smaller than encoded traffic identifier {len(marker)}"
             )
         payload = marker + b"x" * (requested_size - len(marker))
-        packet_id = randomizer.randrange(1, 0xFFFFFFFF)
+        packet_id = self._allocate_packet_id(source, randomizer)
         packet = mesh_pb2.MeshPacket(
             id=packet_id,
             to=0xFFFFFFFF if destination == "broadcast" else self.hardware_ids[destination],
             want_ack=self.current.request.acknowledgment_requested,
-            hop_limit=self.scenario.rf.hop_limit,
+            hop_limit=self._run_scenario.rf.hop_limit,
             priority=mesh_pb2.MeshPacket.Priority.RELIABLE,
         )
         packet.decoded.portnum = portnums_pb2.TEXT_MESSAGE_APP
@@ -355,18 +552,26 @@ class TrafficController:
             submitted=False,
         )
         self.current.generated_messages.append(generated)
-        self.current.requested += 1
-        self._messages_by_packet[packet_id] = generated
+        self._generated_count += 1
+        self._receiver_opportunities += (
+            len(self._run_scenario.nodes) - 1
+            if self.current.request.kind == TrafficKind.BROADCAST_TEXT
+            else 1
+        )
+        self.current.requested = self._generated_count
+        self._messages_by_packet[(self.hardware_ids[source], packet_id)] = generated
         self._messages_by_key[(self.current.run_id, self._sequence)] = generated
         request = mesh_pb2.ToRadio()
         request.packet.CopyFrom(packet)
         try:
             await self.gateways[source].send_to_radio(request, source="traffic")
             generated.submitted = True
-            self.current.submitted += 1
+            self._submitted_count += 1
+            self.current.submitted = self._submitted_count
         except Exception as exc:
             generated.submission_error = str(exc)
-            self.current.submission_failed += 1
+            self._submission_failed_count += 1
+            self.current.submission_failed = self._submission_failed_count
         self.event_broker.publish(
             PacketEvent(
                 monotonicSeconds=generated.generated_monotonic,
@@ -390,7 +595,7 @@ class TrafficController:
     ) -> str:
         if request.kind == TrafficKind.BROADCAST_TEXT:
             return "broadcast"
-        candidates = [node.id for node in self.scenario.nodes if node.id != source]
+        candidates = [node.id for node in self._run_scenario.nodes if node.id != source]
         if request.destination_strategy == DestinationStrategy.FIXED:
             if request.fixed_destination is None:
                 raise RuntimeError("fixed destination was not validated")
@@ -402,88 +607,80 @@ class TrafficController:
         return randomizer.choice(candidates)
 
     async def _finish(self, state: TrafficRunState) -> None:
-        if self.current is None:
+        if self.current is None or self._frozen_result is not None:
             return
-        self.current.state = state
-        self.current.finished_at = datetime.now(UTC)
-        self.current.transmitted = sum(message.transmitted for message in self.current.generated_messages)
-        delivered_keys = self._delivered_keys()
-        self.current.delivered = len(delivered_keys)
-        self.current.metrics = self._snapshot_metrics(delivered_keys=delivered_keys)
-        self.results_root.mkdir(parents=True, exist_ok=True)
-        destination = self.results_root / f"{self.current.run_id}.json"
-        temporary = destination.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(self.current.model_dump(mode="json", by_alias=True), indent=2) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(destination)
+        self.state = state
+        current = self.current
+        current.state = state
+        current.finished_at = datetime.now(UTC)
+        current.requested = self._generated_count
+        current.submitted = self._submitted_count
+        current.submission_failed = self._submission_failed_count
+        current.transmitted = self._transmitted_count
+        current.delivered = self._unique_deliveries
+        self._metrics = self._final_metrics()
+        current.metrics = self._metrics
+        frozen = current.model_copy(deep=True)
+        try:
+            self.results_root.mkdir(parents=True, exist_ok=True)
+            destination = self.results_root / f"{frozen.run_id}.json"
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(frozen.model_dump(mode="json", by_alias=True), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(destination)
+        except Exception as exc:
+            self.state = TrafficRunState.FAILED
+            current.state = TrafficRunState.FAILED
+            persistence_failure = f"result persistence failed: {exc}"
+            current.failure = (
+                f"{current.failure}; {persistence_failure}"
+                if current.failure
+                else persistence_failure
+            )
+            frozen = current.model_copy(deep=True)
+            LOGGER.exception(
+                "traffic result persistence failed",
+                extra={"traffic_run_id": current.run_id},
+            )
+        self._frozen_result = frozen
+        self.current = frozen.model_copy(deep=True)
 
-    def _delivered_keys(self) -> set[tuple[str, int]]:
-        if self.current is None:
-            return set()
-        if self.current.request.kind == TrafficKind.DIRECT_TEXT:
-            return {
-                (self.current.run_id, message.sequence)
-                for message in self.current.generated_messages
-                if message.destination_node in message.delivered_to
-            }
-        return {
-            (f"{self.current.run_id}:{receiver}", message.sequence)
-            for message in self.current.generated_messages
-            for receiver in message.delivered_to
-            if receiver != message.source_node
-        }
-
-    def _snapshot_metrics(
-        self, *, delivered_keys: set[tuple[str, int]] | None = None
-    ) -> MetricsSnapshot:
-        generated = len(self.current.generated_messages) if self.current is not None else 0
-        receiver_keys = delivered_keys or set()
-        delivered_message_ids = (
-            {
-                (self.current.run_id, message.sequence)
-                for message in self.current.generated_messages
-                if (
-                    message.destination_node in message.delivered_to
-                    if self.current.request.kind == TrafficKind.DIRECT_TEXT
-                    else any(
-                        receiver != message.source_node for receiver in message.delivered_to
-                    )
-                )
-            }
-            if self.current is not None
-            else set()
-        )
+    def _final_metrics(self) -> MetricsSnapshot:
+        delivered_ids: set[tuple[str, int]] = set()
+        if self.current is not None:
+            if self.current.request.kind == TrafficKind.DIRECT_TEXT:
+                delivered_ids = {
+                    (self.current.run_id, message.sequence)
+                    for message in self.current.generated_messages
+                    if message.destination_node in message.delivered_to
+                }
+            else:
+                delivered_ids = {
+                    (self.current.run_id, message.sequence)
+                    for message in self.current.generated_messages
+                    if any(receiver != message.source_node for receiver in message.delivered_to)
+                }
         receivers_per_broadcast = (
             {
                 str(message.sequence): len(
                     {receiver for receiver in message.delivered_to if receiver != message.source_node}
                 )
-                for message in self.current.generated_messages
+                for message in (self.current.generated_messages if self.current is not None else [])
             }
             if self.current is not None and self.current.request.kind == TrafficKind.BROADCAST_TEXT
             else {}
         )
-        receiver_opportunities = (
-            generated * (len(self.scenario.nodes) - 1)
-            if self.current is not None and self.current.request.kind == TrafficKind.BROADCAST_TEXT
-            else generated
-        )
-        acknowledgments = (
-            sum(message.acknowledged for message in self.current.generated_messages)
-            if self.current is not None
-            else 0
-        )
         expected_acknowledgments = (
-            generated
+            self._generated_count
             if self.current is not None and self.current.request.acknowledgment_requested
             else 0
         )
         return calculate_metrics(
-            generated=generated,
-            delivered_ids=delivered_message_ids,
-            acknowledged=acknowledgments,
+            generated=self._generated_count,
+            delivered_ids=delivered_ids,
+            acknowledged=self._acknowledgments,
             acknowledgment_expected=expected_acknowledgments,
             latencies_ms=self._latencies_ms,
             rf_transmitters=self._rf_transmitters,
@@ -493,13 +690,54 @@ class TrafficController:
             drop_reasons=self._drop_reasons,
             airtimes_ms=self._airtimes_ms,
             event_loop_lag_ms=self._event_loop_lag_ms,
-            receiver_deliveries=len(receiver_keys),
-            receiver_delivery_opportunities=receiver_opportunities,
+            receiver_deliveries=self._receiver_deliveries,
+            receiver_delivery_opportunities=self._receiver_opportunities,
             receivers_per_broadcast=receivers_per_broadcast,
         )
 
-    def _validate_request_nodes(self, request: TrafficRunRequest) -> None:
-        known = {node.id for node in self.scenario.nodes}
+    def _live_metrics(self) -> MetricsSummary:
+        return self._summary_metrics(self._live_metrics_snapshot())
+
+    def _live_metrics_snapshot(self) -> MetricsSnapshot:
+        expected_acknowledgments = (
+            self._generated_count
+            if self.current is not None and self.current.request.acknowledgment_requested
+            else 0
+        )
+        complete = calculate_metrics(
+            generated=self._generated_count,
+            delivered_ids=set(),
+            delivered_count=self._unique_deliveries,
+            acknowledged=self._acknowledgments,
+            acknowledgment_expected=expected_acknowledgments,
+            latencies_ms=[],
+            rf_transmitters=[],
+            rf_transmission_count=self._rf_transmission_count,
+            relay_transmissions=self._relay_transmissions,
+            duplicate_receptions=self._duplicates,
+            failed_receptions=self._failed_receptions,
+            drop_reasons=[],
+            drops_by_reason=dict(self._drop_counts),
+            airtimes_ms=[],
+            observed_airtime_ms=self._observed_airtime_ms,
+            per_node_transmit_counts=dict(self._per_node_transmit_counts),
+            event_loop_lag_ms=self._event_loop_lag_ms,
+            receiver_deliveries=self._receiver_deliveries,
+            receiver_delivery_opportunities=self._receiver_opportunities,
+            receivers_per_broadcast={},
+        )
+        return complete
+
+    @staticmethod
+    def _summary_metrics(metrics: MetricsSnapshot) -> MetricsSummary:
+        values = metrics.model_dump(mode="python", by_alias=True, exclude={"receivers_per_broadcast"})
+        return MetricsSummary.model_validate(values)
+
+    def _validate_request_nodes(
+        self, request: TrafficRunRequest, *, scenario_snapshot: Scenario | None = None
+    ) -> None:
+        scenario = scenario_snapshot or self.scenario
+        known = {node.id for node in scenario.nodes}
         unknown_sources = set(request.source_nodes) - known
         if unknown_sources:
             raise ValueError(f"unknown traffic sources: {sorted(unknown_sources)}")
@@ -508,10 +746,75 @@ class TrafficController:
         if request.fixed_destination is not None:
             if request.fixed_destination not in known:
                 raise ValueError(f"unknown fixed destination: {request.fixed_destination}")
-            if request.fixed_destination in request.source_nodes and len(request.source_nodes) == 1:
-                raise ValueError("direct traffic destination cannot equal its only source")
+            if request.kind == TrafficKind.DIRECT_TEXT and request.fixed_destination in request.source_nodes:
+                raise ValueError("direct traffic destination cannot be one of its source nodes")
 
-    def _parse_identifier(self, payload: bytes) -> tuple[str, int] | None:
+    @staticmethod
+    def _maximum_sequence(request: TrafficRunRequest) -> int:
+        return len(request.source_nodes) * TrafficController._messages_per_source(request)
+
+    @staticmethod
+    def _messages_per_source(request: TrafficRunRequest) -> int:
+        offered = (
+            Decimal(str(request.duration_seconds))
+            * Decimal(str(request.messages_per_minute))
+            / Decimal(60)
+        )
+        return max(1, int(offered.to_integral_value(rounding=ROUND_CEILING)))
+
+    def _allocate_packet_id(self, source: str, randomizer: random.Random) -> int:
+        used = self._packet_ids_by_source.setdefault(source, set())
+        while True:
+            packet_id = randomizer.randrange(1, 0xFFFFFFFF)
+            if packet_id not in used:
+                used.add(packet_id)
+                return packet_id
+
+    def _message_for_packet_identity(
+        self, packet: mesh_pb2.MeshPacket
+    ) -> GeneratedMessage | None:
+        return self._messages_by_packet.get((self._packet_origin(packet), packet.id))
+
+    def _correlated_delivery_message(
+        self, packet: mesh_pb2.MeshPacket
+    ) -> GeneratedMessage | None:
+        if self.current is None:
+            return None
+        identifier = self._traffic_identifier_from_packet(packet)
+        if identifier is None or identifier[0] != self.current.run_id:
+            return None
+        message = self._message_for_packet_identity(packet)
+        if message is None or message.sequence != identifier[1]:
+            return None
+        return message
+
+    @classmethod
+    def _traffic_identifier_from_packet(
+        cls, packet: mesh_pb2.MeshPacket
+    ) -> tuple[str, int] | None:
+        if packet.WhichOneof("payload_variant") != "decoded":
+            return None
+        if packet.decoded.portnum == portnums_pb2.TEXT_MESSAGE_APP:
+            payload = bytes(packet.decoded.payload)
+        elif packet.decoded.portnum == portnums_pb2.SIMULATOR_APP:
+            compressed = mesh_pb2.Compressed()
+            try:
+                compressed.ParseFromString(packet.decoded.payload)
+            except Exception:
+                return None
+            if compressed.portnum != portnums_pb2.TEXT_MESSAGE_APP:
+                return None
+            payload = bytes(compressed.data)
+        else:
+            return None
+        return cls._parse_identifier(payload)
+
+    @staticmethod
+    def _packet_origin(packet: mesh_pb2.MeshPacket) -> int:
+        return int(getattr(packet, "from"))
+
+    @staticmethod
+    def _parse_identifier(payload: bytes) -> tuple[str, int] | None:
         try:
             prefix, run_id, sequence, _ = payload.decode("utf-8", errors="strict").split(":", 3)
             if prefix != TRAFFIC_PREFIX:
@@ -524,10 +827,26 @@ class TrafficController:
         self._sequence = 0
         self._messages_by_packet.clear()
         self._messages_by_key.clear()
+        self._delivered_sequences.clear()
         self._latencies_ms.clear()
         self._rf_transmitters.clear()
         self._airtimes_ms.clear()
         self._relay_transmissions = 0
         self._duplicates = 0
         self._failed_receptions = 0
+        self._latest_failed_receptions.clear()
         self._drop_reasons.clear()
+        self._drop_counts.clear()
+        self._event_loop_lag_ms = None
+        self._generated_count = 0
+        self._submitted_count = 0
+        self._submission_failed_count = 0
+        self._transmitted_count = 0
+        self._unique_deliveries = 0
+        self._receiver_deliveries = 0
+        self._receiver_opportunities = 0
+        self._acknowledgments = 0
+        self._rf_transmission_count = 0
+        self._observed_airtime_ms = 0
+        self._per_node_transmit_counts.clear()
+        self._metrics = None

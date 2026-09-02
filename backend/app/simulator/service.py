@@ -23,6 +23,7 @@ from backend.app.models import (
     apply_topology_preset,
     default_scenario,
 )
+from backend.app.provenance import DEFAULT_METADATA_PATH, BuildMetadata, load_build_metadata
 from backend.app.runtime import (
     NativeProcessSupervisor,
     NodeProcessState,
@@ -31,11 +32,17 @@ from backend.app.runtime import (
     request_node_info,
     verify_node,
 )
-from backend.app.traffic import TrafficController, TrafficRunRequest, TrafficRunResult, TrafficRunState
+from backend.app.traffic import (
+    TrafficController,
+    TrafficRunRequest,
+    TrafficRunResult,
+    TrafficRunState,
+    TrafficRunSummary,
+    summarize_result,
+)
 
 from .medium import DirectedMedium
 
-FIRMWARE_IMAGE_DIGEST = "sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4"
 COLLISION_MARKER_DEFAULT = "/usr/share/meshtastic-lab/native-collision-enabled"
 LOGGER = logging.getLogger(__name__)
 
@@ -74,7 +81,13 @@ class CapabilityView(BaseModel):
         default_factory=lambda: ["linux/amd64", "linux/arm64"],
         alias="supportedContainerArchitectures",
     )
-    firmware_image_digest: str = Field(default=FIRMWARE_IMAGE_DIGEST, alias="firmwareImageDigest")
+    provenance_available: bool = Field(alias="provenanceAvailable")
+    firmware_commit: str = Field(alias="firmwareCommit")
+    collision_patch_sha256: str = Field(alias="collisionPatchSha256")
+    firmware_binary_sha256: str = Field(alias="firmwareBinarySha256")
+    build_architecture: str = Field(alias="buildArchitecture")
+    client_library_version: str = Field(alias="clientLibraryVersion")
+    upstream_base_image_digest: str = Field(alias="upstreamBaseImageDigest")
 
 
 class NodeView(BaseModel):
@@ -125,6 +138,7 @@ class SimulatorService:
         binary_path: Path | None = None,
         data_root: Path | None = None,
         collision_marker: Path | None = None,
+        build_metadata_path: Path | None = None,
         warmup_seconds: float = 5.0,
     ) -> None:
         binary = binary_path or Path(os.environ.get("MESHTASTICD_BIN", "/usr/bin/meshtasticd"))
@@ -132,9 +146,13 @@ class SimulatorService:
         marker = collision_marker or Path(
             os.environ.get("MESHTASTIC_COLLISION_MARKER", COLLISION_MARKER_DEFAULT)
         )
+        metadata_path = build_metadata_path or Path(
+            os.environ.get("MESHTASTIC_BUILD_METADATA", str(DEFAULT_METADATA_PATH))
+        )
         self.data_root = root
         self.results_root = root / "runs"
         self.collision_marker = marker
+        self.build_metadata: BuildMetadata = load_build_metadata(metadata_path)
         self.warmup_seconds = warmup_seconds
         self.scenario = default_scenario()
         self.state = LifecycleState.STOPPED
@@ -155,11 +173,13 @@ class SimulatorService:
         self.medium: DirectedMedium | None = None
         self.traffic: TrafficController | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._topology_lock = asyncio.Lock()
         self._failure_cleanup_task: asyncio.Task[None] | None = None
         self._event_loop_lag_task: asyncio.Task[None] | None = None
 
     def capabilities(self) -> CapabilityView:
         available = self.collision_marker.is_file()
+        provenance_available = self.build_metadata.firmware_commit != "unavailable"
         return CapabilityView(
             collisionModel="native",
             collisionAvailable=available,
@@ -168,6 +188,13 @@ class SimulatorService:
                 if available
                 else "Native collision marker is absent. Simulation start is disabled."
             ),
+            provenanceAvailable=provenance_available,
+            firmwareCommit=self.build_metadata.firmware_commit,
+            collisionPatchSha256=self.build_metadata.collision_patch_sha256,
+            firmwareBinarySha256=self.build_metadata.firmware_binary_sha256,
+            buildArchitecture=self.build_metadata.build_architecture,
+            clientLibraryVersion=self.build_metadata.client_library_version,
+            upstreamBaseImageDigest=self.build_metadata.upstream_base_image_digest,
         )
 
     def lifecycle(self) -> LifecycleView:
@@ -190,10 +217,16 @@ class SimulatorService:
                 return CommandResult(commandId=command_id, state=self.state, detail="already running")
             if self.state not in {LifecycleState.STOPPED, LifecycleState.FAILED}:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", f"cannot start from {self.state}")
-            if not self.capabilities().collision_available:
+            capabilities = self.capabilities()
+            if not capabilities.collision_available:
                 raise SimulationConflict(
                     "NATIVE_COLLISION_UNAVAILABLE",
                     "the runtime does not contain a verified collision-enabled native firmware build",
+                )
+            if not capabilities.provenance_available:
+                raise SimulationConflict(
+                    "BUILD_METADATA_UNAVAILABLE",
+                    "the runtime does not contain build metadata for the native firmware artifact",
                 )
 
             self.simulation_id = str(uuid.uuid4())
@@ -212,6 +245,7 @@ class SimulatorService:
                         public_port=node.api_port,
                         event_handler=self._on_gateway_event,
                         from_radio_handler=self._on_from_radio,
+                        public_clients_enabled=False,
                     )
                     for node in self.scenario.nodes
                 }
@@ -228,6 +262,7 @@ class SimulatorService:
                     hardware_ids=hardware_ids,
                     event_broker=self.event_broker,
                     results_root=self.results_root,
+                    build_metadata=self.build_metadata,
                 )
                 self.medium = DirectedMedium(
                     scenario=self.scenario,
@@ -236,6 +271,7 @@ class SimulatorService:
                     hardware_ids=hardware_ids,
                     transmission_handler=self.traffic.record_rf_transmission,
                     drop_handler=self.traffic.record_drop,
+                    failure_handler=self._on_medium_failure,
                 )
                 await self.medium.start()
                 self.state = LifecycleState.WARMING_UP
@@ -245,9 +281,19 @@ class SimulatorService:
                     datetime.now(UTC).timestamp() + warmup_deadline + self.warmup_seconds, UTC
                 )
                 self._publish_lifecycle()
-                await self._warm_up_nodes()
+                missing_pairs, expected_pairs = await self._warm_up_nodes()
+                if self.state == LifecycleState.FAILED:
+                    raise RuntimeError(self.message)
                 self.state = LifecycleState.RUNNING
+                await asyncio.gather(
+                    *(gateway.enable_public_clients() for gateway in self.gateways.values())
+                )
                 self.message = f"{len(self.gateways)} native nodes are running"
+                if missing_pairs:
+                    self.message += (
+                        f"; warm-up observed {expected_pairs - len(missing_pairs)} of "
+                        f"{expected_pairs} graph-connected pairs"
+                    )
                 self.warming_up_until = None
                 self._event_loop_lag_task = asyncio.create_task(
                     self._measure_event_loop_lag(), name="event-loop-lag"
@@ -294,36 +340,57 @@ class SimulatorService:
         return self.scenario
 
     async def update_link(self, link: DirectedLink) -> DirectedLink:
-        if self.state != LifecycleState.RUNNING or self.medium is None:
-            raise SimulationConflict("INVALID_LIFECYCLE_STATE", "runtime links require RUNNING state")
-        await self.medium.update_link(link)
-        links = [
-            link if (current.from_node, current.to_node) == (link.from_node, link.to_node) else current
-            for current in self.scenario.links
-        ]
-        self.scenario = self.scenario.model_copy(update={"links": links})
-        return link
+        async with self._topology_lock:
+            if self.state != LifecycleState.RUNNING or self.medium is None:
+                raise SimulationConflict("INVALID_LIFECYCLE_STATE", "runtime links require RUNNING state")
+            self._reject_topology_change_during_traffic()
+            await self.medium.update_link(link)
+            links = [
+                link
+                if (current.from_node, current.to_node) == (link.from_node, link.to_node)
+                else current
+                for current in self.scenario.links
+            ]
+            self.scenario = self.scenario.model_copy(update={"links": links})
+            return link
 
     async def apply_topology(self, preset: TopologyPreset) -> Scenario:
-        updated = apply_topology_preset(self.scenario, preset)
-        if self.state == LifecycleState.STOPPED:
+        async with self._topology_lock:
+            updated = apply_topology_preset(self.scenario, preset)
+            if self.state == LifecycleState.STOPPED:
+                self.scenario = updated
+                return updated
+            if self.state != LifecycleState.RUNNING or self.medium is None:
+                raise SimulationConflict(
+                    "INVALID_LIFECYCLE_STATE", f"cannot apply topology from {self.state}"
+                )
+            self._reject_topology_change_during_traffic()
+            await self.medium.apply_links(updated.links)
             self.scenario = updated
             return updated
-        if self.state != LifecycleState.RUNNING or self.medium is None:
-            raise SimulationConflict("INVALID_LIFECYCLE_STATE", f"cannot apply topology from {self.state}")
-        await self.medium.apply_links(updated.links)
-        self.scenario = updated
-        return updated
 
-    def start_traffic(self, request: TrafficRunRequest) -> str:
-        if self.state != LifecycleState.RUNNING or self.traffic is None:
-            raise SimulationConflict("INVALID_LIFECYCLE_STATE", "traffic requires RUNNING state")
-        try:
-            return self.traffic.start(request)
-        except RuntimeError as exc:
-            raise SimulationConflict("TRAFFIC_RUN_ACTIVE", str(exc)) from exc
-        except ValueError as exc:
-            raise SimulationConflict("INVALID_TRAFFIC_REQUEST", str(exc)) from exc
+    async def start_traffic(self, request: TrafficRunRequest) -> str:
+        async with self._topology_lock:
+            if self.state != LifecycleState.RUNNING or self.traffic is None:
+                raise SimulationConflict("INVALID_LIFECYCLE_STATE", "traffic requires RUNNING state")
+            try:
+                return self.traffic.start(
+                    request, scenario_snapshot=self.scenario.model_copy(deep=True)
+                )
+            except RuntimeError as exc:
+                raise SimulationConflict("TRAFFIC_RUN_ACTIVE", str(exc)) from exc
+            except ValueError as exc:
+                raise SimulationConflict("INVALID_TRAFFIC_REQUEST", str(exc)) from exc
+
+    def _reject_topology_change_during_traffic(self) -> None:
+        if self.traffic is not None and self.traffic.state in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+        }:
+            raise SimulationConflict(
+                "TRAFFIC_RUN_ACTIVE",
+                "topology changes are allowed only between traffic runs",
+            )
 
     async def stop_traffic(self) -> None:
         if self.traffic is not None:
@@ -332,11 +399,21 @@ class SimulatorService:
     def traffic_result(self, run_id: str) -> TrafficRunResult:
         if self.traffic is not None and self.traffic.current is not None:
             if self.traffic.current.run_id == run_id:
-                return self.traffic.current
+                result = self.traffic.result()
+                if result is not None:
+                    return result
         path = self.results_root / f"{run_id}.json"
         if not path.is_file():
             raise FileNotFoundError(run_id)
         return TrafficRunResult.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def traffic_summary(self, run_id: str) -> TrafficRunSummary:
+        if self.traffic is not None and self.traffic.current is not None:
+            if self.traffic.current.run_id == run_id:
+                summary = self.traffic.summary()
+                if summary is not None:
+                    return summary
+        return summarize_result(self.traffic_result(run_id))
 
     def completed_runs(self) -> list[str]:
         if not self.results_root.is_dir():
@@ -376,8 +453,8 @@ class SimulatorService:
             node = next(candidate for candidate in self.scenario.nodes if candidate.id == node_id)
             verification = await asyncio.to_thread(
                 configure_and_verify_node,
-                hostname="127.0.0.1",
-                port=node.api_port,
+                hostname=self.gateways[node_id].control_host,
+                port=self.gateways[node_id].control_port,
                 node=node,
                 rf=self.scenario.rf,
                 channel=self.scenario.channel,
@@ -397,8 +474,8 @@ class SimulatorService:
                 await gateway.start()
                 verification = await asyncio.to_thread(
                     verify_node,
-                    hostname="127.0.0.1",
-                    port=node.api_port,
+                    hostname=gateway.control_host,
+                    port=gateway.control_port,
                     node=node,
                     rf=self.scenario.rf,
                     channel=self.scenario.channel,
@@ -426,17 +503,18 @@ class SimulatorService:
                     detail=event.detail,
                 )
             )
-        if event.kind == "gateway.failed" and self.state in {
+        if event.kind in {"gateway.failed", "gateway.rf_queue_full"} and self.state in {
             LifecycleState.WARMING_UP,
             LifecycleState.RUNNING,
         }:
-            self.state = LifecycleState.FAILED
-            self.message = f"Gateway for {event.node_id} failed: {event.detail}"
-            self._publish_lifecycle()
-            if self._failure_cleanup_task is None or self._failure_cleanup_task.done():
-                self._failure_cleanup_task = asyncio.create_task(
-                    self._cleanup_resources(), name="failed-gateway-cleanup"
-                )
+            category = (
+                "SIMULATOR_OVERLOAD"
+                if event.kind == "gateway.rf_queue_full"
+                else "GATEWAY_FAILED"
+            )
+            self._schedule_runtime_failure(
+                category, f"Gateway for {event.node_id}: {event.detail}"
+            )
 
     async def _on_from_radio(self, node_id: str, message: mesh_pb2.FromRadio) -> None:
         if self.traffic is not None:
@@ -496,53 +574,71 @@ class SimulatorService:
             elif variant == "device_metrics":
                 metrics.channel_utilization = telemetry.device_metrics.channel_utilization
 
-    async def _warm_up_nodes(self) -> None:
+    async def _warm_up_nodes(self) -> tuple[set[tuple[str, str]], int]:
         expected = self.scenario.reachable_pairs()
-        if not expected:
-            return
         self.nodeinfo_observations.clear()
         deadline_seconds = self._warmup_deadline_seconds()
-        try:
-            async with asyncio.timeout(deadline_seconds):
-                for node in self.scenario.nodes:
-                    source_expected = {pair for pair in expected if pair[0] == node.id}
-                    while source_expected - self.nodeinfo_observations:
-                        await asyncio.to_thread(
-                            request_node_info,
-                            hostname="127.0.0.1",
-                            port=node.api_port,
-                        )
-                        await self.gateways[node.id].client_disconnected.wait()
-                        if source_expected.issubset(self.nodeinfo_observations):
-                            break
-                        self._nodeinfo_changed.clear()
-                        if source_expected.issubset(self.nodeinfo_observations):
-                            break
-                        try:
-                            await asyncio.wait_for(self._nodeinfo_changed.wait(), timeout=3)
-                        except TimeoutError:
-                            continue
-        except TimeoutError as exc:
-            missing = sorted(expected - self.nodeinfo_observations)
-            raise RuntimeError(
-                f"firmware warm-up did not observe reachable pairs within "
-                f"{deadline_seconds}s: {missing}"
-            ) from exc
+
+        async def request_once(index: int, node_id: str) -> str | None:
+            await asyncio.sleep(index * 0.15)
+            gateway = self.gateways[node_id]
+            try:
+                await asyncio.to_thread(
+                    request_node_info,
+                    hostname=gateway.control_host,
+                    port=gateway.control_port,
+                    deadline_seconds=deadline_seconds,
+                )
+                await asyncio.wait_for(gateway.client_disconnected.wait(), timeout=5)
+            except Exception as exc:
+                return f"{node_id}: {exc}"
+            return None
+
+        errors = await asyncio.gather(
+            *(request_once(index, node.id) for index, node in enumerate(self.scenario.nodes))
+        )
+        for error in errors:
+            if error is not None:
+                LOGGER.warning("best-effort NodeInfo warm-up failed", extra={"detail": error})
         await asyncio.sleep(self.warmup_seconds)
+        missing = expected - self.nodeinfo_observations
+        if missing:
+            LOGGER.warning(
+                "NodeInfo warm-up ended with missing observations",
+                extra={"missing_pair_count": len(missing), "expected_pair_count": len(expected)},
+            )
+        return missing, len(expected)
 
     def _warmup_deadline_seconds(self) -> float:
-        return min(120, 30 + 10 * len(self.scenario.nodes))
+        return min(30, 10 + 2 * len(self.scenario.nodes))
+
+    async def _on_medium_failure(self, node_id: str, exc: Exception) -> None:
+        self._schedule_runtime_failure(
+            "SIMULATOR_OVERLOAD", f"RF medium worker for {node_id} failed: {exc}"
+        )
 
     async def _on_process_failure(self, node_id: str, return_code: int | None) -> None:
         if self.state in {LifecycleState.STOPPING, LifecycleState.STOPPED, LifecycleState.FAILED}:
             return
+        self._schedule_runtime_failure(
+            "FIRMWARE_PROCESS_FAILED", f"Firmware node {node_id} exited with code {return_code}"
+        )
+
+    def _schedule_runtime_failure(self, category: str, detail: str) -> None:
+        if self.state in {LifecycleState.STOPPING, LifecycleState.STOPPED, LifecycleState.FAILED}:
+            return
         self.state = LifecycleState.FAILED
-        self.message = f"Firmware node {node_id} exited with code {return_code}"
+        self.message = f"{category}: {detail}"
         self._publish_lifecycle()
         if self._failure_cleanup_task is None or self._failure_cleanup_task.done():
             self._failure_cleanup_task = asyncio.create_task(
-                self._cleanup_resources(), name="failed-simulation-cleanup"
+                self._fail_traffic_and_cleanup(self.message), name="failed-simulation-cleanup"
             )
+
+    async def _fail_traffic_and_cleanup(self, reason: str) -> None:
+        if self.traffic is not None:
+            await self.traffic.fail(reason)
+        await self._cleanup_resources()
 
     async def _cleanup_resources(self) -> None:
         lag_task, self._event_loop_lag_task = self._event_loop_lag_task, None

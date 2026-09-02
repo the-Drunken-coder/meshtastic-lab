@@ -174,6 +174,19 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
             capabilities = (await client.get("/api/capabilities")).json()
             if not capabilities.get("collisionAvailable"):
                 raise AcceptanceFailure(f"native collision capability unavailable: {capabilities}")
+            provenance_fields = (
+                "firmwareCommit",
+                "collisionPatchSha256",
+                "firmwareBinarySha256",
+                "buildArchitecture",
+                "clientLibraryVersion",
+                "upstreamBaseImageDigest",
+            )
+            if not capabilities.get("provenanceAvailable") or any(
+                capabilities.get(field) in {None, "", "unavailable"}
+                for field in provenance_fields
+            ):
+                raise AcceptanceFailure(f"native build provenance unavailable: {capabilities}")
 
             step = "load and start three-node relay scenario"
             await client.post("/api/simulation/stop")
@@ -269,6 +282,19 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
             persisted.raise_for_status()
             if persisted.json().get("scenarioSnapshot", {}).get("name") != "three-node-relay":
                 raise AcceptanceFailure("persisted run did not contain the exact scenario snapshot")
+            if "generatedMessages" in persisted.json():
+                raise AcceptanceFailure("bounded result endpoint exposed generated message records")
+            exported = await client.get(f"/api/traffic/runs/{run_id}/export")
+            exported.raise_for_status()
+            export_result = exported.json()
+            if not export_result.get("generatedMessages"):
+                raise AcceptanceFailure("completed export omitted generated message records")
+            for field in provenance_fields:
+                if export_result.get(field) != capabilities.get(field):
+                    raise AcceptanceFailure(
+                        f"completed export provenance differs for {field}: "
+                        f"{export_result.get(field)} != {capabilities.get(field)}"
+                    )
 
             return {
                 "simulation": "three-node-relay",

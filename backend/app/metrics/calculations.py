@@ -8,7 +8,7 @@ from collections import Counter
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class MetricsSnapshot(BaseModel):
+class _MetricsBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     generated_application_messages: int = Field(alias="generatedApplicationMessages")
@@ -16,7 +16,6 @@ class MetricsSnapshot(BaseModel):
     delivery_ratio: float | None = Field(alias="deliveryRatio")
     receiver_deliveries: int = Field(alias="receiverDeliveries")
     receiver_delivery_ratio: float | None = Field(alias="receiverDeliveryRatio")
-    receivers_per_broadcast: dict[str, int] = Field(alias="receiversPerBroadcast")
     acknowledgment_success_ratio: float | None = Field(alias="acknowledgmentSuccessRatio")
     median_latency_ms: float | None = Field(alias="medianLatencyMs")
     p95_latency_ms: float | None = Field(alias="p95LatencyMs")
@@ -30,6 +29,16 @@ class MetricsSnapshot(BaseModel):
     observed_airtime_ms: int = Field(alias="observedAirtimeMs")
     per_node_transmit_counts: dict[str, int] = Field(alias="perNodeTransmitCounts")
     event_loop_lag_ms: float | None = Field(default=None, alias="eventLoopLagMs")
+
+
+class MetricsSnapshot(_MetricsBase):
+    """Complete metrics, including the per-message broadcast detail."""
+
+    receivers_per_broadcast: dict[str, int] = Field(alias="receiversPerBroadcast")
+
+
+class MetricsSummary(_MetricsBase):
+    """Bounded live metrics without the per-message broadcast detail."""
 
 
 def percentile(values: list[float], proportion: float, *, minimum_samples: int = 1) -> float | None:
@@ -49,10 +58,29 @@ def percentile(values: list[float], proportion: float, *, minimum_samples: int =
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
+def _percentile_ordered(
+    ordered: list[float], proportion: float, *, minimum_samples: int = 1
+) -> float | None:
+    if len(ordered) < minimum_samples:
+        return None
+    if not 0 <= proportion <= 1:
+        raise ValueError("percentile proportion must be between zero and one")
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * proportion
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 def calculate_metrics(
     *,
     generated: int,
     delivered_ids: set[tuple[str, int]],
+    delivered_count: int | None = None,
     acknowledged: int,
     acknowledgment_expected: int,
     latencies_ms: list[float],
@@ -66,15 +94,21 @@ def calculate_metrics(
     receiver_deliveries: int | None = None,
     receiver_delivery_opportunities: int | None = None,
     receivers_per_broadcast: dict[str, int] | None = None,
+    rf_transmission_count: int | None = None,
+    observed_airtime_ms: int | None = None,
+    per_node_transmit_counts: dict[str, int] | None = None,
+    drops_by_reason: dict[str, int] | None = None,
 ) -> MetricsSnapshot:
-    delivered = len(delivered_ids)
+    delivered = len(delivered_ids) if delivered_count is None else delivered_count
     receiver_count = delivered if receiver_deliveries is None else receiver_deliveries
     receiver_opportunities = (
         generated
         if receiver_delivery_opportunities is None
         else receiver_delivery_opportunities
     )
-    rf_count = len(rf_transmitters)
+    rf_count = len(rf_transmitters) if rf_transmission_count is None else rf_transmission_count
+    # Sort once and reuse the ordered sample for all three exact percentiles.
+    ordered_latencies = sorted(latencies_ms)
     return MetricsSnapshot(
         generatedApplicationMessages=generated,
         uniqueApplicationMessagesDelivered=delivered,
@@ -87,16 +121,20 @@ def calculate_metrics(
         acknowledgmentSuccessRatio=(
             acknowledged / acknowledgment_expected if acknowledgment_expected else None
         ),
-        medianLatencyMs=percentile(latencies_ms, 0.5),
-        p95LatencyMs=percentile(latencies_ms, 0.95, minimum_samples=20),
-        p99LatencyMs=percentile(latencies_ms, 0.99, minimum_samples=100),
+        medianLatencyMs=_percentile_ordered(ordered_latencies, 0.5),
+        p95LatencyMs=_percentile_ordered(ordered_latencies, 0.95, minimum_samples=20),
+        p99LatencyMs=_percentile_ordered(ordered_latencies, 0.99, minimum_samples=100),
         rfTransmissions=rf_count,
         rfTransmissionsPerDelivery=rf_count / receiver_count if receiver_count else None,
         relayTransmissions=relay_transmissions,
         duplicateReceptions=duplicate_receptions,
         failedReceptions=failed_receptions,
-        dropsByReason=dict(Counter(drop_reasons)),
-        observedAirtimeMs=sum(airtimes_ms),
-        perNodeTransmitCounts=dict(Counter(rf_transmitters)),
+        dropsByReason=(dict(Counter(drop_reasons)) if drops_by_reason is None else drops_by_reason),
+        observedAirtimeMs=(sum(airtimes_ms) if observed_airtime_ms is None else observed_airtime_ms),
+        perNodeTransmitCounts=(
+            dict(Counter(rf_transmitters))
+            if per_node_transmit_counts is None
+            else per_node_transmit_counts
+        ),
         eventLoopLagMs=event_loop_lag_ms,
     )

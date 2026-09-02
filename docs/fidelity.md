@@ -30,9 +30,9 @@ RSSI and SNR are metadata supplied to enabled receiver firmware. They are not ca
 
 ## Native collisions
 
-The image builds firmware commit `54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb` with `USERPREFS_SIMRADIO_EMULATE_COLLISIONS=1`. Under that preference, `SimRadio` retains a receive for its calculated airtime. A second overlapping receive marks the current receive bad, increments the firmware `rxBad` statistic, and drops the overlap. A receive can also collide with an active transmission after its preamble window.
+The default image builds firmware commit `54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb` with `USERPREFS_SIMRADIO_EMULATE_COLLISIONS=1`. Under that preference, `SimRadio` retains a receive for its calculated airtime. A second overlapping receive marks the current receive bad, increments the firmware `rxBad` statistic, and drops the overlap. A receive can also collide with an active transmission after its preamble window.
 
-The Docker build checks for the collision-only firmware log string before creating the runtime marker. Runtime start fails if the marker is absent. The hidden-terminal integration test drives two non-hearing transmitters into one receiver and verifies the native bad-reception outcome. There is no approximate fallback in V1.
+The Docker build checks for the collision-only firmware log string before creating the runtime marker. It also records the resolved firmware commit, collision-patch SHA-256, final binary SHA-256, build architecture, client-library version, and the separately named upstream base-image digest. Capabilities and completed results read that generated metadata instead of identifying the custom executable by the stock image digest. Runtime start fails if the collision marker is absent. The hidden-terminal integration test drives two non-hearing transmitters into one receiver and verifies the native bad-reception outcome. There is no approximate fallback in V1.
 
 ## Airtime
 
@@ -54,4 +54,4 @@ One RF transmitter event contributes airtime once, regardless of receiver count.
 
 Built-in payloads include a compact run UUID and sequence. Generation uses a monotonic clock. Direct delivery occurs only when the intended destination firmware exposes that matching application packet. Broadcast accounting counts unique receiving nodes other than the source against the applicable receiver set. A routing acknowledgment is recorded separately from destination delivery.
 
-Median appears with one or more latency samples. P95 requires 20 samples and P99 requires 100. Insufficient samples are unavailable, not zero. Completed results include the scenario snapshot, upstream revisions, collision model, timestamps, seed, generated records, aggregate metrics, and failures.
+Median appears with one or more latency samples. P95 requires 20 samples and P99 requires 100. Insufficient samples are unavailable, not zero. Live polling reports bounded incremental counters; exact latency percentiles are finalized when a run becomes terminal. Completed exports include the exact runtime scenario snapshot, build metadata, collision model, timestamps, seed, generated records, aggregate metrics, and failures.

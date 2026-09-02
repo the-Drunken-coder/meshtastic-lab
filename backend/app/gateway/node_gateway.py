@@ -71,12 +71,16 @@ class NodeGateway:
         queue_size: int = 256,
         startup_timeout: float = 20.0,
         shutdown_timeout: float = 5.0,
+        public_clients_enabled: bool = True,
     ) -> None:
         self.node_id = node_id
         self.downstream_host = downstream_host
         self.downstream_port = downstream_port
         self.public_host = public_host
         self.public_port = public_port
+        self.public_clients_enabled = public_clients_enabled
+        self.control_host = "127.0.0.1"
+        self.control_port = 0
         self.event_handler = event_handler
         self.from_radio_handler = from_radio_handler
         self.startup_timeout = startup_timeout
@@ -95,11 +99,18 @@ class NodeGateway:
         self._external_writes: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_size)
         self._downstream_reader: asyncio.StreamReader | None = None
         self._downstream_writer: asyncio.StreamWriter | None = None
-        self._external_writer: asyncio.StreamWriter | None = None
+        self._client_writer: asyncio.StreamWriter | None = None
         self._server: asyncio.Server | None = None
+        self._control_server: asyncio.Server | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._config_waiters: dict[int, asyncio.Future[None]] = {}
         self._stop_lock = asyncio.Lock()
+
+    @property
+    def internal_port(self) -> int:
+        """Return the ephemeral loopback port reserved for internal clients."""
+
+        return self.control_port
 
     async def start(self) -> None:
         if self.state == GatewayState.RUNNING:
@@ -111,6 +122,14 @@ class NodeGateway:
         self.failed.clear()
         try:
             await self._establish_ready_downstream()
+            self._control_server = await asyncio.start_server(
+                self._handle_internal_client,
+                host=self.control_host,
+                port=0,
+                limit=4096,
+            )
+            control_socket = self._control_server.sockets[0]
+            self.control_port = int(control_socket.getsockname()[1])
             self._server = await asyncio.start_server(
                 self._handle_external_client,
                 host=self.public_host,
@@ -233,11 +252,40 @@ class NodeGateway:
         task.add_done_callback(self._tasks.discard)
         return task
 
+    async def enable_public_clients(self) -> None:
+        """Admit public clients after internal startup/configuration is complete."""
+
+        if self.state in {GatewayState.STOPPED, GatewayState.STOPPING}:
+            raise GatewayError(f"cannot enable public clients while gateway is {self.state}")
+        self.public_clients_enabled = True
+        await self._emit("gateway.public_clients_enabled", "public client admission enabled")
+
     async def _handle_external_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        await self._handle_client(reader, writer, public=True)
+
+    async def _handle_internal_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await self._handle_client(reader, writer, public=False)
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        public: bool,
+    ) -> None:
         peer = writer.get_extra_info("peername")
-        if self.external_connected:
+        if public and not self.public_clients_enabled:
+            self.rejected_clients += 1
+            await self._emit("gateway.client_rejected", f"public client admission disabled: {peer}")
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        if self._client_writer is not None:
             self.rejected_clients += 1
             await self._emit("gateway.client_rejected", f"second client rejected: {peer}")
             writer.close()
@@ -245,10 +293,12 @@ class NodeGateway:
                 await writer.wait_closed()
             return
 
-        self.external_connected = True
+        self.external_connected = public
         self.client_disconnected.clear()
-        self._external_writer = writer
-        await self._emit("gateway.client_connected", str(peer))
+        self._client_writer = writer
+        await self._emit(
+            "gateway.client_connected", f"{'public' if public else 'internal'}: {peer}"
+        )
         reader_task = asyncio.create_task(
             self._external_reader_loop(reader), name=f"{self.node_id}-client-reader"
         )
@@ -266,8 +316,8 @@ class NodeGateway:
         finally:
             self._tasks.discard(reader_task)
             self._tasks.discard(writer_task)
-            if self._external_writer is writer:
-                self._external_writer = None
+            if self._client_writer is writer:
+                self._client_writer = None
             self.external_connected = False
             self.client_disconnected.set()
             self._clear_queue(self._external_writes)
@@ -351,7 +401,7 @@ class NodeGateway:
             await self._emit("gateway.rf_transmit", str(packet.id), frame=frame)
             return
 
-        if self.external_connected:
+        if self._client_writer is not None:
             try:
                 self._external_writes.put_nowait(frame.raw)
             except asyncio.QueueFull:
@@ -367,8 +417,8 @@ class NodeGateway:
         for waiter in self._config_waiters.values():
             if not waiter.done():
                 waiter.set_exception(GatewayError(detail))
-        if self._external_writer is not None:
-            self._external_writer.close()
+        if self._client_writer is not None:
+            self._client_writer.close()
 
     async def _emit(self, kind: str, detail: str, *, frame: Frame | None = None) -> None:
         LOGGER.info(detail, extra={"node_id": self.node_id, "event": kind})
@@ -382,13 +432,17 @@ class NodeGateway:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        if self._control_server is not None:
+            self._control_server.close()
+            await self._control_server.wait_closed()
+            self._control_server = None
 
-        for writer in (self._external_writer, self._downstream_writer):
+        for writer in (self._client_writer, self._downstream_writer):
             if writer is not None:
                 writer.close()
                 with contextlib.suppress(Exception):
                     await writer.wait_closed()
-        self._external_writer = None
+        self._client_writer = None
         self._downstream_writer = None
         self._downstream_reader = None
 
