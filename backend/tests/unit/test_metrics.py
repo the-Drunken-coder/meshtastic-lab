@@ -70,7 +70,7 @@ def test_metrics_count_airtime_once_per_transmitter() -> None:
     assert metrics.receiver_delivery_ratio == 0.75
     assert metrics.receivers_per_broadcast == {"1": 2, "2": 1}
     assert metrics.rf_transmissions == 3
-    assert metrics.rf_transmissions_per_delivery == 1
+    assert metrics.rf_transmissions_per_delivery == 3
     assert metrics.observed_airtime_ms == 50
     assert metrics.per_node_transmit_counts == {"node-1": 1, "node-2": 2}
     assert metrics.drops_by_reason == {"link-disabled": 2}

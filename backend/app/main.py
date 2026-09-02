@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -135,7 +135,7 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
         stream: Annotated[str, Query(pattern="^(stdout|stderr)$")] = "stderr",
         limit: Annotated[int, Query(ge=1, le=250)] = 100,
     ) -> object:
-        if node_id not in simulator.supervisor.records:
+        if not simulator.supervisor.has_logs(node_id):
             raise HTTPException(status_code=404, detail=f"unknown or stopped node: {node_id}")
         return {
             "nodeId": node_id,
@@ -180,19 +180,19 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
         return simulator.traffic_summary(run_id)
 
     @app.get("/api/traffic/runs/{run_id}/export")
-    async def export_traffic_result(run_id: str) -> FileResponse:
+    async def export_traffic_result(run_id: str) -> Response:
         path = simulator.results_root / f"{run_id}.json"
-        if not path.is_file():
-            if (
-                simulator.traffic is not None
-                and simulator.traffic.current is not None
-                and simulator.traffic.current.run_id == run_id
-            ):
-                raise SimulationConflict(
-                    "TRAFFIC_RUN_NOT_COMPLETE", "traffic results can be exported after the run finishes"
-                )
-            raise FileNotFoundError(run_id)
-        return FileResponse(path, media_type="application/json", filename=f"{run_id}.json")
+        if path.is_file():
+            return FileResponse(path, media_type="application/json", filename=f"{run_id}.json")
+        result = simulator.traffic_result(run_id)
+        if result.finished_at is None:
+            raise SimulationConflict(
+                "TRAFFIC_RUN_NOT_COMPLETE", "traffic results can be exported after the run finishes"
+            )
+        return JSONResponse(
+            content=result.model_dump(mode="json", by_alias=True),
+            headers={"Content-Disposition": f'attachment; filename="{run_id}.json"'},
+        )
 
     @app.get("/api/events")
     async def events(

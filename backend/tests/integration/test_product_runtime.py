@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import socket
 import subprocess
 import time
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,6 +16,7 @@ import pytest
 from backend.app.models import default_scenario
 
 PRODUCT_IMAGE = "meshtastic-lab:0.1.0"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
 def unused_port() -> int:
@@ -169,6 +172,39 @@ async def test_product_lifecycle_failure_and_five_node_cleanup() -> None:
             assert victim["id"] in str(failed.get("message"))
             await client.post("/api/simulation/stop")
             await wait_for_state(client, "STOPPED", 30)
+            archived_logs = await client.get(f"/api/nodes/{victim['id']}/logs?stream=stderr")
+            archived_logs.raise_for_status()
+
+            hidden_terminal_path = REPOSITORY_ROOT / "scenarios" / "hidden-terminal.json"
+            hidden_terminal = json.loads(
+                await asyncio.to_thread(hidden_terminal_path.read_text, encoding="utf-8")
+            )
+            assert (await client.put("/api/scenario", json=hidden_terminal)).status_code == 200
+            response = await client.post("/api/simulation/start")
+            response.raise_for_status()
+            await wait_for_state(client, "RUNNING", 120)
+            collision_run = await client.post(
+                "/api/traffic/runs",
+                json={
+                    "kind": "broadcast-text",
+                    "sourceNodes": ["node-1", "node-3"],
+                    "destinationStrategy": "fixed",
+                    "messagesPerMinute": 600,
+                    "payloadBytes": 200,
+                    "durationSeconds": 8,
+                    "acknowledgmentRequested": False,
+                    "seed": 7,
+                },
+            )
+            collision_run.raise_for_status()
+            collision_result = await wait_for_traffic(client, 30)
+            assert collision_result["state"] == "COMPLETED"
+            collision_metrics = collision_result["metrics"]
+            assert isinstance(collision_metrics, dict)
+            assert collision_metrics["failedReceptions"] > 0
+            response = await client.post("/api/simulation/stop")
+            response.raise_for_status()
+            await wait_for_state(client, "STOPPED", 30)
 
             five_nodes = default_scenario(5).model_dump(mode="json", by_alias=True)
             assert (await client.put("/api/scenario", json=five_nodes)).status_code == 200
@@ -215,6 +251,17 @@ async def test_product_lifecycle_failure_and_five_node_cleanup() -> None:
             active.raise_for_status()
             active_run_id = active.json()["runId"]
             await asyncio.sleep(1)
+            active_scenario = (await client.get("/api/scenario")).json()
+            active_link = next(
+                link
+                for link in active_scenario["links"]
+                if link["from"] == "node-1" and link["to"] == "node-5"
+            )
+            disabled_link = {**active_link, "enabled": False}
+            changed = await client.put("/api/links", json=disabled_link)
+            changed.raise_for_status()
+            restored = await client.put("/api/links", json=active_link)
+            restored.raise_for_status()
             stop_started = time.monotonic()
             stopped = await client.post("/api/simulation/stop")
             stopped.raise_for_status()
@@ -223,6 +270,11 @@ async def test_product_lifecycle_failure_and_five_node_cleanup() -> None:
             cancelled = await client.get(f"/api/traffic/runs/{active_run_id}")
             cancelled.raise_for_status()
             assert cancelled.json()["state"] == "CANCELLED"
+            exported = await client.get(f"/api/traffic/runs/{active_run_id}/export")
+            exported.raise_for_status()
+            changes = exported.json()["topologyChanges"]
+            assert [change["link"]["enabled"] for change in changes] == [False, True]
+            assert changes[0]["eventSequence"] < changes[1]["eventSequence"]
     finally:
         await asyncio.to_thread(
             subprocess.run,

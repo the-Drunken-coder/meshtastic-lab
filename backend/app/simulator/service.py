@@ -33,6 +33,7 @@ from backend.app.runtime import (
     verify_node,
 )
 from backend.app.traffic import (
+    PacketIdQuarantineCapacityError,
     TrafficController,
     TrafficRunRequest,
     TrafficRunResult,
@@ -44,6 +45,7 @@ from backend.app.traffic import (
 from .medium import DirectedMedium
 
 COLLISION_MARKER_DEFAULT = "/usr/share/meshtastic-lab/native-collision-enabled"
+MAX_VOLATILE_RESULTS = 8
 LOGGER = logging.getLogger(__name__)
 
 
@@ -170,9 +172,14 @@ class SimulatorService:
         self.node_metrics: dict[str, _NodeMetrics] = {}
         self.nodeinfo_observations: set[tuple[str, str]] = set()
         self._nodeinfo_changed = asyncio.Event()
+        self._local_stats_condition = asyncio.Condition()
+        self._local_stats_response_ids: dict[str, int] = {}
+        self._control_packet_id = 0x4D4C0000
         self.medium: DirectedMedium | None = None
         self.traffic: TrafficController | None = None
+        self._volatile_results: dict[str, TrafficRunResult] = {}
         self._lifecycle_lock = asyncio.Lock()
+        self._cleanup_lock = asyncio.Lock()
         self._topology_lock = asyncio.Lock()
         self._failure_cleanup_task: asyncio.Task[None] | None = None
         self._event_loop_lag_task: asyncio.Task[None] | None = None
@@ -212,7 +219,9 @@ class SimulatorService:
 
     async def start(self) -> CommandResult:
         command_id = str(uuid.uuid4())
+        await self._await_failure_cleanup()
         async with self._lifecycle_lock:
+            await self._await_failure_cleanup()
             if self.state in {LifecycleState.RUNNING, LifecycleState.WARMING_UP}:
                 return CommandResult(commandId=command_id, state=self.state, detail="already running")
             if self.state not in {LifecycleState.STOPPED, LifecycleState.FAILED}:
@@ -236,6 +245,7 @@ class SimulatorService:
             try:
                 records = await self.supervisor.start(self.scenario)
                 self.node_metrics = {node.id: _NodeMetrics() for node in self.scenario.nodes}
+                self._local_stats_response_ids.clear()
                 self.gateways = {
                     node.id: NodeGateway(
                         node_id=node.id,
@@ -263,6 +273,7 @@ class SimulatorService:
                     event_broker=self.event_broker,
                     results_root=self.results_root,
                     build_metadata=self.build_metadata,
+                    failed_reception_sampler=self._sample_local_stats,
                 )
                 self.medium = DirectedMedium(
                     scenario=self.scenario,
@@ -304,18 +315,25 @@ class SimulatorService:
                 self.state = LifecycleState.FAILED
                 self.message = f"Startup failed: {exc}"
                 self._publish_lifecycle()
-                await self._cleanup_resources()
+                failure_cleanup_awaited = await self._await_failure_cleanup()
+                if not failure_cleanup_awaited:
+                    await self._cleanup_resources()
                 raise
 
     async def stop(self) -> CommandResult:
         command_id = str(uuid.uuid4())
+        failure_cleanup_awaited = await self._await_failure_cleanup()
         async with self._lifecycle_lock:
+            if not failure_cleanup_awaited:
+                failure_cleanup_awaited = await self._await_failure_cleanup()
             if self.state == LifecycleState.STOPPED:
                 return CommandResult(commandId=command_id, state=self.state, detail="already stopped")
             self.state = LifecycleState.STOPPING
             self.message = "Stopping traffic, gateways, and native processes"
             self._publish_lifecycle()
-            await self._cleanup_resources()
+            async with self._topology_lock:
+                if not failure_cleanup_awaited:
+                    await self._cleanup_resources()
             self.state = LifecycleState.STOPPED
             self.message = "Stopped"
             self.simulation_id = None
@@ -327,6 +345,7 @@ class SimulatorService:
         if self.state != LifecycleState.STOPPED:
             raise SimulationConflict("INVALID_LIFECYCLE_STATE", "reset is allowed only while stopped")
         self.scenario = default_scenario()
+        self.supervisor.clear_archived_logs()
         self.message = "Scenario reset to the five-node full mesh"
         return CommandResult(commandId=str(uuid.uuid4()), state=self.state, detail=self.message)
 
@@ -343,8 +362,15 @@ class SimulatorService:
         async with self._topology_lock:
             if self.state != LifecycleState.RUNNING or self.medium is None:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", "runtime links require RUNNING state")
-            self._reject_topology_change_during_traffic()
-            await self.medium.update_link(link)
+            existing = self.scenario.link_map().get((link.from_node, link.to_node))
+            if existing == link:
+                return link
+            try:
+                if self.traffic is not None:
+                    self.traffic.ensure_topology_change_capacity(1)
+            except RuntimeError as exc:
+                raise SimulationConflict("TOPOLOGY_HISTORY_FULL", str(exc)) from exc
+            event = await self.medium.update_link(link)
             links = [
                 link
                 if (current.from_node, current.to_node) == (link.from_node, link.to_node)
@@ -352,6 +378,8 @@ class SimulatorService:
                 for current in self.scenario.links
             ]
             self.scenario = self.scenario.model_copy(update={"links": links})
+            if self.traffic is not None:
+                self.traffic.record_topology_change(event, link)
             return link
 
     async def apply_topology(self, preset: TopologyPreset) -> Scenario:
@@ -364,37 +392,53 @@ class SimulatorService:
                 raise SimulationConflict(
                     "INVALID_LIFECYCLE_STATE", f"cannot apply topology from {self.state}"
                 )
-            self._reject_topology_change_during_traffic()
-            await self.medium.apply_links(updated.links)
+            previous = self.scenario.link_map()
+            changed = [
+                link
+                for link in updated.links
+                if previous[(link.from_node, link.to_node)] != link
+            ]
+            try:
+                if self.traffic is not None:
+                    self.traffic.ensure_topology_change_capacity(len(changed))
+            except RuntimeError as exc:
+                raise SimulationConflict("TOPOLOGY_HISTORY_FULL", str(exc)) from exc
+            events = await self.medium.apply_links(updated.links)
             self.scenario = updated
+            if self.traffic is not None:
+                for event, link in zip(events, changed, strict=True):
+                    self.traffic.record_topology_change(event, link)
             return updated
 
     async def start_traffic(self, request: TrafficRunRequest) -> str:
         async with self._topology_lock:
             if self.state != LifecycleState.RUNNING or self.traffic is None:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", "traffic requires RUNNING state")
+            if self.traffic.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+                raise SimulationConflict("TRAFFIC_RUN_ACTIVE", "a traffic run is already active")
+            try:
+                baseline = await self._sample_local_stats()
+            except Exception as exc:
+                raise SimulationConflict(
+                    "LOCAL_STATS_UNAVAILABLE", f"could not capture native local statistics: {exc}"
+                ) from exc
             try:
                 return self.traffic.start(
-                    request, scenario_snapshot=self.scenario.model_copy(deep=True)
+                    request,
+                    scenario_snapshot=self.scenario.model_copy(deep=True),
+                    failed_reception_baseline=baseline,
                 )
+            except PacketIdQuarantineCapacityError as exc:
+                raise SimulationConflict("PACKET_ID_QUARANTINE_FULL", str(exc)) from exc
             except RuntimeError as exc:
                 raise SimulationConflict("TRAFFIC_RUN_ACTIVE", str(exc)) from exc
             except ValueError as exc:
                 raise SimulationConflict("INVALID_TRAFFIC_REQUEST", str(exc)) from exc
 
-    def _reject_topology_change_during_traffic(self) -> None:
-        if self.traffic is not None and self.traffic.state in {
-            TrafficRunState.RUNNING,
-            TrafficRunState.STOPPING,
-        }:
-            raise SimulationConflict(
-                "TRAFFIC_RUN_ACTIVE",
-                "topology changes are allowed only between traffic runs",
-            )
-
     async def stop_traffic(self) -> None:
-        if self.traffic is not None:
-            await self.traffic.stop()
+        async with self._topology_lock:
+            if self.traffic is not None:
+                await self.traffic.stop()
 
     def traffic_result(self, run_id: str) -> TrafficRunResult:
         if self.traffic is not None and self.traffic.current is not None:
@@ -403,9 +447,12 @@ class SimulatorService:
                 if result is not None:
                     return result
         path = self.results_root / f"{run_id}.json"
-        if not path.is_file():
-            raise FileNotFoundError(run_id)
-        return TrafficRunResult.model_validate_json(path.read_text(encoding="utf-8"))
+        if path.is_file():
+            return TrafficRunResult.model_validate_json(path.read_text(encoding="utf-8"))
+        volatile = self._volatile_results.get(run_id)
+        if volatile is not None:
+            return volatile.model_copy(deep=True)
+        raise FileNotFoundError(run_id)
 
     def traffic_summary(self, run_id: str) -> TrafficRunSummary:
         if self.traffic is not None and self.traffic.current is not None:
@@ -416,9 +463,12 @@ class SimulatorService:
         return summarize_result(self.traffic_result(run_id))
 
     def completed_runs(self) -> list[str]:
-        if not self.results_root.is_dir():
-            return []
-        return sorted(path.stem for path in self.results_root.glob("*.json"))
+        persisted = (
+            {path.stem for path in self.results_root.glob("*.json")}
+            if self.results_root.is_dir()
+            else set()
+        )
+        return sorted(persisted | self._volatile_results.keys())
 
     def nodes(self) -> list[NodeView]:
         views: list[NodeView] = []
@@ -571,8 +621,57 @@ class SimulatorService:
                             detail="Firmware local statistics incremented num_packets_rx_bad",
                         )
                     )
+                async with self._local_stats_condition:
+                    self._local_stats_response_ids[node_id] = packet.decoded.request_id
+                    self._local_stats_condition.notify_all()
             elif variant == "device_metrics":
                 metrics.channel_utilization = telemetry.device_metrics.channel_utilization
+
+    async def _sample_local_stats(self) -> dict[str, int]:
+        node_ids = list(self.gateways)
+        if not node_ids or set(node_ids) != set(self.verifications):
+            raise RuntimeError("native nodes are not ready for local-stat sampling")
+        requests = {node_id: self._local_stats_request(node_id) for node_id in node_ids}
+        await asyncio.gather(
+            *(
+                self.gateways[node_id].send_to_radio(
+                    requests[node_id], source="controller.local-stats"
+                )
+                for node_id in node_ids
+            )
+        )
+
+        async def wait_for_sample(node_id: str) -> int:
+            async with self._local_stats_condition:
+                await asyncio.wait_for(
+                    self._local_stats_condition.wait_for(
+                        lambda: self._local_stats_response_ids.get(node_id)
+                        == requests[node_id].packet.id
+                    ),
+                    timeout=5,
+                )
+            return self.node_metrics[node_id].rx_bad
+
+        values = await asyncio.gather(*(wait_for_sample(node_id) for node_id in node_ids))
+        return dict(zip(node_ids, values, strict=True))
+
+    def _local_stats_request(self, node_id: str) -> mesh_pb2.ToRadio:
+        telemetry = telemetry_pb2.Telemetry()
+        telemetry.local_stats.CopyFrom(telemetry_pb2.LocalStats())
+        request = mesh_pb2.ToRadio()
+        request.packet.id = self._next_control_packet_id()
+        request.packet.to = self.verifications[node_id].node_number
+        request.packet.priority = mesh_pb2.MeshPacket.Priority.RELIABLE
+        request.packet.decoded.portnum = portnums_pb2.TELEMETRY_APP
+        request.packet.decoded.payload = telemetry.SerializeToString()
+        request.packet.decoded.want_response = True
+        return request
+
+    def _next_control_packet_id(self) -> int:
+        self._control_packet_id = (self._control_packet_id + 1) & 0xFFFFFFFF
+        if self._control_packet_id == 0:
+            self._control_packet_id = 1
+        return self._control_packet_id
 
     async def _warm_up_nodes(self) -> tuple[set[tuple[str, str]], int]:
         expected = self.scenario.reachable_pairs()
@@ -636,17 +735,41 @@ class SimulatorService:
             )
 
     async def _fail_traffic_and_cleanup(self, reason: str) -> None:
-        if self.traffic is not None:
-            await self.traffic.fail(reason)
-        await self._cleanup_resources()
+        async with self._topology_lock:
+            async with self._cleanup_lock:
+                if self.traffic is not None:
+                    await self.traffic.fail(reason)
+                await self._cleanup_resources_unlocked()
+
+    async def _await_failure_cleanup(self) -> bool:
+        task = self._failure_cleanup_task
+        if task is None or task is asyncio.current_task():
+            return False
+        await asyncio.shield(task)
+        if self._failure_cleanup_task is task:
+            self._failure_cleanup_task = None
+        return True
 
     async def _cleanup_resources(self) -> None:
+        async with self._cleanup_lock:
+            await self._cleanup_resources_unlocked()
+
+    async def _cleanup_resources_unlocked(self) -> None:
         lag_task, self._event_loop_lag_task = self._event_loop_lag_task, None
         if lag_task is not None:
             lag_task.cancel()
             await asyncio.gather(lag_task, return_exceptions=True)
         if self.traffic is not None:
             await self.traffic.stop()
+            result = self.traffic.result()
+            if (
+                result is not None
+                and result.finished_at is not None
+                and not (self.results_root / f"{result.run_id}.json").is_file()
+            ):
+                self._volatile_results[result.run_id] = result
+                while len(self._volatile_results) > MAX_VOLATILE_RESULTS:
+                    self._volatile_results.pop(next(iter(self._volatile_results)))
         if self.medium is not None:
             await self.medium.stop()
         if self.gateways:

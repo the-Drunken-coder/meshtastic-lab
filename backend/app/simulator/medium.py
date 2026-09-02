@@ -64,7 +64,7 @@ class DirectedMedium:
         if waiters:
             await asyncio.gather(*waiters, return_exceptions=True)
 
-    async def update_link(self, link: DirectedLink) -> None:
+    async def update_link(self, link: DirectedLink) -> PacketEvent:
         key = (link.from_node, link.to_node)
         async with self._link_lock:
             if key not in self._links:
@@ -72,17 +72,7 @@ class DirectedMedium:
             updated = dict(self._links)
             updated[key] = link
             self._links = updated
-        self._event_broker.publish(
-            PacketEvent(
-                monotonicSeconds=time.monotonic(),
-                eventType=EventType.LINK_UPDATED,
-                transmitter=link.from_node,
-                receiver=link.to_node,
-                result="enabled" if link.enabled else "disabled",
-                rssiDbm=link.rssi_dbm,
-                snrDb=link.snr_db,
-            )
-        )
+        event = self._publish_link_update(link, monotonic_seconds=time.monotonic())
         LOGGER.info(
             "directed link updated",
             extra={
@@ -91,13 +81,32 @@ class DirectedMedium:
                 "link_decision": "enabled" if link.enabled else "disabled",
             },
         )
+        return event
 
-    async def apply_links(self, links: list[DirectedLink]) -> None:
+    async def apply_links(self, links: list[DirectedLink]) -> list[PacketEvent]:
         replacement = {(link.from_node, link.to_node): link for link in links}
         async with self._link_lock:
             if replacement.keys() != self._links.keys():
                 raise ValueError("runtime topology must contain the existing directed link set")
+            changed = [link for key, link in replacement.items() if self._links[key] != link]
             self._links = replacement
+        monotonic_seconds = time.monotonic()
+        return [self._publish_link_update(link, monotonic_seconds=monotonic_seconds) for link in changed]
+
+    def _publish_link_update(
+        self, link: DirectedLink, *, monotonic_seconds: float
+    ) -> PacketEvent:
+        return self._event_broker.publish(
+            PacketEvent(
+                monotonicSeconds=monotonic_seconds,
+                eventType=EventType.LINK_UPDATED,
+                transmitter=link.from_node,
+                receiver=link.to_node,
+                result="enabled" if link.enabled else "disabled",
+                rssiDbm=link.rssi_dbm,
+                snrDb=link.snr_db,
+            )
+        )
 
     async def transmit(self, transmitter: str, packet: mesh_pb2.MeshPacket) -> None:
         monotonic_now = time.monotonic()

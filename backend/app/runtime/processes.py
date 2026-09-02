@@ -16,6 +16,7 @@ from backend.app.models import Scenario
 
 LOGGER = logging.getLogger(__name__)
 ProcessFailureHandler = Callable[[str, int | None], Coroutine[object, object, None]]
+OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 
 
 class NodeProcessState(StrEnum):
@@ -45,6 +46,12 @@ class ProcessRecord:
         return self.process.pid if self.process is not None else None
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivedProcessLogs:
+    stdout_lines: tuple[str, ...]
+    stderr_lines: tuple[str, ...]
+
+
 class NativeProcessSupervisor:
     """Start isolated firmware children and reap every exit path."""
 
@@ -65,11 +72,13 @@ class NativeProcessSupervisor:
         self.shutdown_timeout = shutdown_timeout
         self.failure_handler = failure_handler
         self.records: dict[str, ProcessRecord] = {}
+        self.archived_logs: dict[str, ArchivedProcessLogs] = {}
         self._stopping = False
 
     async def start(self, scenario: Scenario) -> Mapping[str, ProcessRecord]:
         if self.records:
             raise RuntimeError("firmware processes are already allocated")
+        self.clear_archived_logs()
         if not self.binary_path.is_file():
             raise FileNotFoundError(f"native firmware binary not found: {self.binary_path}")
 
@@ -112,20 +121,37 @@ class NativeProcessSupervisor:
             )
 
         for record in records:
-            for task in tuple(record.tasks):
+            _, pending_tasks = await asyncio.wait(
+                tuple(record.tasks), timeout=OUTPUT_DRAIN_TIMEOUT_SECONDS
+            ) if record.tasks else (set(), set())
+            for task in pending_tasks:
                 task.cancel()
-            if record.tasks:
-                await asyncio.gather(*record.tasks, return_exceptions=True)
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
             record.tasks.clear()
             if record.state != NodeProcessState.FAILED:
                 record.state = NodeProcessState.STOPPED
+            self.archived_logs[record.node_id] = ArchivedProcessLogs(
+                stdout_lines=tuple(record.stdout_lines),
+                stderr_lines=tuple(record.stderr_lines),
+            )
         self.records.clear()
         self._stopping = False
 
     def recent_logs(self, node_id: str, *, stream: str = "stderr", limit: int = 100) -> list[str]:
-        record = self.records[node_id]
-        lines = record.stderr_lines if stream == "stderr" else record.stdout_lines
-        return list(lines)[-limit:]
+        record = self.records.get(node_id)
+        if record is not None:
+            active_lines = record.stderr_lines if stream == "stderr" else record.stdout_lines
+            return list(active_lines)[-limit:]
+        archive = self.archived_logs[node_id]
+        archived_lines = archive.stderr_lines if stream == "stderr" else archive.stdout_lines
+        return list(archived_lines)[-limit:]
+
+    def has_logs(self, node_id: str) -> bool:
+        return node_id in self.records or node_id in self.archived_logs
+
+    def clear_archived_logs(self) -> None:
+        self.archived_logs.clear()
 
     def _record_for(self, node_id: str, index: int) -> ProcessRecord:
         node_root = self.data_root / node_id

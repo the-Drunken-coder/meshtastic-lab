@@ -41,7 +41,7 @@ STOPPED ── start ──> STARTING ── configured ──> WARMING_UP ─�
    └──────────────────────────── stop <── STOPPING <──────────── stop ────────────────┘
 ```
 
-The lifecycle lock serializes commands. Node identity, roles, RF configuration, and channel configuration change only in `STOPPED`. Directed links use a copy-on-write map under an async lock and can change in `RUNNING` between traffic runs. A run rejects topology changes so its captured scenario remains the topology used for its full duration. Start is all-or-nothing. Configuration writes use the official settings transaction, intentionally reboot once, reconnect the gateway, read effective values back, and fail if they differ.
+The lifecycle lock serializes commands. Node identity, roles, RF configuration, and channel configuration change only in `STOPPED`. Directed links use a copy-on-write map under an async lock and can change in `RUNNING`, including during traffic. Every run keeps its starting scenario plus the event sequence, monotonic time, and directed link for each in-run change. Start is all-or-nothing. Configuration writes use the official settings transaction, intentionally reboot once, reconnect the gateway, read effective values back, and fail if they differ.
 
 Warm-up sends one best-effort NodeInfo request through each private gateway endpoint, then allows a bounded stabilization interval. Process readiness, gateway readiness, and verified local configuration are hard gates. Network-wide NodeInfo observations are evidence, not a readiness proof. The lifecycle message reports missing graph-connected pairs because hop limits, non-relaying roles, collisions, and transient contention can make them unobservable.
 
@@ -53,9 +53,9 @@ The backend event loop owns gateways, medium loops, traffic scheduling, lifecycl
 
 ## Failure handling
 
-A child exit, gateway failure, RF queue overflow, or unexpected medium-worker exit identifies the node and moves the simulator to `FAILED`. Transport overload uses the explicit `SIMULATOR_OVERLOAD` category so it cannot masquerade as mesh congestion. Failure cleanup freezes an active traffic result, retains recent daemon output, stops traffic and medium tasks, closes gateways, and terminates the remaining children. Graceful child shutdown has an eight-second deadline followed by force-kill. Gateway startup and shutdown also have deadlines. Stop cancels an active traffic run before dismantling the RF path.
+A child exit, gateway failure, RF queue overflow, or unexpected medium-worker exit identifies the node and moves the simulator to `FAILED`. Transport overload uses the explicit `SIMULATOR_OVERLOAD` category so it cannot masquerade as mesh congestion. One serialized failure task freezes an active traffic result, archives recent daemon output, stops traffic and medium tasks, closes gateways, and terminates the remaining children. Start and Stop await that task. Graceful child shutdown has an eight-second deadline followed by force-kill. Gateway startup and shutdown also have deadlines. Stop cancels an active traffic run before dismantling the RF path.
 
-Results use a temporary file followed by an atomic rename under `/data/runs`. Terminal results are frozen before that rename, and later firmware packets cannot change them. The polled live summary contains only bounded counters and aggregate maps; full generated-message records stay in the completed export. No packet or UI queue is unbounded.
+Results use a temporary file followed by an atomic rename under `/data/runs`. Terminal results are frozen before that rename, and later firmware packets cannot change them. If persistence fails, the last eight unpersisted terminal results remain available through the API until the backend restarts. The polled live summary contains only bounded counters and aggregate maps; full generated-message records stay in the completed export. No packet or UI queue is unbounded.
 
 ## Extension seams
 

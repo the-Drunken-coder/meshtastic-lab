@@ -61,9 +61,9 @@ async def test_deterministic_traffic_schedule_and_persistence(tmp_path: Path) ->
     assert result.requested == 3
     assert result.submitted == 3
     assert [message.packet_id for message in result.generated_messages] == [
-        4071050725,
-        1695753999,
-        311111476,
+        253970985,
+        3250102041,
+        108967520,
     ]
     assert (tmp_path / f"{run_id}.json").is_file()
 
@@ -304,6 +304,72 @@ async def test_broadcast_delivery_ratio_counts_messages_once(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_direct_relay_observation_counts_only_destination_delivery(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    request = TrafficRunRequest(
+        kind=TrafficKind.DIRECT_TEXT,
+        sourceNodes=["node-1"],
+        fixedDestination="node-3",
+        messagesPerMinute=0.1,
+        durationSeconds=1,
+        payloadBytes=64,
+    )
+    run_id = controller.start(request)
+
+    class FixedRandom:
+        def randrange(self, _start: int, _stop: int) -> int:
+            return 7
+
+    await controller._submit("node-1", "node-3", FixedRandom())  # type: ignore[arg-type]
+    packet = _rf_packet(run_id=run_id, sequence=1, packet_id=7, origin=1)
+    controller.record_rf_transmission("node-1", packet, 10)
+    controller.record_rf_transmission("node-2", packet, 10)
+    received = _text_from_radio(run_id=run_id, sequence=1, packet_id=7, origin=1)
+    await controller.handle_from_radio("node-2", received)
+    await controller.handle_from_radio("node-3", received)
+    await controller.stop()
+
+    result = controller.result()
+    assert result is not None
+    assert result.generated_messages[0].delivered_to == ["node-3"]
+    assert result.metrics.receiver_deliveries == 1
+    assert result.metrics.receiver_delivery_ratio == 1
+    assert result.metrics.median_latency_ms is not None
+    assert result.metrics.rf_transmissions_per_delivery == 2
+
+
+@pytest.mark.asyncio
+async def test_final_local_stats_are_measured_against_explicit_baseline(tmp_path: Path) -> None:
+    async def sample_local_stats() -> dict[str, int]:
+        return {"node-1": 12, "node-2": 4, "node-3": 1}
+
+    selected = default_scenario(3)
+    controller = TrafficController(
+        scenario=selected,
+        gateways={node.id: FakeGateway() for node in selected.nodes},  # type: ignore[arg-type]
+        hardware_ids={node.id: index for index, node in enumerate(selected.nodes, start=1)},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0,
+        failed_reception_sampler=sample_local_stats,
+    )
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        ),
+        failed_reception_baseline={"node-1": 10, "node-2": 4, "node-3": 0},
+    )
+
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.state == TrafficRunState.COMPLETED
+    assert result.metrics.failed_receptions == 3
+
+
+@pytest.mark.asyncio
 async def test_matching_marker_requires_exact_packet_identity(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     request = TrafficRunRequest(
@@ -353,6 +419,54 @@ async def test_packet_ids_are_not_reused_across_runs(tmp_path: Path) -> None:
     assert controller.current is not None
     assert controller.current.generated_messages[0].packet_id == 8
     await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeat_seed_keeps_destinations_stable_with_bounded_packet_quarantine(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    request = TrafficRunRequest(
+        kind=TrafficKind.DIRECT_TEXT,
+        sourceNodes=["node-1"],
+        destinationStrategy=DestinationStrategy.DETERMINISTIC_RANDOM,
+        messagesPerMinute=600,
+        durationSeconds=0.21,
+        payloadBytes=64,
+        seed=7,
+    )
+
+    controller.start(request)
+    first = await controller.wait(deadline_seconds=2)
+    controller.start(request)
+    second = await controller.wait(deadline_seconds=2)
+
+    assert [message.destination_node for message in first.generated_messages] == [
+        message.destination_node for message in second.generated_messages
+    ]
+    retained = sum(len(values) for values in controller._quarantined_packet_ids.values())
+    assert retained == len(first.generated_messages)
+    assert retained <= 36_000 * len(request.source_nodes)
+
+
+@pytest.mark.asyncio
+async def test_failed_run_cannot_be_downgraded_by_stop(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"], messagesPerMinute=0.1, durationSeconds=1, payloadBytes=64
+        )
+    )
+    assert controller.current is not None
+    controller.state = TrafficRunState.FAILED
+    controller.current.failure = "boom"
+
+    await controller.stop()
+
+    result = controller.result()
+    assert result is not None
+    assert result.state == TrafficRunState.FAILED
+    assert result.failure == "boom"
 
 
 @pytest.mark.asyncio

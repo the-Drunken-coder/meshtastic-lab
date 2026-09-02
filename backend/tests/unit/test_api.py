@@ -1,9 +1,14 @@
+import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from backend.app.main import create_app
+from backend.app.metrics import EventBroker
+from backend.app.models import default_scenario
+from backend.app.runtime import ProcessRecord
 from backend.app.simulator import SimulatorService
+from backend.app.traffic import TrafficController, TrafficRunRequest
 
 
 def test_health_scenario_and_structured_collision_failure(tmp_path: Path) -> None:
@@ -57,3 +62,71 @@ def test_openapi_describes_bounded_traffic_responses(tmp_path: Path) -> None:
     assert result["content"]["application/json"]["schema"]["$ref"].endswith(
         "/TrafficRunSummary"
     )
+
+
+def test_daemon_logs_remain_available_after_process_cleanup(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, collision_marker=tmp_path / "marker")
+    record = ProcessRecord(
+        node_id="node-1",
+        hardware_id=1,
+        internal_port=46001,
+        data_directory=tmp_path / "node-1" / "state",
+        stdout_path=tmp_path / "node-1" / "stdout.log",
+        stderr_path=tmp_path / "node-1" / "stderr.log",
+    )
+    record.stderr_lines.append("native failure")
+    service.supervisor.records[record.node_id] = record
+    asyncio.run(service.supervisor.stop())
+
+    with TestClient(create_app(service)) as client:
+        response = client.get("/api/nodes/node-1/logs?stream=stderr")
+
+    assert response.status_code == 200
+    assert response.json()["lines"] == ["native failure"]
+
+
+def test_unpersisted_terminal_result_survives_cleanup_and_exports(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, collision_marker=tmp_path / "marker")
+    service.results_root.write_text("not a directory", encoding="utf-8")
+    scenario = default_scenario(2)
+
+    class Gateway:
+        async def send_to_radio(self, _message: object, *, source: str) -> None:
+            del source
+
+    service.traffic = TrafficController(
+        scenario=scenario,
+        gateways={node.id: Gateway() for node in scenario.nodes},  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=service.results_root,
+        settle_seconds=0,
+    )
+
+    async def finish_and_cleanup() -> str:
+        if service.traffic is None:
+            raise AssertionError("traffic controller missing")
+        run_id = service.traffic.start(
+            TrafficRunRequest(
+                sourceNodes=["node-1"],
+                messagesPerMinute=600,
+                durationSeconds=0.01,
+                payloadBytes=64,
+            )
+        )
+        result = await service.traffic.wait(deadline_seconds=2)
+        assert result.failure is not None and "result persistence failed" in result.failure
+        await service._cleanup_resources()
+        return run_id
+
+    run_id = asyncio.run(finish_and_cleanup())
+    assert service.traffic is None
+
+    with TestClient(create_app(service)) as client:
+        summary = client.get(f"/api/traffic/runs/{run_id}")
+        exported = client.get(f"/api/traffic/runs/{run_id}/export")
+
+    assert summary.status_code == 200
+    assert summary.json()["state"] == "FAILED"
+    assert exported.status_code == 200
+    assert exported.json()["runId"] == run_id

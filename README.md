@@ -46,7 +46,7 @@ V1 permits one external client per node. A second client to that same node is re
 
 ## Scenarios and runs
 
-Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running between traffic runs.
+Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running, including during traffic runs. Completed exports keep the starting scenario and an ordered timeline of changes made during the run.
 
 The checked-in JSON scenarios under `scenarios/` are valid API payloads. To load one without the UI:
 
@@ -66,7 +66,7 @@ Use **Export scenario** in the UI or `GET /api/scenario/export` to save the curr
 - Relay TX counts transmissions where the transmitting firmware did not originate the packet.
 - Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it.
 - ACK success is separate from destination delivery. Percentiles remain unavailable until their configured sample minimum is met.
-- Failed or bad receptions come from native firmware local statistics. Collision results are labeled `native` only in the collision-enabled image.
+- Failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. Collision results are labeled `native` only in the collision-enabled image.
 
 See [fidelity](docs/fidelity.md) for exact boundaries.
 

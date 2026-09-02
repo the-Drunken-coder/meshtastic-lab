@@ -13,7 +13,7 @@ Meshtastic Lab V1 is a firmware behavior test environment with an explicit conne
 - Client API configuration, NodeDB synchronization, reconnects, and ordinary application traffic
 - Firmware response to a controlled real-time offered application load
 
-The deterministic seed controls traffic destination and identifier choices. It does not make host thread scheduling cycle-exact.
+The deterministic seed controls traffic destination and identifier choices through separate random streams, so identifier retries cannot shift the destination sequence. Packet identifiers remain reserved for the current run and enter a five-minute quarantine afterward to reject late acknowledgments. The quarantine is capped at 36,000 identifiers per source, equal to the largest supported one-hour run at 600 messages per minute. It does not make host thread scheduling cycle-exact.
 
 ## Not modeled accurately
 
@@ -32,7 +32,7 @@ RSSI and SNR are metadata supplied to enabled receiver firmware. They are not ca
 
 The default image builds firmware commit `54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb` with `USERPREFS_SIMRADIO_EMULATE_COLLISIONS=1`. Under that preference, `SimRadio` retains a receive for its calculated airtime. A second overlapping receive marks the current receive bad, increments the firmware `rxBad` statistic, and drops the overlap. A receive can also collide with an active transmission after its preamble window.
 
-The Docker build checks for the collision-only firmware log string before creating the runtime marker. It also records the resolved firmware commit, collision-patch SHA-256, final binary SHA-256, build architecture, client-library version, and the separately named upstream base-image digest. Capabilities and completed results read that generated metadata instead of identifying the custom executable by the stock image digest. Runtime start fails if the collision marker is absent. The hidden-terminal integration test drives two non-hearing transmitters into one receiver and verifies the native bad-reception outcome. There is no approximate fallback in V1.
+The Docker build checks for the collision-only firmware log string before creating the runtime marker. It also records the resolved firmware commit, collision-patch SHA-256, final binary SHA-256, build architecture, client-library version, and the separately named upstream base-image digest. Capabilities and completed results read that generated metadata instead of identifying the custom executable by the stock image digest. Runtime start fails if the collision marker is absent. Traffic runs request local statistics immediately before generation and after settling or cancellation, then persist the per-node `rxBad` deltas. The hidden-terminal integration test drives two non-hearing transmitters into one receiver and verifies the native bad-reception outcome. There is no approximate fallback in V1.
 
 ## Airtime
 

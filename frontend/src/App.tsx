@@ -491,7 +491,7 @@ function App() {
             <div className="section-toolbar">
               <div><h2>Directed topology</h2><p>Rows transmit. Columns receive. RSSI −85 dBm · SNR 8 dB.</p></div>
               <label className="inline-check"><input type="checkbox" checked={symmetric} onChange={(event) => setSymmetric(event.currentTarget.checked)} /> Edit symmetrically</label>
-              <div className="preset-actions">{presets.map(([label, preset]) => <button key={preset} onClick={() => applyPreset(preset)} disabled={busy !== null || trafficActive || (!stopped && !running)}>{label}</button>)}</div>
+              <div className="preset-actions">{presets.map(([label, preset]) => <button key={preset} onClick={() => applyPreset(preset)} disabled={busy !== null || (!stopped && !running)}>{label}</button>)}</div>
             </div>
             <div className="matrix-scroll">
               <table className="topology-matrix">
@@ -500,7 +500,7 @@ function App() {
                   if (source.id === target.id) return <td className="diagonal" key={target.id}>·</td>;
                   const link = scenario.links.find((candidate) => candidate.from === source.id && candidate.to === target.id);
                   if (!link) return <td key={target.id}>Missing</td>;
-                  return <td key={target.id}><button className={`link-toggle ${link.enabled ? "enabled" : "disabled"}`} aria-label={`${link.enabled ? "Disable" : "Enable"} link from ${source.displayName} to ${target.displayName}`} onClick={() => toggleLink(link)} disabled={busy !== null || trafficActive || (!stopped && !running)}>{link.enabled ? "ON" : "OFF"}</button></td>;
+                  return <td key={target.id}><button className={`link-toggle ${link.enabled ? "enabled" : "disabled"}`} aria-label={`${link.enabled ? "Disable" : "Enable"} link from ${source.displayName} to ${target.displayName}`} onClick={() => toggleLink(link)} disabled={busy !== null || (!stopped && !running)}>{link.enabled ? "ON" : "OFF"}</button></td>;
                 })}</tr>)}</tbody>
               </table>
             </div>

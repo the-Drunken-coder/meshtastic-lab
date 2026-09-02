@@ -8,8 +8,8 @@ import logging
 import random
 import time
 import uuid
-from collections import Counter
-from collections.abc import Mapping
+from collections import Counter, deque
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
@@ -28,11 +28,20 @@ from backend.app.metrics import (
     PacketEvent,
     calculate_metrics,
 )
-from backend.app.models import Scenario
+from backend.app.models import DirectedLink, Scenario
 from backend.app.provenance import BuildMetadata
 
 TRAFFIC_PREFIX = "ML1"
+PACKET_ID_QUARANTINE_SECONDS = 5 * 60
+MAX_QUARANTINED_PACKET_IDS_PER_SOURCE = 600 * 60
+MAX_TOPOLOGY_CHANGES_PER_RUN = 10_000
+PACKET_ID_RNG_SALT = 0x4D4C5F5041434B4554
 LOGGER = logging.getLogger(__name__)
+FailedReceptionSampler = Callable[[], Awaitable[Mapping[str, int]]]
+
+
+class PacketIdQuarantineCapacityError(RuntimeError):
+    pass
 
 
 class TrafficKind(StrEnum):
@@ -97,6 +106,14 @@ class GeneratedMessage(BaseModel):
     acknowledged: bool = False
 
 
+class TopologyChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_sequence: int = Field(alias="eventSequence")
+    monotonic_seconds: float = Field(alias="monotonicSeconds")
+    link: DirectedLink
+
+
 class _ProvenanceFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -141,6 +158,7 @@ class TrafficRunResult(_ProvenanceFields):
     transmitted: int = 0
     delivered: int = 0
     generated_messages: list[GeneratedMessage] = Field(default_factory=list, alias="generatedMessages")
+    topology_changes: list[TopologyChange] = Field(default_factory=list, alias="topologyChanges")
     metrics: MetricsSnapshot
     failure: str | None = None
 
@@ -169,7 +187,9 @@ class TrafficRunSummary(_ProvenanceFields):
 def summarize_result(result: TrafficRunResult) -> TrafficRunSummary:
     """Strip export-only records and per-message metrics from a terminal result."""
 
-    values = result.model_dump(mode="python", by_alias=True, exclude={"generated_messages"})
+    values = result.model_dump(
+        mode="python", by_alias=True, exclude={"generated_messages", "topology_changes"}
+    )
     metrics = values["metrics"]
     if not isinstance(metrics, dict):
         raise TypeError("traffic result metrics did not serialize as an object")
@@ -190,6 +210,7 @@ class TrafficController:
         results_root: Path,
         build_metadata: BuildMetadata | None = None,
         settle_seconds: float = 3.0,
+        failed_reception_sampler: FailedReceptionSampler | None = None,
     ) -> None:
         self.scenario = scenario
         self.gateways = gateways
@@ -198,6 +219,7 @@ class TrafficController:
         self.results_root = results_root
         self.build_metadata = build_metadata or BuildMetadata.unavailable()
         self.settle_seconds = settle_seconds
+        self.failed_reception_sampler = failed_reception_sampler
         self.state = TrafficRunState.IDLE
         self.current: TrafficRunResult | None = None
         self._frozen_result: TrafficRunResult | None = None
@@ -206,7 +228,9 @@ class TrafficController:
         self._sequence = 0
         self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
         self._messages_by_key: dict[tuple[str, int], GeneratedMessage] = {}
-        self._packet_ids_by_source: dict[str, set[int]] = {}
+        self._packet_ids_by_source: dict[str, dict[int, float]] = {}
+        self._packet_id_quarantine: dict[str, deque[tuple[float, int]]] = {}
+        self._quarantined_packet_ids: dict[str, set[int]] = {}
         self._delivered_sequences: set[int] = set()
         self._latencies_ms: list[float] = []
         self._rf_transmitters: list[str] = []
@@ -232,7 +256,11 @@ class TrafficController:
         self._metrics: MetricsSnapshot | None = None
 
     def start(
-        self, request: TrafficRunRequest, *, scenario_snapshot: Scenario | None = None
+        self,
+        request: TrafficRunRequest,
+        *,
+        scenario_snapshot: Scenario | None = None,
+        failed_reception_baseline: Mapping[str, int] | None = None,
     ) -> str:
         if self._task is not None and not self._task.done():
             raise RuntimeError("a traffic run is already active")
@@ -247,6 +275,7 @@ class TrafficController:
                 f"{marker_size} for sequence {max_sequence}"
             )
         self._reset_accumulators()
+        self._latest_failed_receptions.update(failed_reception_baseline or {})
         self._run_scenario = snapshot
         self.current = TrafficRunResult(
             runId=run_id,
@@ -271,30 +300,45 @@ class TrafficController:
         return run_id
 
     async def stop(self) -> None:
+        if self._frozen_result is not None:
+            return
+        if self.state == TrafficRunState.FAILED:
+            await self._cancel_run_task()
+            await self._sample_final_failed_receptions(required=False)
+            if self._frozen_result is None:
+                await self._finish(TrafficRunState.FAILED)
+            return
         if self._task is None or self._task.done():
             return
         self.state = TrafficRunState.STOPPING
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
+        await self._cancel_run_task()
+        try:
+            await self._sample_final_failed_receptions(required=True)
+        except RuntimeError as exc:
+            self.state = TrafficRunState.FAILED
+            if self.current is not None:
+                self.current.failure = str(exc)
         if self._frozen_result is None:
-            await self._finish(TrafficRunState.CANCELLED)
+            terminal = (
+                TrafficRunState.FAILED
+                if self.state == TrafficRunState.FAILED
+                else TrafficRunState.CANCELLED
+            )
+            await self._finish(terminal)
 
     async def fail(self, reason: str) -> None:
         """Fail an active run, preserving FAILED when its task observes cancellation."""
 
-        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+        if self.current is None or self.state not in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+            TrafficRunState.FAILED,
+        }:
             return
         self.state = TrafficRunState.FAILED
         self.current.failure = reason
-        task = self._task
-        if task is None or task.done():
-            await self._finish(TrafficRunState.FAILED)
-            return
-        if task is asyncio.current_task():
-            await self._finish(TrafficRunState.FAILED)
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await self._cancel_run_task()
+        await self._sample_final_failed_receptions(required=False)
         if self._frozen_result is None:
             await self._finish(TrafficRunState.FAILED)
 
@@ -384,12 +428,43 @@ class TrafficController:
         self._drop_counts[reason] += 1
 
     def record_failed_receptions(self, node_id: str, total: int) -> None:
-        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+        if self.current is None or self.state not in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+            TrafficRunState.FAILED,
+        }:
             return
         previous = self._latest_failed_receptions.get(node_id)
         self._latest_failed_receptions[node_id] = total
-        if previous is not None:
-            self._failed_receptions += max(0, total - previous)
+        if previous is None:
+            return
+        self._failed_receptions += max(0, total - previous)
+
+    def ensure_topology_change_capacity(self, additional_changes: int) -> None:
+        if self.current is None or self.state not in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+        }:
+            return
+        if len(self.current.topology_changes) + additional_changes > MAX_TOPOLOGY_CHANGES_PER_RUN:
+            raise RuntimeError(
+                f"traffic run cannot record more than {MAX_TOPOLOGY_CHANGES_PER_RUN} topology changes"
+            )
+
+    def record_topology_change(self, event: PacketEvent, link: DirectedLink) -> None:
+        if self.current is None or self.state not in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+        }:
+            return
+        self.ensure_topology_change_capacity(1)
+        self.current.topology_changes.append(
+            TopologyChange(
+                eventSequence=event.sequence,
+                monotonicSeconds=event.monotonic_seconds,
+                link=link,
+            )
+        )
 
     def set_event_loop_lag(self, lag_ms: float) -> None:
         if self.current is not None and self.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
@@ -409,24 +484,22 @@ class TrafficController:
             generated = self._correlated_delivery_message(packet)
             if generated is None:
                 return
+            is_applicable_receiver = (
+                node_id == generated.destination_node
+                if self.current.request.kind == TrafficKind.DIRECT_TEXT
+                else node_id != generated.source_node
+            )
+            if not is_applicable_receiver:
+                return
             sequence = generated.sequence
             if node_id in generated.delivered_to:
                 self._duplicates += 1
                 return
             generated.delivered_to.append(node_id)
-            if node_id != generated.source_node:
-                self._receiver_deliveries += 1
-                if (
-                    self.current.request.kind == TrafficKind.DIRECT_TEXT
-                    and node_id == generated.destination_node
-                ):
-                    if sequence not in self._delivered_sequences:
-                        self._delivered_sequences.add(sequence)
-                        self._unique_deliveries += 1
-                elif self.current.request.kind == TrafficKind.BROADCAST_TEXT:
-                    if sequence not in self._delivered_sequences:
-                        self._delivered_sequences.add(sequence)
-                        self._unique_deliveries += 1
+            self._receiver_deliveries += 1
+            if sequence not in self._delivered_sequences:
+                self._delivered_sequences.add(sequence)
+                self._unique_deliveries += 1
             self._latencies_ms.append((time.monotonic() - generated.generated_monotonic) * 1000)
             self.event_broker.publish(
                 PacketEvent(
@@ -485,7 +558,8 @@ class TrafficController:
         if self.current is None:
             return
         request = self.current.request
-        randomizer = random.Random(request.seed)
+        destination_randomizer = random.Random(request.seed)
+        packet_id_randomizer = random.Random(request.seed ^ PACKET_ID_RNG_SALT)
         interval = 60 / request.messages_per_minute
         started = time.monotonic()
         messages_per_source = self._messages_per_source(request)
@@ -498,23 +572,21 @@ class TrafficController:
                 scheduled = started + tick * interval
                 await asyncio.sleep(max(0, scheduled - time.monotonic()))
                 destination = self._destination_for(
-                    request, source, randomizer=randomizer, round_robin=round_robin
+                    request,
+                    source,
+                    randomizer=destination_randomizer,
+                    round_robin=round_robin,
                 )
-                await self._submit(source, destination, randomizer)
+                await self._submit(source, destination, packet_id_randomizer)
                 if tick + 1 == messages_per_source:
                     del next_tick[source]
                 else:
                     next_tick[source] = tick + 1
             await asyncio.sleep(self.settle_seconds)
+            await self._sample_final_failed_receptions(required=True)
             self.state = TrafficRunState.COMPLETED
             await self._finish(TrafficRunState.COMPLETED)
         except asyncio.CancelledError:
-            final_state = (
-                TrafficRunState.FAILED
-                if self.state == TrafficRunState.FAILED
-                else TrafficRunState.CANCELLED
-            )
-            await self._finish(final_state)
             raise
         except Exception as exc:
             self.state = TrafficRunState.FAILED
@@ -763,12 +835,66 @@ class TrafficController:
         return max(1, int(offered.to_integral_value(rounding=ROUND_CEILING)))
 
     def _allocate_packet_id(self, source: str, randomizer: random.Random) -> int:
-        used = self._packet_ids_by_source.setdefault(source, set())
+        now = time.monotonic()
+        self._purge_packet_id_quarantine(source, now=now)
+        used = self._packet_ids_by_source.setdefault(source, {})
+        quarantined = self._quarantined_packet_ids.setdefault(source, set())
         while True:
             packet_id = randomizer.randrange(1, 0xFFFFFFFF)
-            if packet_id not in used:
-                used.add(packet_id)
+            if packet_id not in used and packet_id not in quarantined:
+                used[packet_id] = now
                 return packet_id
+
+    async def _cancel_run_task(self) -> None:
+        task = self._task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _sample_final_failed_receptions(self, *, required: bool) -> None:
+        if self.failed_reception_sampler is None:
+            return
+        try:
+            totals = await self.failed_reception_sampler()
+        except Exception as exc:
+            detail = f"final native local statistics unavailable: {exc}"
+            if required:
+                raise RuntimeError(detail) from exc
+            if self.current is not None:
+                self.current.failure = (
+                    f"{self.current.failure}; {detail}" if self.current.failure else detail
+                )
+            return
+        for node_id, total in totals.items():
+            self.record_failed_receptions(node_id, total)
+
+    def _retire_packet_ids(self) -> None:
+        now = time.monotonic()
+        for source, packet_ids in self._packet_ids_by_source.items():
+            self._purge_packet_id_quarantine(source, now=now)
+            quarantine = self._packet_id_quarantine.setdefault(source, deque())
+            quarantined = self._quarantined_packet_ids.setdefault(source, set())
+            retained = [
+                (allocated_at + PACKET_ID_QUARANTINE_SECONDS, packet_id)
+                for packet_id, allocated_at in packet_ids.items()
+                if allocated_at + PACKET_ID_QUARANTINE_SECONDS > now
+            ]
+            if len(quarantine) + len(retained) > MAX_QUARANTINED_PACKET_IDS_PER_SOURCE:
+                raise PacketIdQuarantineCapacityError(
+                    "packet ID quarantine capacity is too small for the configured late-acknowledgment window"
+                )
+            for expiry, packet_id in retained:
+                quarantine.append((expiry, packet_id))
+                quarantined.add(packet_id)
+        self._packet_ids_by_source.clear()
+
+    def _purge_packet_id_quarantine(self, source: str, *, now: float) -> None:
+        quarantine = self._packet_id_quarantine.setdefault(source, deque())
+        quarantined = self._quarantined_packet_ids.setdefault(source, set())
+        while quarantine and quarantine[0][0] <= now:
+            _, packet_id = quarantine.popleft()
+            quarantined.discard(packet_id)
 
     def _message_for_packet_identity(
         self, packet: mesh_pb2.MeshPacket
@@ -824,6 +950,7 @@ class TrafficController:
             return None
 
     def _reset_accumulators(self) -> None:
+        self._retire_packet_ids()
         self._sequence = 0
         self._messages_by_packet.clear()
         self._messages_by_key.clear()

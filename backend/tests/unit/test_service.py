@@ -2,20 +2,22 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from meshtastic.protobuf import mesh_pb2
 
 import backend.app.simulator.service as service_module
 from backend.app.gateway import GatewayEvent
-from backend.app.metrics import EventBroker
+from backend.app.metrics import EventBroker, EventType, PacketEvent
 from backend.app.models import (
     DirectedLink,
     TopologyPreset,
     apply_topology_preset,
     default_scenario,
 )
-from backend.app.simulator import LifecycleState, SimulationConflict, SimulatorService
+from backend.app.runtime import ProcessRecord
+from backend.app.simulator import LifecycleState, SimulatorService
 from backend.app.traffic import TrafficController, TrafficRunRequest
 
 
@@ -34,8 +36,28 @@ class FakeMedium:
     def __init__(self) -> None:
         self.links: list[DirectedLink] = []
 
-    async def update_link(self, link: DirectedLink) -> None:
+    async def update_link(self, link: DirectedLink) -> PacketEvent:
         self.links.append(link)
+        return PacketEvent(
+            sequence=len(self.links),
+            monotonicSeconds=float(len(self.links)),
+            eventType=EventType.LINK_UPDATED,
+            transmitter=link.from_node,
+            receiver=link.to_node,
+            result="enabled" if link.enabled else "disabled",
+        )
+
+
+class BlockingMedium(FakeMedium):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_started = asyncio.Event()
+        self.release_update = asyncio.Event()
+
+    async def update_link(self, link: DirectedLink) -> PacketEvent:
+        self.update_started.set()
+        await self.release_update.wait()
+        return await super().update_link(link)
 
 
 class WarmupGateway:
@@ -64,6 +86,11 @@ async def test_runtime_link_snapshot_is_atomic_with_traffic_start(tmp_path: Path
         settle_seconds=0,
     )
 
+    async def sample_local_stats() -> dict[str, int]:
+        return {"node-1": 0, "node-2": 0}
+
+    service._sample_local_stats = sample_local_stats  # type: ignore[method-assign]
+
     changed = DirectedLink.model_validate(
         {"from": "node-1", "to": "node-2", "enabled": False}
     )
@@ -84,13 +111,60 @@ async def test_runtime_link_snapshot_is_atomic_with_traffic_start(tmp_path: Path
         link for link in links if link["from"] == "node-1" and link["to"] == "node-2"
     )
     assert changed_snapshot["enabled"] is False
-    with pytest.raises(SimulationConflict, match="only between traffic runs"):
-        await service.update_link(
-            DirectedLink.model_validate(
-                {"from": "node-1", "to": "node-2", "enabled": True}
-            )
-        )
+    restored = DirectedLink.model_validate(
+        {"from": "node-1", "to": "node-2", "enabled": True}
+    )
+    await service.update_link(restored)
+    assert service.traffic.current is not None
+    assert [change.link for change in service.traffic.current.topology_changes] == [restored]
+    assert service.traffic.current.topology_changes[0].event_sequence == 2
+    await service.update_link(restored)
+    assert [change.link for change in service.traffic.current.topology_changes] == [restored]
+    assert medium.links == [changed, restored]
     await service.traffic.stop()
+
+
+@pytest.mark.asyncio
+async def test_traffic_stop_waits_for_started_topology_update(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.scenario = default_scenario(2)
+    service.state = LifecycleState.RUNNING
+    medium = BlockingMedium()
+    service.medium = medium  # type: ignore[assignment]
+    service.traffic = TrafficController(
+        scenario=service.scenario,
+        gateways={node.id: FakeGateway() for node in service.scenario.nodes},  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path / "runs",
+        settle_seconds=10,
+    )
+    service.traffic.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=0.1,
+            durationSeconds=1,
+            payloadBytes=64,
+        )
+    )
+    changed = DirectedLink.model_validate(
+        {"from": "node-1", "to": "node-2", "enabled": False}
+    )
+
+    update_task = asyncio.create_task(service.update_link(changed))
+    await medium.update_started.wait()
+    stop_task = asyncio.create_task(service.stop_traffic())
+    await asyncio.sleep(0)
+    assert not stop_task.done()
+
+    medium.release_update.set()
+    await update_task
+    await stop_task
+
+    result = service.traffic.result()
+    assert result is not None
+    assert result.state == service_module.TrafficRunState.CANCELLED
+    assert [change.link for change in result.topology_changes] == [changed]
 
 
 @pytest.mark.asyncio
@@ -134,3 +208,124 @@ async def test_rf_queue_overflow_fails_with_explicit_category(tmp_path: Path) ->
 
     assert service.state == LifecycleState.FAILED
     assert service.message.startswith("SIMULATOR_OVERLOAD:")
+
+
+@pytest.mark.asyncio
+async def test_local_stats_sampler_waits_for_fresh_per_node_responses(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.node_metrics = {
+        "node-1": service_module._NodeMetrics(),
+        "node-2": service_module._NodeMetrics(),
+    }
+    service.verifications = {
+        "node-1": SimpleNamespace(node_number=1),
+        "node-2": SimpleNamespace(node_number=2),
+    }  # type: ignore[assignment]
+
+    class StatsGateway:
+        def __init__(self, node_id: str, rx_bad: int) -> None:
+            self.node_id = node_id
+            self.rx_bad = rx_bad
+            self.requests: list[mesh_pb2.ToRadio] = []
+            self.reply_task: asyncio.Task[None] | None = None
+
+        async def send_to_radio(self, request: mesh_pb2.ToRadio, *, source: str) -> None:
+            assert source == "controller.local-stats"
+            copied = mesh_pb2.ToRadio()
+            copied.CopyFrom(request)
+            self.requests.append(copied)
+            unsolicited = mesh_pb2.FromRadio()
+            unsolicited.packet.decoded.portnum = service_module.portnums_pb2.TELEMETRY_APP
+            unsolicited_telemetry = service_module.telemetry_pb2.Telemetry()
+            unsolicited_telemetry.local_stats.num_packets_rx_bad = 999
+            unsolicited.packet.decoded.payload = unsolicited_telemetry.SerializeToString()
+            await service._on_from_radio(self.node_id, unsolicited)
+
+            async def reply() -> None:
+                await asyncio.sleep(0)
+                response = mesh_pb2.FromRadio()
+                response.packet.decoded.portnum = service_module.portnums_pb2.TELEMETRY_APP
+                response.packet.decoded.request_id = request.packet.id
+                telemetry = service_module.telemetry_pb2.Telemetry()
+                telemetry.local_stats.num_packets_rx_bad = self.rx_bad
+                response.packet.decoded.payload = telemetry.SerializeToString()
+                await service._on_from_radio(self.node_id, response)
+
+            self.reply_task = asyncio.create_task(reply())
+
+    gateways = {
+        "node-1": StatsGateway("node-1", 3),
+        "node-2": StatsGateway("node-2", 5),
+    }
+    service.gateways = gateways  # type: ignore[assignment]
+
+    result = await service._sample_local_stats()
+
+    assert result == {"node-1": 3, "node-2": 5}
+    for gateway in gateways.values():
+        packet = gateway.requests[0].packet
+        assert packet.to in {1, 2}
+        assert packet.decoded.portnum == service_module.portnums_pb2.TELEMETRY_APP
+        assert packet.decoded.want_response
+        assert service._local_stats_response_ids[gateway.node_id] == packet.id
+        assert gateway.reply_task is not None and gateway.reply_task.done()
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_in_flight_failure_cleanup(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.state = LifecycleState.FAILED
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def cleanup() -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    service._failure_cleanup_task = asyncio.create_task(cleanup())
+    stop_task = asyncio.create_task(service.stop())
+    await cleanup_started.wait()
+    await asyncio.sleep(0)
+    assert not stop_task.done()
+
+    release_cleanup.set()
+    result = await stop_task
+
+    assert result.state == LifecycleState.STOPPED
+    assert service._failure_cleanup_task is None
+
+
+@pytest.mark.asyncio
+async def test_archived_process_logs_survive_cleanup_until_reset(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    record = ProcessRecord(
+        node_id="node-1",
+        hardware_id=1,
+        internal_port=46001,
+        data_directory=tmp_path / "node-1" / "state",
+        stdout_path=tmp_path / "node-1" / "stdout.log",
+        stderr_path=tmp_path / "node-1" / "stderr.log",
+    )
+    record.stdout_lines.append("started")
+    record.stderr_lines.append("fatal detail")
+    service.supervisor.records[record.node_id] = record
+
+    async def drain_final_line() -> None:
+        await asyncio.sleep(0)
+        record.stderr_lines.append("final buffered detail")
+
+    drain_task = asyncio.create_task(drain_final_line())
+    record.tasks.add(drain_task)
+    drain_task.add_done_callback(record.tasks.discard)
+
+    await service.supervisor.stop()
+
+    assert service.supervisor.has_logs("node-1")
+    assert service.supervisor.recent_logs("node-1", stream="stdout") == ["started"]
+    assert service.supervisor.recent_logs("node-1", stream="stderr") == [
+        "fatal detail",
+        "final buffered detail",
+    ]
+
+    await service.reset()
+    assert not service.supervisor.has_logs("node-1")

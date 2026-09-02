@@ -125,7 +125,7 @@ def calculate_metrics(
         p95LatencyMs=_percentile_ordered(ordered_latencies, 0.95, minimum_samples=20),
         p99LatencyMs=_percentile_ordered(ordered_latencies, 0.99, minimum_samples=100),
         rfTransmissions=rf_count,
-        rfTransmissionsPerDelivery=rf_count / receiver_count if receiver_count else None,
+        rfTransmissionsPerDelivery=rf_count / delivered if delivered else None,
         relayTransmissions=relay_transmissions,
         duplicateReceptions=duplicate_receptions,
         failedReceptions=failed_receptions,
