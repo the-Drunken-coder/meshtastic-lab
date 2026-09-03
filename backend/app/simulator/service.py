@@ -231,15 +231,13 @@ class SimulatorService:
 
     async def start(self) -> CommandResult:
         command_id = str(uuid.uuid4())
-        failure_cleanup_awaited = await self._await_failure_cleanup()
+        await self._await_failure_cleanup()
         async with self._lifecycle_lock:
-            if not failure_cleanup_awaited:
-                failure_cleanup_awaited = await self._await_failure_cleanup()
             if self.state in {LifecycleState.RUNNING, LifecycleState.WARMING_UP}:
                 return CommandResult(commandId=command_id, state=self.state, detail="already running")
             if self.state not in {LifecycleState.STOPPED, LifecycleState.FAILED}:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", f"cannot start from {self.state}")
-            if self.state == LifecycleState.FAILED and not failure_cleanup_awaited:
+            if self.state == LifecycleState.FAILED:
                 await self._cleanup_resources()
             capabilities = self.capabilities()
             if not capabilities.collision_available:
@@ -352,27 +350,22 @@ class SimulatorService:
                 self.state = LifecycleState.FAILED
                 self.message = f"Startup failed: {exc}"
                 self._publish_lifecycle()
-                failure_cleanup_awaited = await self._await_failure_cleanup()
-                if not failure_cleanup_awaited:
-                    await self._cleanup_resources()
+                await self._cleanup_resources()
                 raise
             finally:
                 self._startup_task = None
 
     async def stop(self) -> CommandResult:
         command_id = str(uuid.uuid4())
-        failure_cleanup_awaited = await self._await_failure_cleanup()
+        await self._await_failure_cleanup()
         async with self._lifecycle_lock:
-            if not failure_cleanup_awaited:
-                failure_cleanup_awaited = await self._await_failure_cleanup()
             if self.state == LifecycleState.STOPPED:
                 return CommandResult(commandId=command_id, state=self.state, detail="already stopped")
             self.state = LifecycleState.STOPPING
             self.message = "Stopping traffic, gateways, and native processes"
             self._publish_lifecycle()
             async with self._topology_lock:
-                if not failure_cleanup_awaited:
-                    await self._cleanup_resources()
+                await self._cleanup_resources()
             self.state = LifecycleState.STOPPED
             self.message = "Stopped"
             self.simulation_id = None

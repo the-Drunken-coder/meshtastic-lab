@@ -18,6 +18,19 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
 
   await page.goto("/");
   await expect(page.getByText("five-node-line", { exact: true })).toBeVisible();
+
+  const externalScenario = {
+    ...lineScenario,
+    name: "five-node-line-external",
+    nodes: lineScenario.nodes.map((node) =>
+      node.id === "node-1" ? { ...node, displayName: "External Node 1" } : node,
+    ),
+  };
+  const externalUpdate = await request.put("/api/scenario", { data: externalScenario });
+  expect(externalUpdate.ok()).toBeTruthy();
+  await expect(page.getByText("five-node-line-external", { exact: true })).toBeVisible();
+  await expect(page.getByText("External Node 1", { exact: true }).first()).toBeVisible();
+
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(page.getByText("RUNNING", { exact: true }).first()).toBeVisible();
 
@@ -30,6 +43,16 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
   await expect(page.getByText(/Traffic run .* started/)).toBeVisible();
   await expect(page.locator(".metric").filter({ hasText: "Generated" }).locator("strong")).not.toHaveText("0");
 
+  await page.route(
+    (url) =>
+      url.pathname === "/api/nodes/node-1/logs" && url.searchParams.get("stream") === "stderr",
+    (route) =>
+      route.fulfill({
+        status: 200,
+        json: { nodeId: "node-1", stream: "stderr", lines: ["archived log sentinel"] },
+      }),
+  );
   await page.getByRole("button", { name: "Stop", exact: true }).click();
   await expect(page.getByText("STOPPED", { exact: true }).first()).toBeVisible();
+  await expect(page.locator(".daemon-log")).toContainText("archived log sentinel");
 });

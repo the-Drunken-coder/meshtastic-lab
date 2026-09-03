@@ -43,6 +43,11 @@ interface Notice {
   text: string;
 }
 
+interface ScenarioEditor {
+  draft: Scenario | null;
+  saved: Scenario | null;
+}
+
 const emptyMetrics: Metrics = {
   generatedApplicationMessages: 0,
   uniqueApplicationMessagesDelivered: 0,
@@ -94,6 +99,24 @@ function trafficDraftForScenario(current: TrafficRequest, nextScenario: Scenario
     sourceNodes: [nextScenario.nodes[0]?.id ?? "node-1"],
     fixedDestination: nextScenario.nodes[1]?.id,
   };
+}
+
+function reconcileTrafficDraft(current: TrafficRequest, nextScenario: Scenario): TrafficRequest {
+  const nodeIds = new Set(nextScenario.nodes.map((node) => node.id));
+  const retainedSources = current.sourceNodes.filter((nodeId) => nodeIds.has(nodeId));
+  const sourceNodes =
+    retainedSources.length > 0
+      ? retainedSources
+      : nextScenario.nodes[0]
+        ? [nextScenario.nodes[0].id]
+        : [];
+  const fixedDestination =
+    current.fixedDestination &&
+    nodeIds.has(current.fixedDestination) &&
+    !sourceNodes.includes(current.fixedDestination)
+      ? current.fixedDestination
+      : nextScenario.nodes.find((node) => !sourceNodes.includes(node.id))?.id;
+  return { ...current, sourceNodes, fixedDestination };
 }
 
 function errorMessage(error: unknown): string {
@@ -153,8 +176,10 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [lifecycle, setLifecycle] = useState<Lifecycle | null>(null);
   const [capability, setCapability] = useState<Capability | null>(null);
-  const [scenario, setScenario] = useState<Scenario | null>(null);
-  const [savedScenario, setSavedScenario] = useState<Scenario | null>(null);
+  const [{ draft: scenario, saved: savedScenario }, setScenarioEditor] = useState<ScenarioEditor>({
+    draft: null,
+    saved: null,
+  });
   const [nodes, setNodes] = useState<NodeView[]>([]);
   const [traffic, setTraffic] = useState<TrafficResult>({ state: "IDLE" });
   const [trafficDraft, setTrafficDraft] = useState<TrafficRequest>(defaultTraffic);
@@ -167,16 +192,40 @@ function App() {
   const [logStream, setLogStream] = useState<"stdout" | "stderr">("stderr");
   const [logs, setLogs] = useState<DaemonLogs | null>(null);
 
+  const setScenario = useCallback((nextScenario: Scenario) => {
+    setScenarioEditor((current) => ({ ...current, draft: nextScenario }));
+  }, []);
+
+  const acceptScenario = useCallback((nextScenario: Scenario) => {
+    setScenarioEditor({ draft: nextScenario, saved: nextScenario });
+  }, []);
+
+  const reconcileScenario = useCallback((nextScenario: Scenario) => {
+    setScenarioEditor((current) => {
+      const hasLocalEdits = Boolean(
+        current.draft &&
+          current.saved &&
+          JSON.stringify(current.draft) !== JSON.stringify(current.saved),
+      );
+      return {
+        draft: hasLocalEdits ? current.draft : nextScenario,
+        saved: nextScenario,
+      };
+    });
+  }, []);
+
   const refreshCore = useCallback(async () => {
-    const [nextLifecycle, nextNodes, nextTraffic] = await Promise.all([
+    const [nextLifecycle, nextScenario, nextNodes, nextTraffic] = await Promise.all([
       api.lifecycle(),
+      api.scenario(),
       api.nodes(),
       api.traffic(),
     ]);
     setLifecycle(nextLifecycle);
+    reconcileScenario(nextScenario);
     setNodes(nextNodes);
     setTraffic(nextTraffic);
-  }, []);
+  }, [reconcileScenario]);
 
   useEffect(() => {
     let active = true;
@@ -194,8 +243,7 @@ function App() {
           if (!active) return;
           setCapability(nextCapability);
           setLifecycle(nextLifecycle);
-          setScenario(nextScenario);
-          setSavedScenario(nextScenario);
+          acceptScenario(nextScenario);
           setNodes(nextNodes);
           setEvents((current) => mergeEvents(current, nextEvents));
           setTraffic(nextTraffic);
@@ -214,7 +262,7 @@ function App() {
       active = false;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, []);
+  }, [acceptScenario]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -224,6 +272,16 @@ function App() {
     }, 1500);
     return () => window.clearInterval(timer);
   }, [refreshCore]);
+
+  useEffect(() => {
+    if (!scenario) return;
+    const nodeIds = new Set(scenario.nodes.map((node) => node.id));
+    setTrafficDraft((current) => reconcileTrafficDraft(current, scenario));
+    setLogNode((current) =>
+      nodeIds.has(current) ? current : (scenario.nodes[0]?.id ?? ""),
+    );
+    setNodeFilter((current) => (nodeIds.has(current) ? current : ""));
+  }, [scenario]);
 
   useEffect(() => {
     let reconnectTimer: number | undefined;
@@ -260,12 +318,6 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    if (lifecycle?.state === "STOPPED") {
-      setLogs(null);
-      return () => {
-        active = false;
-      };
-    }
     api.logs(logNode, logStream)
       .then((nextLogs) => {
         if (active) setLogs(nextLogs);
@@ -315,8 +367,7 @@ function App() {
     if (!scenario) return;
     void perform("save", async () => {
       const updated = await api.replaceScenario(scenario);
-      setScenario(updated);
-      setSavedScenario(updated);
+      acceptScenario(updated);
       setNotice({ tone: "good", text: `Saved scenario ${updated.name}.` });
     });
   };
@@ -328,8 +379,7 @@ function App() {
       if (command === "reset") {
         await api.reset();
         const updated = await api.scenario();
-        setScenario(updated);
-        setSavedScenario(updated);
+        acceptScenario(updated);
         setTrafficDraft((current) => trafficDraftForScenario(current, updated));
       }
     });
@@ -361,8 +411,7 @@ function App() {
     void perform(`topology-${preset}`, async () => {
       if (dirty && stopped) throw new Error("Save scenario changes before applying a topology preset.");
       const updated = await api.applyTopology(preset);
-      setScenario(updated);
-      setSavedScenario(updated);
+      acceptScenario(updated);
       setNotice({ tone: "good", text: `Applied ${preset} directed topology.` });
     });
   };
@@ -381,8 +430,7 @@ function App() {
       if (running) {
         await Promise.all(nextLinks.map((nextLink) => api.updateLink(nextLink)));
         const updated = await api.scenario();
-        setScenario(updated);
-        setSavedScenario(updated);
+        acceptScenario(updated);
       } else if (stopped) {
         const keys = new Set(nextLinks.map((candidate) => `${candidate.from}:${candidate.to}`));
         const updated: Scenario = {
@@ -395,8 +443,7 @@ function App() {
           }),
         };
         const saved = await api.replaceScenario(updated);
-        setScenario(saved);
-        setSavedScenario(saved);
+        acceptScenario(saved);
       }
       setNotice({
         tone: "good",
@@ -558,7 +605,7 @@ function App() {
               <select aria-label="Log node" value={logNode} onChange={(event) => setLogNode(event.currentTarget.value)}>{scenario.nodes.map((node) => <option value={node.id} key={node.id}>{node.displayName}</option>)}</select>
               <select aria-label="Log stream" value={logStream} onChange={(event) => setLogStream(event.currentTarget.value as "stdout" | "stderr")}><option value="stderr">stderr</option><option value="stdout">stdout</option></select>
             </div>
-            <pre className="daemon-log">{logs?.lines.slice(-18).join("\n") || (stopped ? "Start the simulation to inspect native logs." : "No recent lines for this stream.")}</pre>
+            <pre className="daemon-log">{logs?.lines.slice(-18).join("\n") || (stopped ? "No archived lines for this stream." : "No recent lines for this stream.")}</pre>
           </section>
         </aside>
 

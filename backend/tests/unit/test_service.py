@@ -626,6 +626,98 @@ async def test_stop_waits_for_in_flight_failure_cleanup(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_cleans_resources_created_by_concurrent_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "collision-marker"
+    marker.touch()
+    service = SimulatorService(
+        binary_path=tmp_path / "meshtasticd",
+        data_root=tmp_path,
+        collision_marker=marker,
+        warmup_seconds=0,
+    )
+    service.build_metadata = BuildMetadata(
+        firmwareCommit="firmware",
+        collisionPatchSha256="patch",
+        firmwareBinarySha256="binary",
+        buildArchitecture="aarch64",
+        clientLibraryVersion="2.7.11",
+        upstreamBaseImageDigest="sha256:base",
+    )
+    service.state = LifecycleState.FAILED
+    cleanup_release = asyncio.Event()
+
+    class RestartGateway:
+        def __init__(self, **_kwargs: object) -> None:
+            self.listening = False
+            started_gateways.append(self)
+
+        def reserve_public_listener(self) -> None:
+            return
+
+        async def start(self) -> None:
+            self.listening = True
+
+        async def stop(self) -> None:
+            self.listening = False
+
+        async def enable_public_clients(self) -> None:
+            return
+
+    started_gateways: list[RestartGateway] = []
+
+    class RestartMedium:
+        def __init__(self, **_kwargs: object) -> None:
+            return
+
+        async def start(self) -> None:
+            return
+
+        async def stop(self) -> None:
+            return
+
+    async def prior_cleanup() -> None:
+        await cleanup_release.wait()
+
+    async def start_processes(_scenario: Scenario) -> dict[str, SimpleNamespace]:
+        return {
+            node.id: SimpleNamespace(internal_port=46000 + index)
+            for index, node in enumerate(service.scenario.nodes, start=1)
+        }
+
+    async def configure_nodes() -> dict[str, NodeVerification]:
+        return {node.id: verification(node.id) for node in service.scenario.nodes}
+
+    async def warm_up_nodes() -> tuple[set[tuple[str, str]], int]:
+        return set(), 0
+
+    monkeypatch.setattr(service_module, "NodeGateway", RestartGateway)
+    monkeypatch.setattr(service_module, "DirectedMedium", RestartMedium)
+    monkeypatch.setattr(service.supervisor, "start", start_processes)
+    monkeypatch.setattr(service, "_configure_nodes", configure_nodes)
+    monkeypatch.setattr(service, "_warm_up_nodes", warm_up_nodes)
+    service._failure_cleanup_task = asyncio.create_task(prior_cleanup())
+
+    await service._lifecycle_lock.acquire()
+    start_task = asyncio.create_task(service.start())
+    await asyncio.sleep(0)
+    stop_task = asyncio.create_task(service.stop())
+    await asyncio.sleep(0)
+    cleanup_release.set()
+    await asyncio.sleep(0)
+    service._lifecycle_lock.release()
+
+    await start_task
+    result = await stop_task
+
+    assert result.state == LifecycleState.STOPPED
+    assert started_gateways
+    assert not any(gateway.listening for gateway in started_gateways)
+    assert service.gateways == {}
+
+
+@pytest.mark.asyncio
 async def test_stop_retries_cleanup_after_failure_task_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
