@@ -20,10 +20,10 @@ from backend.app.metrics import (
 @pytest.mark.parametrize(
     ("preset", "expected"),
     [
-        ("SHORT_FAST", 91),
-        ("MEDIUM_FAST", 293),
-        ("LONG_FAST", 1009),
-        ("LONG_MODERATE", 3477),
+        ("SHORT_FAST", 89),
+        ("MEDIUM_FAST", 289),
+        ("LONG_FAST", 976),
+        ("LONG_MODERATE", 3379),
         ("LONG_SLOW", 6168),
     ],
 )
@@ -33,6 +33,11 @@ def test_airtime_matches_upstream_simradio_equation(preset: str, expected: int) 
 
 def test_retransmission_delay_includes_airtime_contention_and_processing() -> None:
     assert maximum_retransmission_delay_ms(100, "LONG_SLOW") == 44051
+
+
+def test_airtime_rounds_payload_symbols_after_applying_coding_rate() -> None:
+    assert airtime_ms(96, "LONG_SLOW") == 5939
+    assert maximum_retransmission_delay_ms(96, "LONG_SLOW") == 43593
 
 
 def test_simulator_wrapper_is_not_counted_as_extra_airtime() -> None:

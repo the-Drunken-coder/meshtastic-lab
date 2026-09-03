@@ -49,7 +49,7 @@ def airtime_ms(payload_length: int, modem_preset: str, *, preamble_symbols: int 
     preamble_time = (preamble_symbols + 4.25) * symbol_time
     numerator = 8 * payload_length - 4 * params.spreading_factor + 28 + 16
     denominator = 4 * (params.spreading_factor - 2 * int(low_data_rate_optimization))
-    payload_symbols = 8 + max(math.ceil(numerator / denominator) * params.coding_rate, 0)
+    payload_symbols = 8 + max(math.ceil(numerator / denominator * params.coding_rate), 0)
     return int((preamble_time + payload_symbols * symbol_time) * 1000)
 
 

@@ -42,7 +42,7 @@ The Docker build checks for the collision-only firmware log string before creati
 Tsymbol = 2^SF / BW
 DE = 1 when Tsymbol > 16 ms, otherwise 0
 Tpreamble = (P + 4.25) × Tsymbol
-payloadSymbols = 8 + max(ceil((8PL - 4SF + 28 + 16) / (4(SF - 2DE))) × CR, 0)
+payloadSymbols = 8 + max(ceil(((8PL - 4SF + 28 + 16) / (4(SF - 2DE))) × CR), 0)
 airtime = Tpreamble + payloadSymbols × Tsymbol
 ```
 
