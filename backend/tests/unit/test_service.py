@@ -356,6 +356,61 @@ def test_persisted_result_is_not_cloned_for_volatile_archive(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_cleanup_continues_while_traffic_finalization_settles(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    finalization_done = asyncio.Event()
+    medium_stopped = asyncio.Event()
+    gateway_stopped = asyncio.Event()
+    supervisor_stopped = asyncio.Event()
+
+    class LateTraffic:
+        current = SimpleNamespace(run_id="late-run")
+
+        async def stop(self) -> bool:
+            return False
+
+        async def wait_for_finalization(self) -> None:
+            await finalization_done.wait()
+
+        def summary(self) -> None:
+            return None
+
+        def result_is_finalized(self, _run_id: str) -> bool:
+            return False
+
+    class Stoppable:
+        def __init__(self, stopped: asyncio.Event) -> None:
+            self.stopped = stopped
+
+        async def stop(self) -> None:
+            self.stopped.set()
+
+    traffic = LateTraffic()
+    service.traffic = traffic  # type: ignore[assignment]
+    service.medium = Stoppable(medium_stopped)  # type: ignore[assignment]
+    service.gateways = {"node-1": Stoppable(gateway_stopped)}  # type: ignore[assignment]
+
+    async def stop_supervisor() -> None:
+        supervisor_stopped.set()
+
+    service.supervisor.stop = stop_supervisor  # type: ignore[method-assign]
+
+    await asyncio.wait_for(service._cleanup_resources(), timeout=0.5)
+
+    assert medium_stopped.is_set()
+    assert gateway_stopped.is_set()
+    assert supervisor_stopped.is_set()
+    assert service.traffic is None
+    late_tasks = tuple(service._late_traffic_finalizations)
+    assert len(late_tasks) == 1
+
+    finalization_done.set()
+    await asyncio.gather(*late_tasks)
+    await asyncio.sleep(0)
+    assert not service._late_traffic_finalizations
+
+
+@pytest.mark.asyncio
 async def test_traffic_stop_waits_for_started_topology_update(tmp_path: Path) -> None:
     service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
     service.scenario = default_scenario(2)

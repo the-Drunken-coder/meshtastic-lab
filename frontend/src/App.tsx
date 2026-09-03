@@ -203,7 +203,7 @@ function App() {
     setScenarioEditor({ draft: nextScenario, saved: nextScenario });
   }, []);
 
-  const reconcileScenario = useCallback((nextScenario: Scenario) => {
+  const reconcileScenario = useCallback((nextScenario: Scenario, lifecycleState: Lifecycle["state"]) => {
     setScenarioEditor((current) => {
       const hasLocalEdits = Boolean(
         current.draft &&
@@ -211,7 +211,7 @@ function App() {
           JSON.stringify(current.draft) !== JSON.stringify(current.saved),
       );
       return {
-        draft: hasLocalEdits ? current.draft : nextScenario,
+        draft: hasLocalEdits && lifecycleState === "STOPPED" ? current.draft : nextScenario,
         saved: nextScenario,
       };
     });
@@ -225,7 +225,7 @@ function App() {
       api.traffic(),
     ]);
     setLifecycle(nextLifecycle);
-    reconcileScenario(nextScenario);
+    reconcileScenario(nextScenario, nextLifecycle.state);
     setNodes(nextNodes);
     setTraffic(nextTraffic);
   }, [reconcileScenario]);
@@ -270,7 +270,9 @@ function App() {
   useEffect(() => {
     const timer = window.setInterval(() => {
       refreshCore().catch((error: unknown) => {
-        setNotice((current) => current ?? { tone: "bad", text: errorMessage(error) });
+        setNotice((current) =>
+          current?.tone === "bad" ? current : { tone: "bad", text: errorMessage(error) },
+        );
       });
     }, 1500);
     return () => window.clearInterval(timer);

@@ -244,8 +244,11 @@ class TrafficController:
         results_root: Path,
         build_metadata: BuildMetadata | None = None,
         settle_seconds: float | None = None,
+        finalization_wait_seconds: float = 5.0,
         failed_reception_sampler: FailedReceptionSampler | None = None,
     ) -> None:
+        if finalization_wait_seconds <= 0:
+            raise ValueError("finalization wait must be positive")
         self.scenario = scenario
         self.gateways = gateways
         self.hardware_ids = hardware_ids
@@ -253,6 +256,7 @@ class TrafficController:
         self.results_root = results_root
         self.build_metadata = build_metadata or BuildMetadata.unavailable()
         self.settle_seconds = settle_seconds
+        self.finalization_wait_seconds = finalization_wait_seconds
         self.failed_reception_sampler = failed_reception_sampler
         self.state = TrafficRunState.IDLE
         self.current: TrafficRunResult | None = None
@@ -260,6 +264,7 @@ class TrafficController:
         self._task: asyncio.Task[None] | None = None
         self._finalization_done = asyncio.Event()
         self._finalization_done.set()
+        self._finalization_wait_timed_out = False
         self._run_scenario = scenario
         self._sequence = 0
         self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
@@ -356,20 +361,19 @@ class TrafficController:
         LOGGER.info("traffic run started", extra={"traffic_run_id": run_id})
         return run_id
 
-    async def stop(self) -> None:
+    async def stop(self) -> bool:
         if self._frozen_result is not None:
-            return
-        if not self._finalization_done.is_set():
-            await asyncio.shield(self._finalization_done.wait())
-            return
+            return True
+        if not await self._wait_for_active_finalization():
+            return False
         if self.state == TrafficRunState.FAILED:
             await self._cancel_run_task()
             await self._sample_final_failed_receptions()
             if self._frozen_result is None:
-                await self._finish(TrafficRunState.FAILED)
-            return
+                return await self._finish(TrafficRunState.FAILED)
+            return True
         if self._task is None or self._task.done():
-            return
+            return True
         self.state = TrafficRunState.STOPPING
         await self._cancel_run_task()
         self._finalize_pending_submissions()
@@ -380,27 +384,52 @@ class TrafficController:
                 if self.state == TrafficRunState.FAILED
                 else TrafficRunState.CANCELLED
             )
-            await self._finish(terminal)
+            return await self._finish(terminal)
+        return True
 
-    async def fail(self, reason: str) -> None:
+    async def fail(self, reason: str) -> bool:
         """Fail an active run, preserving FAILED when its task observes cancellation."""
 
-        if not self._finalization_done.is_set():
-            await asyncio.shield(self._finalization_done.wait())
-            return
+        if not await self._wait_for_active_finalization():
+            return False
         if self.current is None or self.state not in {
             TrafficRunState.RUNNING,
             TrafficRunState.STOPPING,
             TrafficRunState.FAILED,
         }:
-            return
+            return True
         self.state = TrafficRunState.FAILED
         self.current.failure = reason
         await self._cancel_run_task()
         self._finalize_pending_submissions()
         await self._sample_final_failed_receptions()
         if self._frozen_result is None:
-            await self._finish(TrafficRunState.FAILED)
+            return await self._finish(TrafficRunState.FAILED)
+        return True
+
+    async def wait_for_finalization(self) -> None:
+        await self._finalization_done.wait()
+
+    async def _wait_for_active_finalization(self) -> bool:
+        if self._finalization_done.is_set():
+            return True
+        if self._finalization_wait_timed_out:
+            return False
+        try:
+            await asyncio.wait_for(
+                self._finalization_done.wait(), timeout=self.finalization_wait_seconds
+            )
+        except TimeoutError:
+            self._finalization_wait_timed_out = True
+            LOGGER.error(
+                "traffic finalization exceeded teardown wait",
+                extra={
+                    "traffic_run_id": self.current.run_id if self.current is not None else None,
+                    "error_category": "traffic-finalization-timeout",
+                },
+            )
+            return False
+        return True
 
     async def wait(self, *, deadline_seconds: float | None = None) -> TrafficRunResult:
         if self._task is not None:
@@ -1023,12 +1052,11 @@ class TrafficController:
             return candidates[index % len(candidates)]
         return randomizer.choice(candidates)
 
-    async def _finish(self, state: TrafficRunState) -> None:
+    async def _finish(self, state: TrafficRunState) -> bool:
         if self.current is None or self._frozen_result is not None:
-            return
-        if not self._finalization_done.is_set():
-            await asyncio.shield(self._finalization_done.wait())
-            return
+            return True
+        if not await self._wait_for_active_finalization():
+            return False
         self._finalization_done.clear()
         try:
             self._finalize_pending_submissions()
@@ -1067,6 +1095,7 @@ class TrafficController:
             self.current = frozen
         finally:
             self._finalization_done.set()
+        return True
 
     def _freeze_and_persist(self, current: TrafficRunResult) -> TrafficRunResult:
         """Serialize a stable terminal result outside the asyncio event loop."""
@@ -1398,6 +1427,7 @@ class TrafficController:
 
     def _reset_accumulators(self) -> None:
         self._retire_packet_ids()
+        self._finalization_wait_timed_out = False
         self._sequence = 0
         self._messages_by_packet.clear()
         self._messages_by_key.clear()

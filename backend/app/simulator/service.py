@@ -196,6 +196,7 @@ class SimulatorService:
         self._failure_cleanup_task: asyncio.Task[None] | None = None
         self._startup_task: asyncio.Task[object] | None = None
         self._event_loop_lag_task: asyncio.Task[None] | None = None
+        self._late_traffic_finalizations: set[asyncio.Task[None]] = set()
 
     def capabilities(self) -> CapabilityView:
         available = self.collision_marker.is_file()
@@ -537,20 +538,41 @@ class SimulatorService:
         )
         return sorted(persisted | self._volatile_results.keys())
 
-    def _archive_unpersisted_traffic_result(self) -> None:
-        if self.traffic is None or self.traffic.current is None:
+    def _archive_unpersisted_traffic_result(
+        self, traffic: TrafficController | None = None
+    ) -> None:
+        selected = traffic or self.traffic
+        if selected is None or selected.current is None:
             return
-        run_id = self.traffic.current.run_id
-        if not self.traffic.result_is_finalized(run_id):
+        run_id = selected.current.run_id
+        if not selected.result_is_finalized(run_id):
             return
         if (self.results_root / f"{run_id}.json").is_file():
             return
-        result = self.traffic.result()
+        result = selected.result()
         if result is None or result.finished_at is None:
             return
         self._volatile_results[result.run_id] = result
         while len(self._volatile_results) > MAX_VOLATILE_RESULTS:
             self._volatile_results.pop(next(iter(self._volatile_results)))
+
+    def _track_late_traffic_finalization(self, traffic: TrafficController) -> None:
+        task = asyncio.create_task(
+            self._settle_late_traffic_finalization(traffic),
+            name=f"late-traffic-finalization-{traffic.current.run_id if traffic.current else 'unknown'}",
+        )
+        self._late_traffic_finalizations.add(task)
+        task.add_done_callback(self._late_traffic_finalizations.discard)
+
+    async def _settle_late_traffic_finalization(self, traffic: TrafficController) -> None:
+        await traffic.wait_for_finalization()
+        summary = traffic.summary()
+        if summary is not None and (
+            self._last_traffic_summary is None
+            or self._last_traffic_summary.run_id == summary.run_id
+        ):
+            self._last_traffic_summary = summary
+        self._archive_unpersisted_traffic_result(traffic)
 
     def nodes(self) -> list[NodeView]:
         views: list[NodeView] = []
@@ -962,9 +984,13 @@ class SimulatorService:
             lag_task.cancel()
             await asyncio.gather(lag_task, return_exceptions=True)
         if self.traffic is not None:
-            await self.traffic.stop()
-            self._last_traffic_summary = self.traffic.summary()
-            self._archive_unpersisted_traffic_result()
+            traffic = self.traffic
+            finalized = await traffic.stop()
+            self._last_traffic_summary = traffic.summary()
+            if finalized:
+                self._archive_unpersisted_traffic_result(traffic)
+            else:
+                self._track_late_traffic_finalization(traffic)
         if self.medium is not None:
             await self.medium.stop()
         if self.gateways:

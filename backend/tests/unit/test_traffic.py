@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,45 @@ async def test_stop_waits_for_terminal_persistence(
     assert persist_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_stop_bounds_wait_for_terminal_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path, finalization_wait_seconds=0.01)
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    persist = controller._freeze_and_persist
+
+    def blocking_persist(current: TrafficRunResult) -> TrafficRunResult:
+        persistence_started.set()
+        if not release_persistence.wait(timeout=2):
+            raise RuntimeError("test did not release persistence")
+        return persist(current)
+
+    monkeypatch.setattr(controller, "_freeze_and_persist", blocking_persist)
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+    )
+    assert await asyncio.to_thread(persistence_started.wait, 1)
+
+    started = time.monotonic()
+    try:
+        assert await controller.stop() is False
+        assert time.monotonic() - started < 0.5
+        assert not controller._finalization_done.is_set()
+    finally:
+        release_persistence.set()
+
+    result = await controller.wait(deadline_seconds=2)
+    assert result.state == TrafficRunState.COMPLETED
+    assert controller.result_is_finalized(result.run_id)
+
+
 def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:
     scenario = default_scenario(2)
     controller = TrafficController(
@@ -146,7 +186,12 @@ def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:
         controller.start(request)
 
 
-def _controller(tmp_path: Path, scenario: Scenario | None = None) -> TrafficController:
+def _controller(
+    tmp_path: Path,
+    scenario: Scenario | None = None,
+    *,
+    finalization_wait_seconds: float = 5.0,
+) -> TrafficController:
     selected = default_scenario(3) if scenario is None else scenario
     gateways = {node.id: FakeGateway(node.id) for node in selected.nodes}
     controller = TrafficController(
@@ -156,6 +201,7 @@ def _controller(tmp_path: Path, scenario: Scenario | None = None) -> TrafficCont
         event_broker=EventBroker(),
         results_root=tmp_path,
         settle_seconds=0,
+        finalization_wait_seconds=finalization_wait_seconds,
     )
     for gateway in gateways.values():
         gateway.controller = controller

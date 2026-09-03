@@ -56,8 +56,47 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
     ),
   ).toMatchObject({ enabled: false, rssiDbm: -85, snrDb: 8 });
 
-  await page.getByRole("button", { name: "Start", exact: true }).click();
+  let pollFailurePending = true;
+  await page.route(
+    (url) => url.pathname === "/api/state",
+    async (route) => {
+      if (pollFailurePending) {
+        pollFailurePending = false;
+        await route.fulfill({ status: 503, json: { error: { message: "polling failed" } } });
+        return;
+      }
+      await route.continue();
+    },
+  );
+  await expect(page.getByRole("alert")).toContainText("HTTP_503: polling failed");
+
+  await page.getByLabel("Frequency slot").fill("21");
+  const runtimeScenario = {
+    ...resizedScenario,
+    name: "five-node-line-runtime",
+    links: resizedScenario.links.map((link) =>
+      link.from === "node-1" && link.to === "node-2"
+        ? { ...link, rssiDbm: -111, snrDb: 1.5 }
+        : link,
+    ),
+  };
+  const runtimeUpdate = await request.put("/api/scenario", { data: runtimeScenario });
+  expect(runtimeUpdate.ok()).toBeTruthy();
+  const started = await request.post("/api/simulation/start");
+  expect(started.ok()).toBeTruthy();
   await expect(page.getByText("RUNNING", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("five-node-line-runtime", { exact: true })).toBeVisible();
+
+  await page
+    .getByRole("button", { name: "Disable link from External Node 1 to Node 2" })
+    .click();
+  const runtimeLinkResponse = await request.get("/api/scenario");
+  const runtimeLinkScenario = (await runtimeLinkResponse.json()) as typeof lineScenario;
+  expect(
+    runtimeLinkScenario.links.find(
+      (link) => link.from === "node-1" && link.to === "node-2",
+    ),
+  ).toMatchObject({ enabled: false, rssiDbm: -111, snrDb: 1.5 });
 
   await page.route(
     (url) =>
