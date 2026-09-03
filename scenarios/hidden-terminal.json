@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "name": "hidden-terminal",
+  "seed": 7,
+  "nodeCount": 3,
+  "rf": {
+    "region": "US",
+    "modemPreset": "LONG_FAST",
+    "frequencySlot": 20,
+    "hopLimit": 4,
+    "collisionMode": "native"
+  },
+  "channel": { "name": "Simulator", "psk": "AQ==" },
+  "nodes": [
+    { "id": "node-1", "displayName": "Hidden A", "role": "CLIENT", "apiPort": 45001 },
+    { "id": "node-2", "displayName": "Receiver", "role": "CLIENT", "apiPort": 45002 },
+    { "id": "node-3", "displayName": "Hidden B", "role": "CLIENT", "apiPort": 45003 }
+  ],
+  "links": [
+    { "from": "node-1", "to": "node-2", "enabled": true, "rssiDbm": -80, "snrDb": 10 },
+    { "from": "node-1", "to": "node-3", "enabled": false, "rssiDbm": -85, "snrDb": 8 },
+    { "from": "node-2", "to": "node-1", "enabled": true, "rssiDbm": -80, "snrDb": 10 },
+    { "from": "node-2", "to": "node-3", "enabled": true, "rssiDbm": -80, "snrDb": 10 },
+    { "from": "node-3", "to": "node-1", "enabled": false, "rssiDbm": -85, "snrDb": 8 },
+    { "from": "node-3", "to": "node-2", "enabled": true, "rssiDbm": -80, "snrDb": 10 }
+  ],
+  "freshState": true
+}

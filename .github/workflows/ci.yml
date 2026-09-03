@@ -17,6 +17,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: 3.13.7
@@ -26,7 +29,7 @@ jobs:
           version: 11.0.9
       - uses: actions/setup-node@v7.0.0
         with:
-          node-version: 25.9.0
+          node-version: 24.16.0
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: uv sync --frozen
@@ -34,14 +37,51 @@ jobs:
       - run: make test
       - run: make lint
 
-  acceptance:
+  native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      MESHTASTIC_TEST_FIRMWARE_IMAGE: meshtastic-lab:0.1.0
+      MESHTASTIC_PRODUCT_IMAGE: meshtastic-lab:0.1.0
+      MESHTASTICATOR_COMMIT: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: 3.13.7
           enable-cache: true
+      - uses: pnpm/action-setup@v6.0.10
+        with:
+          version: 11.0.9
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
       - run: uv sync --frozen
-      - run: make acceptance
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - name: Build the custom firmware image
+        run: docker compose build
+      - name: Run native integration tests
+        run: make integration-test
+      - name: Run real-firmware acceptance
+        run: make acceptance
+      - name: Install Playwright browser and system dependencies
+        run: pnpm --dir frontend exec playwright install --with-deps chromium
+      - name: Run Playwright browser smoke tests
+        run: |
+          trap 'docker compose down' EXIT
+          docker compose up --build --detach --wait --wait-timeout 180
+          pnpm --dir frontend exec playwright test --reporter=html
+      - name: Upload browser diagnostics
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: browser-test-results
+          path: |
+            frontend/test-results
+            frontend/playwright-report
+          if-no-files-found: ignore

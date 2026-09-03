@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Meshtastic Lab Mock 2: Signal Sheet</title><link rel="stylesheet" href="base.css">
+  <style>
+    :root{color-scheme:dark;--bg:#0d1117;--panel:#11161d;--ink:#e6edf3;--muted:#8b949e;--line:#30363d;--line-strong:#484f58;--accent:#39d98a;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+    body{min-width:1060px}.app{height:100vh;display:grid;grid-template-columns:58px 1fr 310px;grid-template-rows:50px 1fr}
+    header{grid-column:1/-1;display:flex;align-items:center;gap:14px;border-bottom:1px solid var(--line-strong);padding:0 12px;background:#090c10}
+    header h1{font:700 15px "SFMono-Regular",monospace;margin:0}header .state{margin-left:auto}
+    nav{border-right:1px solid var(--line-strong);display:grid;align-content:start;gap:8px;padding:10px 7px;background:#090c10}
+    nav button{width:42px;height:42px;padding:0;background:transparent;color:var(--muted);border-color:transparent}nav button.active{color:var(--ink);background:#1b222c;border-color:var(--line-strong)}
+    main{min-width:0;display:grid;grid-template-rows:44px 1fr 260px}.tabs{display:flex;border-bottom:1px solid var(--line);background:var(--panel)}
+    .tabs button{border:0;border-right:1px solid var(--line);border-radius:0;background:transparent;color:var(--muted);padding:0 18px}.tabs button.active{color:var(--ink);border-bottom:2px solid var(--accent)}
+    .matrix-area{padding:14px;overflow:auto}.matrix-title{display:flex;align-items:flex-end;margin-bottom:10px}.matrix-title h2{margin:0;font-size:18px}.matrix-title .actions{margin-left:auto}
+    .matrix td{height:48px;min-width:88px}.matrix .toggle{width:54px;background:#171d25;border-color:#38414b}.matrix .toggle.on{background:#143423;color:#7ee787;border-color:#238636}
+    .timeline{border-top:1px solid var(--line-strong);overflow:auto;background:#0a0e13}.timeline-head{display:flex;align-items:center;height:40px;padding:0 10px;border-bottom:1px solid var(--line)}
+    .timeline-head select{width:130px;margin-left:8px}.timeline table{font-size:11px}.inspect{border-left:1px solid var(--line-strong);overflow:auto;background:var(--panel)}
+    .inspect section{border-bottom:1px solid var(--line);padding:12px}.inspect h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+    .kv{display:grid;grid-template-columns:1fr auto;gap:7px 12px;font-variant-numeric:tabular-nums}.kv span:nth-child(odd){color:var(--muted)}
+    .spark{height:52px;display:flex;gap:3px;align-items:end;border-bottom:1px solid var(--line-strong)}.spark i{flex:1;background:#2f81f7;min-height:4px}.run{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .log{background:#080b0f;color:#b8c1ca;padding:8px;font:11px/1.55 "SFMono-Regular",monospace}
+  </style>
+</head><body><div class="app">
+  <header><h1>ML / RF-03</h1><span class="mono muted">3 nodes · LONG_FAST · US/20</span><span class="mono">54e0d8d · collision/native</span><span class="state ok"><span class="status-dot"></span>RUNNING</span><button>Stop</button></header>
+  <nav aria-label="Workspace"><button class="active" aria-label="Topology">RF</button><button aria-label="Nodes">ND</button><button aria-label="Traffic">TX</button><button aria-label="Results">RS</button><button aria-label="Logs">LG</button></nav>
+  <main><div class="tabs"><button class="active">Topology</button><button>Node processes</button><button>Scenario JSON</button><button>Run history</button></div>
+    <section class="matrix-area"><div class="matrix-title"><div><h2>Signal sheet</h2><span class="muted">Directed paths · selected node-2 → node-3</span></div><div class="actions"><button>Full</button><button class="primary">Line</button><button>Star</button><button>None</button></div></div>
+      <table class="matrix"><thead><tr><th>Transmitter</th><th>node-1</th><th>node-2</th><th>node-3</th><th>TX</th><th>Relay</th></tr></thead><tbody>
+        <tr><th>node-1 <span class="ok">●</span></th><td class="diag">SELF</td><td><button class="toggle on">-85 / 8</button></td><td><button class="toggle">BLOCK</button></td><td>18</td><td>0</td></tr>
+        <tr><th>node-2 <span class="ok">●</span></th><td><button class="toggle on">-85 / 8</button></td><td class="diag">SELF</td><td><button class="toggle on focus-note">-85 / 8</button></td><td>25</td><td>12</td></tr>
+        <tr><th>node-3 <span class="ok">●</span></th><td><button class="toggle">BLOCK</button></td><td><button class="toggle on">-85 / 8</button></td><td class="diag">SELF</td><td>12</td><td>0</td></tr>
+      </tbody></table>
+    </section>
+    <section class="timeline"><div class="timeline-head"><b>RF timeline</b><select><option>All nodes</option></select><select><option>All events</option></select><span class="muted" style="margin-left:auto">live · seq 247</span></div>
+      <table><thead><tr><th>UTC</th><th>Type</th><th>From</th><th>To</th><th>Receivers</th><th>ID</th><th>Run/seq</th><th>Hop</th><th>RF</th><th>Outcome</th></tr></thead><tbody>
+        <tr><td>18:32:19.114</td><td>rf_transmit</td><td>node-2</td><td>node-3</td><td>node-3</td><td class="mono">9a8311</td><td>6f1a/18</td><td>3/4</td><td>-85 · 8</td><td class="ok">delivered</td></tr>
+        <tr><td>18:32:18.006</td><td>link_updated</td><td>node-2</td><td>node-3</td><td>·</td><td>·</td><td>·</td><td>·</td><td>·</td><td class="ok">enabled</td></tr>
+        <tr><td>18:32:16.782</td><td>link_disabled</td><td>node-2</td><td>node-3</td><td>·</td><td class="mono">9a830d</td><td>6f1a/17</td><td>3/4</td><td>·</td><td class="bad">drop</td></tr>
+      </tbody></table>
+    </section>
+  </main>
+  <aside class="inspect">
+    <section><h2>Selected link</h2><div class="kv"><span>Path</span><b>node-2 → node-3</b><span>State</span><b class="ok">Enabled</b><span>RSSI</span><b>-85 dBm</b><span>SNR</span><b>8 dB</b></div><div class="actions" style="margin-top:10px"><button class="danger">Disable link</button><label><input type="checkbox" style="width:auto;min-height:auto"> symmetric</label></div></section>
+    <section><h2>Traffic / 6f1a</h2><div class="run"><div class="field"><label>Mode</label><select><option>Direct</option></select></div><div class="field"><label>Strategy</label><select><option>Round robin</option></select></div><div class="field"><label>Rate</label><input value="12/min"></div><div class="field"><label>Bytes</label><input value="48"></div><div class="field"><label>Duration</label><input value="60s"></div><div class="field"><label>Seed</label><input value="731"></div></div><button class="primary" style="width:100%;margin-top:8px">Start traffic</button></section>
+    <section><h2>Delivery</h2><div class="kv"><span>Generated</span><b>20</b><span>Delivered</span><b>18</b><span>Ratio</span><b>90%</b><span>ACK</span><b>16 / 18</b><span>Median</span><b>812 ms</b><span>P95</span><b>2.4 s</b><span>P99</span><b>N/A</b><span>RF TX</span><b>47</b><span>RF / delivered</span><b>2.61</b><span>Airtime</span><b>21.4 s</b></div><div class="spark"><i style="height:22%"></i><i style="height:48%"></i><i style="height:35%"></i><i style="height:72%"></i><i style="height:54%"></i><i style="height:90%"></i><i style="height:62%"></i><i style="height:42%"></i></div></section>
+    <section><h2>node-2 daemon</h2><div class="log">[Router] relay id=9a8311<br>[SimRadio] airtime 518ms<br>[ServerAPI] to phone<br>[Router] ACK seq=18</div></section>
+  </aside>
+</div></body></html>

@@ -1,0 +1,52 @@
+[project]
+name = "meshtastic-lab"
+version = "0.1.0"
+description = "Firmware-in-the-loop Meshtastic network simulator"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "meshtastic==2.7.11",
+  "protobuf>=6.31,<7",
+  "pydantic>=2.11,<3",
+  "python-json-logger>=3.3,<4",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+  "integration: uses native Meshtastic firmware",
+]
+testpaths = ["backend/tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["backend.app"]
+
+[[tool.mypy.overrides]]
+module = "meshtastic.*"
+ignore_missing_imports = true

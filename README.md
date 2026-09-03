@@ -9,10 +9,16 @@ The firmware still creates, encrypts, queues, retries, floods, relays, acknowled
 Requirements are Docker Engine 24 or newer with Compose v2, or current Docker Desktop. Allocate at least 4 CPU cores and 6 GB of memory for a 10-node run.
 
 ```sh
-docker compose up --build
+make dev
 ```
 
-Open <http://127.0.0.1:8080>. The initial image build compiles collision-enabled native firmware from the pinned source commit and can take several minutes. Later builds use Docker’s cache.
+Open <http://127.0.0.1:8080>. `make dev` records the current clean repository commit in the image, then compiles collision-enabled native firmware from the pinned source commit. The initial build can take several minutes; later builds use Docker’s cache.
+
+For direct Compose use, start from a clean checkout and supply its revision explicitly. The image build rejects a missing or malformed revision instead of creating a runtime that cannot start:
+
+```sh
+MESHTASTICATOR_COMMIT="$(git rev-parse HEAD)" docker compose up --build
+```
 
 The application binds only to loopback:
 
@@ -42,11 +48,11 @@ node_1 = TCPInterface(hostname="127.0.0.1", portNumber=45001)
 node_1.sendText("hello from an ordinary client", wantAck=False)
 ```
 
-V1 permits one external client per node. A second client to that same node is rejected without disturbing the first. Different nodes support simultaneous clients.
+V1 permits one external client per node. A second client to that same node is rejected without disturbing the first. Different nodes support simultaneous clients. During startup, configuration uses a separate loopback-only control endpoint and public clients are admitted only after the simulation reaches `RUNNING`.
 
 ## Scenarios and runs
 
-Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running.
+Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running, including during traffic runs. Completed exports keep the starting scenario and an ordered timeline of changes made during the run.
 
 The checked-in JSON scenarios under `scenarios/` are valid API payloads. To load one without the UI:
 
@@ -56,17 +62,17 @@ curl -X PUT http://127.0.0.1:8080/api/scenario \
   --data-binary @scenarios/five-node-line.json
 ```
 
-Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`.
+Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
 
 ## Metrics
 
-- Generated is application messages created by the offered traffic schedule. Submitted and submission failed show whether the firmware Client API accepted each request.
+- Generated is application messages created by the offered traffic schedule. Submitted and submission failed come from the firmware admission response for each request, including queue status and pre-transmission rate-limit errors, not from socket writes.
 - Delivered counts unique generated messages exposed by an intended receiver. Receiver deliveries and receiver delivery ratio separately count every applicable node reached by each broadcast.
 - RF TX counts firmware transmitter events once, even when several receivers hear one frame. RF TX per delivery exposes flooding and retry amplification.
 - Relay TX counts transmissions where the transmitting firmware did not originate the packet.
-- Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it.
-- ACK success is separate from destination delivery. Percentiles remain unavailable until their configured sample minimum is met.
-- Failed or bad receptions come from native firmware local statistics. Collision results are labeled `native` only in the collision-enabled image.
+- Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it. The total is also broken down by transmitting node.
+- ACK success is separate from destination delivery. It applies only to firmware-accepted direct messages because firmware disables acknowledgments for broadcasts. Percentiles remain unavailable until their configured sample minimum is met. Live percentiles use the most recent 2,048 deliveries; completed results use the full run.
+- Duplicate and failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. A partial sample keeps the run exportable and sets `failedReceptionMetricsComplete` to false with the missing nodes listed in `missingLocalStatsNodes`. Collision results are labeled `native` only in the collision-enabled image.
 
 See [fidelity](docs/fidelity.md) for exact boundaries.
 
@@ -92,10 +98,10 @@ The supported container paths are Linux `amd64` and Linux `arm64`. Docker Deskto
 ## Troubleshooting
 
 - **Start is disabled:** inspect `/api/capabilities`. The image refuses to claim native collision support if its build marker is absent. Rebuild without cache if a partial old image is present.
-- **Startup becomes FAILED:** select the named node and `stderr` in Daemon diagnostics. Startup is all-or-nothing and preserves recent child output.
+- **Startup becomes FAILED:** select the named node and `stderr` in Daemon diagnostics. Startup is all-or-nothing and preserves recent child output. Persisted stdout and stderr each retain one rotated 8 MiB backup.
 - **Client is rejected:** another external client is already attached to that node. Disconnect it or select another node endpoint.
 - **Ports are occupied:** stop another stack or local Meshtastic process using `8080` or `45001` through `45010`. `docker compose down` removes the application container without deleting the result volume.
-- **Slow first start:** every node receives and verifies the requested firmware configuration, reboots, reconnects, and exchanges NodeInfo over the configured topology. Readiness uses those observations, not a fixed sleep.
+- **Warm-up reports missing pairs:** local firmware configuration is the readiness gate. NodeInfo exchange is timed and best effort because hop limits, non-relaying roles, and collisions can make graph-connected pairs unobservable. Missing pairs remain visible in the lifecycle message but do not invalidate a correctly configured simulation.
 - **Apple Silicon build pressure:** the native firmware builder is large. Increase Docker Desktop’s memory limit if the compiler is killed.
 
 Architecture details are in [architecture](docs/architecture.md), and the gateway contract is in [client connections](docs/client-connections.md).
