@@ -208,17 +208,16 @@ function App() {
   const acceptEvents = useCallback((incoming: PacketEvent[], streamId?: string) => {
     const incomingStreamId = streamId ?? incoming[0]?.streamId;
     if (!incomingStreamId) return;
+    const streamChanged =
+      eventStreamId.current !== null && eventStreamId.current !== incomingStreamId;
+    const matchingEvents = incoming.filter((event) => event.streamId === incomingStreamId);
+    eventStreamId.current = incomingStreamId;
+    latestEventSequence.current = matchingEvents.reduce(
+      (latest, event) => Math.max(latest, event.sequence),
+      streamChanged ? 0 : latestEventSequence.current,
+    );
     setEvents((current) => {
-      const streamChanged =
-        eventStreamId.current !== null && eventStreamId.current !== incomingStreamId;
-      eventStreamId.current = incomingStreamId;
-      const matchingEvents = incoming.filter((event) => event.streamId === incomingStreamId);
-      const merged = mergeEvents(streamChanged ? [] : current, matchingEvents);
-      latestEventSequence.current = merged.reduce(
-        (latest, event) => Math.max(latest, event.sequence),
-        0,
-      );
-      return merged;
+      return mergeEvents(streamChanged ? [] : current, matchingEvents);
     });
   }, []);
 
