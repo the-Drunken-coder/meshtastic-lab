@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,49 @@ async def test_deterministic_traffic_schedule_and_persistence(tmp_path: Path) ->
     ]
     assert (tmp_path / f"{run_id}.json").is_file()
     assert (tmp_path / f"{run_id}.summary.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_terminal_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    persist_calls = 0
+    persist = controller._freeze_and_persist
+
+    def blocking_persist(current: TrafficRunResult) -> TrafficRunResult:
+        nonlocal persist_calls
+        persist_calls += 1
+        persistence_started.set()
+        if not release_persistence.wait(timeout=2):
+            raise RuntimeError("test did not release persistence")
+        return persist(current)
+
+    monkeypatch.setattr(controller, "_freeze_and_persist", blocking_persist)
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+    )
+    assert await asyncio.to_thread(persistence_started.wait, 1)
+
+    stop_task = asyncio.create_task(controller.stop())
+    await asyncio.sleep(0)
+    try:
+        assert not stop_task.done()
+    finally:
+        release_persistence.set()
+    await stop_task
+
+    result = controller.result()
+    assert result is not None
+    assert result.state == TrafficRunState.COMPLETED
+    assert persist_calls == 1
 
 
 def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:

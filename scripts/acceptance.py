@@ -128,13 +128,7 @@ def listeners_closed(ports: list[int]) -> None:
         except OSError:
             continue
         with probe:
-            probe.settimeout(0.5)
-            try:
-                probe.sendall(b"\x94\xc3\x00\x00")
-                if probe.recv(1) != b"":
-                    occupied.append(port)
-            except OSError:
-                continue
+            occupied.append(port)
     if occupied:
         raise AcceptanceFailure(f"public listeners remained open after stop: {occupied}")
 

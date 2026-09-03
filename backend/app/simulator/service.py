@@ -442,7 +442,8 @@ class SimulatorService:
         async with self._topology_lock:
             if self.state != LifecycleState.RUNNING or self.traffic is None:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", "traffic requires RUNNING state")
-            if self.traffic.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+            traffic = self.traffic
+            if traffic.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
                 raise SimulationConflict("TRAFFIC_RUN_ACTIVE", "a traffic run is already active")
             try:
                 baseline = await self._sample_local_stats()
@@ -450,9 +451,14 @@ class SimulatorService:
                 raise SimulationConflict(
                     "LOCAL_STATS_UNAVAILABLE", f"could not capture native local statistics: {exc}"
                 ) from exc
+            if self.state != LifecycleState.RUNNING or self.traffic is not traffic:
+                raise SimulationConflict(
+                    "INVALID_LIFECYCLE_STATE",
+                    "simulation stopped while traffic baselines were being captured",
+                )
             try:
                 self._archive_unpersisted_traffic_result()
-                return self.traffic.start(
+                return traffic.start(
                     request,
                     scenario_snapshot=self.scenario.model_copy(deep=True),
                     failed_reception_baseline=baseline,
@@ -481,6 +487,16 @@ class SimulatorService:
         volatile = self._volatile_results.get(run_id)
         if volatile is not None:
             return volatile.model_copy(deep=True)
+        raise FileNotFoundError(run_id)
+
+    def traffic_result_is_complete(self, run_id: str) -> bool:
+        """Check export readiness without copying a run's generated-message records."""
+
+        if self.traffic is not None and self.traffic.current is not None:
+            if self.traffic.current.run_id == run_id:
+                return self.traffic.result_is_finalized(run_id)
+        if (self.results_root / f"{run_id}.json").is_file() or run_id in self._volatile_results:
+            return True
         raise FileNotFoundError(run_id)
 
     def traffic_summary(self, run_id: str) -> TrafficRunSummary:
@@ -556,6 +572,23 @@ class SimulatorService:
         return views
 
     async def _configure_nodes(self) -> dict[str, NodeVerification]:
+        async def settle_node_tasks(
+            tasks: list[asyncio.Task[NodeVerification]],
+        ) -> list[NodeVerification]:
+            try:
+                return await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            except Exception:
+                # Official-client calls run in worker threads and cannot be
+                # cancelled safely. Let every bounded sibling finish before
+                # startup cleanup closes gateways and process state.
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
         async def configure(node_id: str) -> NodeVerification:
             node = next(candidate for candidate in self.scenario.nodes if candidate.id == node_id)
             verification = await asyncio.to_thread(
@@ -570,7 +603,11 @@ class SimulatorService:
             await asyncio.wait_for(self.gateways[node_id].client_disconnected.wait(), timeout=5)
             return verification
 
-        await asyncio.gather(*(configure(node.id) for node in self.scenario.nodes))
+        configure_tasks = [
+            asyncio.create_task(configure(node.id), name=f"configure-{node.id}")
+            for node in self.scenario.nodes
+        ]
+        await settle_node_tasks(configure_tasks)
 
         async def reconnect_and_verify(node_id: str) -> NodeVerification:
             gateway = self.gateways[node_id]
@@ -594,13 +631,23 @@ class SimulatorService:
                     return verification
             raise RuntimeError(f"{node_id} did not stabilize after configuration restarts")
 
-        values = await asyncio.gather(
-            *(reconnect_and_verify(node.id) for node in self.scenario.nodes)
-        )
+        reconnect_tasks = [
+            asyncio.create_task(
+                reconnect_and_verify(node.id), name=f"reconnect-and-verify-{node.id}"
+            )
+            for node in self.scenario.nodes
+        ]
+        values = await settle_node_tasks(reconnect_tasks)
         return {verification.node_id: verification for verification in values}
 
     async def _on_gateway_event(self, event: GatewayEvent) -> None:
-        if event.kind in {"gateway.started", "gateway.failed", "gateway.client_connected"}:
+        if event.kind in {
+            "gateway.started",
+            "gateway.stopped",
+            "gateway.failed",
+            "gateway.client_connected",
+            "gateway.client_disconnected",
+        }:
             self.event_broker.publish(
                 PacketEvent(
                     monotonicSeconds=time.monotonic(),

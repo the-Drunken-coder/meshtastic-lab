@@ -188,11 +188,11 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
         path = simulator.results_root / f"{run_id}.json"
         if path.is_file():
             return FileResponse(path, media_type="application/json", filename=f"{run_id}.json")
-        result = simulator.traffic_result(run_id)
-        if result.finished_at is None:
+        if not simulator.traffic_result_is_complete(run_id):
             raise SimulationConflict(
                 "TRAFFIC_RUN_NOT_COMPLETE", "traffic results can be exported after the run finishes"
             )
+        result = simulator.traffic_result(run_id)
         return JSONResponse(
             content=result.model_dump(mode="json", by_alias=True),
             headers={"Content-Disposition": f'attachment; filename="{run_id}.json"'},

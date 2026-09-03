@@ -115,17 +115,20 @@ function shortDigest(digest: string): string {
 }
 
 function makeNodes(count: number, previous: Scenario["nodes"]): Scenario["nodes"] {
-  return Array.from({ length: count }, (_, offset) => {
-    const index = offset + 1;
-    return (
-      previous[offset] ?? {
-        id: `node-${index}`,
-        displayName: `Node ${index}`,
-        role: "CLIENT" as const,
-        apiPort: 45000 + index,
-      }
-    );
-  });
+  const next = previous.slice(0, count);
+  const usedIds = new Set(next.map((node) => node.id));
+  const usedPorts = new Set(next.map((node) => node.apiPort));
+  let suffix = 1;
+  let apiPort = 45001;
+  while (next.length < count) {
+    while (usedIds.has(`node-${suffix}`)) suffix += 1;
+    while (usedPorts.has(apiPort)) apiPort += 1;
+    const id = `node-${suffix}`;
+    next.push({ id, displayName: `Node ${suffix}`, role: "CLIENT", apiPort });
+    usedIds.add(id);
+    usedPorts.add(apiPort);
+  }
+  return next;
 }
 
 function makeLinks(nodeIds: string[], preset: TopologyPreset): DirectedLink[] {
@@ -342,11 +345,16 @@ function App() {
       nodes: nextNodes,
       links: makeLinks(nextNodes.map((node) => node.id), "full-mesh"),
     });
-    setTrafficDraft((current) => ({
-      ...current,
-      sourceNodes: current.sourceNodes.filter((source) => nextNodes.some((node) => node.id === source)),
-      fixedDestination: nextNodes.find((node) => node.id !== current.sourceNodes[0])?.id,
-    }));
+    setTrafficDraft((current) => {
+      const sourceNodes = current.sourceNodes.filter((source) =>
+        nextNodes.some((node) => node.id === source),
+      );
+      const fixedDestination =
+        nextNodes.find(
+          (node) => node.id === current.fixedDestination && !sourceNodes.includes(node.id),
+        )?.id ?? nextNodes.find((node) => !sourceNodes.includes(node.id))?.id;
+      return { ...current, sourceNodes, fixedDestination };
+    });
   };
 
   const applyPreset = (preset: TopologyPreset) => {
@@ -398,12 +406,16 @@ function App() {
   };
 
   const toggleSource = (nodeId: string) => {
-    setTrafficDraft((current) => ({
-      ...current,
-      sourceNodes: current.sourceNodes.includes(nodeId)
+    setTrafficDraft((current) => {
+      const sourceNodes = current.sourceNodes.includes(nodeId)
         ? current.sourceNodes.filter((source) => source !== nodeId)
-        : [...current.sourceNodes, nodeId],
-    }));
+        : [...current.sourceNodes, nodeId];
+      const fixedDestination =
+        current.fixedDestination && !sourceNodes.includes(current.fixedDestination)
+          ? current.fixedDestination
+          : scenario?.nodes.find((node) => !sourceNodes.includes(node.id))?.id;
+      return { ...current, sourceNodes, fixedDestination };
+    });
   };
 
   const runTraffic = () => {
@@ -413,7 +425,7 @@ function App() {
       if (
         request.kind === "direct-text" &&
         request.destinationStrategy === "fixed" &&
-        !request.fixedDestination
+        (!request.fixedDestination || request.sourceNodes.includes(request.fixedDestination))
       ) {
         request.fixedDestination = scenario?.nodes.find(
           (node) => !request.sourceNodes.includes(node.id),
@@ -436,6 +448,16 @@ function App() {
 
   const firmwareVersion = nodes.find((node) => node.firmwareVersion)?.firmwareVersion;
   const phase = trafficActive || traffic.state === "COMPLETED" ? 4 : running ? 3 : stopped ? 1 : 2;
+  const eligibleDestinations = scenario.nodes.filter(
+    (node) => !trafficDraft.sourceNodes.includes(node.id),
+  );
+  const fixedDestination =
+    eligibleDestinations.find((node) => node.id === trafficDraft.fixedDestination)?.id ??
+    eligibleDestinations[0]?.id;
+  const fixedDestinationUnavailable =
+    trafficDraft.kind === "direct-text" &&
+    trafficDraft.destinationStrategy === "fixed" &&
+    fixedDestination === undefined;
 
   return (
     <div className="app-shell">
@@ -450,7 +472,7 @@ function App() {
           <span>{lifecycle.message}</span>
         </div>
         <div className="header-actions">
-          <button onClick={() => lifecycleCommand("start")} disabled={!stopped || dirty || busy !== null || !capability.collisionAvailable}>Start</button>
+          <button onClick={() => lifecycleCommand("start")} disabled={!stopped || dirty || busy !== null || !capability.collisionAvailable || !capability.provenanceAvailable}>Start</button>
           <button onClick={() => lifecycleCommand("stop")} disabled={stopped || busy !== null}>Stop</button>
           <button onClick={() => lifecycleCommand("reset")} disabled={!stopped || busy !== null}>Reset</button>
         </div>
@@ -566,7 +588,7 @@ function App() {
               <div className="traffic-fields">
                 <Field label="Message kind"><select value={trafficDraft.kind} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, kind: event.currentTarget.value as TrafficRequest["kind"] })}><option value="broadcast-text">Broadcast text</option><option value="direct-text">Direct text</option></select></Field>
                 <Field label="Destination strategy"><select value={trafficDraft.destinationStrategy} disabled={trafficActive || trafficDraft.kind === "broadcast-text"} onChange={(event) => setTrafficDraft({ ...trafficDraft, destinationStrategy: event.currentTarget.value as TrafficRequest["destinationStrategy"] })}><option value="fixed">Fixed</option><option value="round-robin">Round robin</option><option value="deterministic-random">Deterministic random</option></select></Field>
-                <Field label="Fixed destination"><select value={trafficDraft.fixedDestination ?? scenario.nodes.find((node) => !trafficDraft.sourceNodes.includes(node.id))?.id ?? ""} disabled={trafficActive || trafficDraft.kind === "broadcast-text" || trafficDraft.destinationStrategy !== "fixed"} onChange={(event) => setTrafficDraft({ ...trafficDraft, fixedDestination: event.currentTarget.value })}>{scenario.nodes.map((node) => <option value={node.id} key={node.id}>{node.displayName}</option>)}</select></Field>
+                <Field label="Fixed destination"><select value={fixedDestination ?? ""} disabled={trafficActive || trafficDraft.kind === "broadcast-text" || trafficDraft.destinationStrategy !== "fixed" || fixedDestination === undefined} onChange={(event) => setTrafficDraft({ ...trafficDraft, fixedDestination: event.currentTarget.value })}>{eligibleDestinations.map((node) => <option value={node.id} key={node.id}>{node.displayName}</option>)}</select></Field>
                 <Field label="Messages/min/source"><input type="number" min={0.1} max={600} step={0.1} value={trafficDraft.messagesPerMinute} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, messagesPerMinute: Number(event.currentTarget.value) })} /></Field>
                 <Field label="Payload bytes"><input type="number" min={48} max={233} value={trafficDraft.payloadBytes} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, payloadBytes: Number(event.currentTarget.value) })} /></Field>
                 <Field label="Duration seconds"><input type="number" min={1} max={3600} value={trafficDraft.durationSeconds} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, durationSeconds: Number(event.currentTarget.value) })} /></Field>
@@ -574,7 +596,7 @@ function App() {
               </div>
               <fieldset className="source-set"><legend>Source nodes</legend>{scenario.nodes.map((node) => <label key={node.id}><input type="checkbox" checked={trafficDraft.sourceNodes.includes(node.id)} disabled={trafficActive} onChange={() => toggleSource(node.id)} /> {node.displayName}</label>)}</fieldset>
               <label className="inline-check"><input type="checkbox" checked={trafficDraft.acknowledgmentRequested} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, acknowledgmentRequested: event.currentTarget.checked })} /> Request acknowledgments</label>
-              <div className="traffic-actions"><button className="primary" onClick={runTraffic} disabled={!running || trafficActive || trafficDraft.sourceNodes.length === 0 || busy !== null}>Start traffic run</button><button onClick={() => { void perform("stop-traffic", () => api.stopTraffic().then(() => undefined)); }} disabled={!trafficActive || busy !== null}>Stop run</button>{traffic.runId && <a href={`/api/traffic/runs/${traffic.runId}/export`}>Export result</a>}</div>
+              <div className="traffic-actions"><button className="primary" onClick={runTraffic} disabled={!running || trafficActive || trafficDraft.sourceNodes.length === 0 || fixedDestinationUnavailable || busy !== null}>Start traffic run</button><button onClick={() => { void perform("stop-traffic", () => api.stopTraffic().then(() => undefined)); }} disabled={!trafficActive || busy !== null}>Stop run</button>{traffic.runId && <a href={`/api/traffic/runs/${traffic.runId}/export`}>Export result</a>}</div>
               {traffic.failure && <p className="error-text">{traffic.failure}</p>}
             </div>
 

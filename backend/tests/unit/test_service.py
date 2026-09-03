@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ from backend.app.models import (
     apply_topology_preset,
     default_scenario,
 )
-from backend.app.runtime import NativeProcessSupervisor, ProcessRecord
+from backend.app.runtime import NativeProcessSupervisor, NodeVerification, ProcessRecord
 from backend.app.simulator import LifecycleState, SimulationConflict, SimulatorService
 from backend.app.traffic import TrafficController, TrafficRunRequest
 
@@ -67,6 +68,22 @@ class WarmupGateway:
     def __init__(self) -> None:
         self.client_disconnected = asyncio.Event()
         self.client_disconnected.set()
+
+
+def verification(node_id: str) -> NodeVerification:
+    return NodeVerification(
+        node_id=node_id,
+        node_number=1,
+        firmware_version="test",
+        owner_long_name=node_id,
+        owner_short_name="N1",
+        role="CLIENT",
+        region="US",
+        modem_preset="LONG_FAST",
+        frequency_slot=20,
+        hop_limit=3,
+        channel_name="lab",
+    )
 
 
 @pytest.mark.asyncio
@@ -122,6 +139,119 @@ async def test_runtime_link_snapshot_is_atomic_with_traffic_start(tmp_path: Path
     assert [change.link for change in service.traffic.current.topology_changes] == [restored]
     assert medium.links == [changed, restored]
     await service.traffic.stop()
+
+
+@pytest.mark.asyncio
+async def test_traffic_start_rechecks_lifecycle_after_baseline_sampling(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.scenario = default_scenario(2)
+    service.state = LifecycleState.RUNNING
+    traffic = TrafficController(
+        scenario=service.scenario,
+        gateways={node.id: FakeGateway() for node in service.scenario.nodes},  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path / "runs",
+        settle_seconds=0,
+    )
+    service.traffic = traffic
+
+    async def sample_after_stop_begins() -> dict[str, int]:
+        service.state = LifecycleState.STOPPING
+        return {"node-1": 0, "node-2": 0}
+
+    service._sample_local_stats = sample_after_stop_begins  # type: ignore[method-assign]
+
+    with pytest.raises(SimulationConflict) as raised:
+        await service.start_traffic(
+            TrafficRunRequest(sourceNodes=["node-1"], durationSeconds=1, payloadBytes=64)
+        )
+
+    assert raised.value.code == "INVALID_LIFECYCLE_STATE"
+    assert traffic.current is None
+
+
+@pytest.mark.asyncio
+async def test_configuration_failure_settles_reconnect_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.scenario = default_scenario(2)
+    sibling_started = threading.Event()
+    sibling_settled = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    class ConfigurationGateway:
+        control_host = "127.0.0.1"
+        control_port = 1
+
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self.client_disconnected = asyncio.Event()
+            self.client_disconnected.set()
+            self.failed = asyncio.Event()
+            self.failed.set()
+
+        async def stop(self) -> None:
+            if self.node_id != "node-2":
+                return
+            sibling_started.set()
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+            sibling_settled.set()
+            raise RuntimeError("sibling finished")
+
+        async def start(self) -> None:
+            return
+
+    service.gateways = {
+        node.id: ConfigurationGateway(node.id) for node in service.scenario.nodes
+    }  # type: ignore[assignment]
+
+    def configure_node(**kwargs: object) -> NodeVerification:
+        node = kwargs["node"]
+        assert hasattr(node, "id")
+        return verification(str(node.id))
+
+    def verify_configured_node(**kwargs: object) -> NodeVerification:
+        node = kwargs["node"]
+        assert hasattr(node, "id")
+        if node.id == "node-1":
+            assert sibling_started.wait(timeout=1)
+            raise RuntimeError("verification failed")
+        return verification(str(node.id))
+
+    monkeypatch.setattr(service_module, "configure_and_verify_node", configure_node)
+    monkeypatch.setattr(service_module, "verify_node", verify_configured_node)
+
+    with pytest.raises(RuntimeError):
+        await service._configure_nodes()
+
+    assert sibling_settled.is_set()
+    assert not sibling_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_node_state_feed_includes_disconnect_and_stop(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+
+    await service._on_gateway_event(
+        GatewayEvent(node_id="node-1", kind="gateway.client_disconnected", detail="peer")
+    )
+    await service._on_gateway_event(
+        GatewayEvent(node_id="node-1", kind="gateway.stopped", detail="gateway stopped")
+    )
+
+    node_events = [
+        event for event in service.event_broker.recent() if event.event_type == EventType.NODE_STATE
+    ]
+    assert [event.result for event in node_events] == [
+        "gateway.client_disconnected",
+        "gateway.stopped",
+    ]
 
 
 @pytest.mark.asyncio

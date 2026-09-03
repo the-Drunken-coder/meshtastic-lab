@@ -256,6 +256,8 @@ class TrafficController:
         self.current: TrafficRunResult | None = None
         self._frozen_result: TrafficRunResult | None = None
         self._task: asyncio.Task[None] | None = None
+        self._finalization_done = asyncio.Event()
+        self._finalization_done.set()
         self._run_scenario = scenario
         self._sequence = 0
         self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
@@ -353,6 +355,9 @@ class TrafficController:
     async def stop(self) -> None:
         if self._frozen_result is not None:
             return
+        if not self._finalization_done.is_set():
+            await asyncio.shield(self._finalization_done.wait())
+            return
         if self.state == TrafficRunState.FAILED:
             await self._cancel_run_task()
             await self._sample_final_failed_receptions()
@@ -376,6 +381,9 @@ class TrafficController:
     async def fail(self, reason: str) -> None:
         """Fail an active run, preserving FAILED when its task observes cancellation."""
 
+        if not self._finalization_done.is_set():
+            await asyncio.shield(self._finalization_done.wait())
+            return
         if self.current is None or self.state not in {
             TrafficRunState.RUNNING,
             TrafficRunState.STOPPING,
@@ -441,6 +449,9 @@ class TrafficController:
             return None
         return self.current.model_copy(deep=True)
 
+    def result_is_finalized(self, run_id: str) -> bool:
+        return self._frozen_result is not None and self._frozen_result.run_id == run_id
+
     def snapshot(self) -> TrafficRunResult | None:
         """Return the full result for compatibility; live endpoints should use summary()."""
 
@@ -448,12 +459,12 @@ class TrafficController:
 
     def record_rf_transmission(
         self, transmitter: str, packet: mesh_pb2.MeshPacket, packet_airtime_ms: int
-    ) -> None:
+    ) -> tuple[str, int] | None:
         if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
-            return
+            return None
         message = self._message_for_packet_identity(packet)
         if message is None or not message.submitted:
-            return
+            return None
         origin = self._packet_origin(packet)
         if not message.transmitted:
             message.transmitted = True
@@ -474,6 +485,7 @@ class TrafficController:
                 "perNodeTransmitCounts": dict(self._per_node_transmit_counts),
             }
         )
+        return self.current.run_id, message.sequence
 
     def record_drop(self, transmitter: str, packet: mesh_pb2.MeshPacket, reason: str) -> None:
         del transmitter
@@ -1013,40 +1025,47 @@ class TrafficController:
     async def _finish(self, state: TrafficRunState) -> None:
         if self.current is None or self._frozen_result is not None:
             return
-        self._finalize_pending_submissions()
-        self.state = state
-        current = self.current
-        current.state = state
-        current.finished_at = datetime.now(UTC)
-        current.requested = self._generated_count
-        current.submitted = self._submitted_count
-        current.submission_failed = self._submission_failed_count
-        current.transmitted = self._transmitted_count
-        current.delivered = self._unique_deliveries
-        self._metrics = await asyncio.to_thread(self._final_metrics)
-        current.metrics = self._metrics
-        self._publish_metric_update(
-            self._summary_metrics(self._metrics).model_dump(mode="python", by_alias=True),
-            result="snapshot",
-        )
+        if not self._finalization_done.is_set():
+            await asyncio.shield(self._finalization_done.wait())
+            return
+        self._finalization_done.clear()
         try:
-            frozen = await asyncio.to_thread(self._freeze_and_persist, current)
-        except Exception as exc:
-            self.state = TrafficRunState.FAILED
-            current.state = TrafficRunState.FAILED
-            persistence_failure = f"result persistence failed: {exc}"
-            current.failure = (
-                f"{current.failure}; {persistence_failure}"
-                if current.failure
-                else persistence_failure
+            self._finalize_pending_submissions()
+            self.state = state
+            current = self.current
+            current.state = state
+            current.finished_at = datetime.now(UTC)
+            current.requested = self._generated_count
+            current.submitted = self._submitted_count
+            current.submission_failed = self._submission_failed_count
+            current.transmitted = self._transmitted_count
+            current.delivered = self._unique_deliveries
+            self._metrics = await asyncio.to_thread(self._final_metrics)
+            current.metrics = self._metrics
+            self._publish_metric_update(
+                self._summary_metrics(self._metrics).model_dump(mode="python", by_alias=True),
+                result="snapshot",
             )
-            frozen = await asyncio.to_thread(current.model_copy, deep=True)
-            LOGGER.exception(
-                "traffic result persistence failed",
-                extra={"traffic_run_id": current.run_id},
-            )
-        self._frozen_result = frozen
-        self.current = frozen
+            try:
+                frozen = await asyncio.to_thread(self._freeze_and_persist, current)
+            except Exception as exc:
+                self.state = TrafficRunState.FAILED
+                current.state = TrafficRunState.FAILED
+                persistence_failure = f"result persistence failed: {exc}"
+                current.failure = (
+                    f"{current.failure}; {persistence_failure}"
+                    if current.failure
+                    else persistence_failure
+                )
+                frozen = await asyncio.to_thread(current.model_copy, deep=True)
+                LOGGER.exception(
+                    "traffic result persistence failed",
+                    extra={"traffic_run_id": current.run_id},
+                )
+            self._frozen_result = frozen
+            self.current = frozen
+        finally:
+            self._finalization_done.set()
 
     def _freeze_and_persist(self, current: TrafficRunResult) -> TrafficRunResult:
         """Serialize a stable terminal result outside the asyncio event loop."""

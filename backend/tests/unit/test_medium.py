@@ -49,11 +49,18 @@ async def test_asymmetric_medium_injects_only_enabled_direction() -> None:
     scenario = scenario.model_copy(update={"links": links})
     gateways = {"node-1": FakeGateway(), "node-2": FakeGateway()}
     broker = EventBroker()
+
+    def correlate(
+        _transmitter: str, _packet: mesh_pb2.MeshPacket, _airtime_ms: int
+    ) -> tuple[str, int]:
+        return "run-1", 3
+
     medium = DirectedMedium(
         scenario=scenario,
         gateways=gateways,  # type: ignore[arg-type]
         event_broker=broker,
         hardware_ids={"node-1": 0xA11CE001, "node-2": 0xA11CE002},
+        transmission_handler=correlate,
     )
 
     await medium.transmit("node-1", text_packet())
@@ -65,6 +72,11 @@ async def test_asymmetric_medium_injects_only_enabled_direction() -> None:
     assert sum(event.event_type == EventType.RF_TRANSMIT for event in broker.recent()) == 2
     assert all(
         event.port_number == portnums_pb2.TEXT_MESSAGE_APP
+        for event in broker.recent()
+        if event.event_type in {EventType.RF_TRANSMIT, EventType.LINK_DISABLED, EventType.RX_INJECTED}
+    )
+    assert all(
+        (event.traffic_run_id, event.traffic_sequence) == ("run-1", 3)
         for event in broker.recent()
         if event.event_type in {EventType.RF_TRANSMIT, EventType.LINK_DISABLED, EventType.RX_INJECTED}
     )

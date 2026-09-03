@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -207,3 +208,25 @@ def test_persisted_summary_does_not_load_full_message_export(
 
     assert summary.run_id == run_id
     assert service.completed_runs() == [run_id]
+
+
+def test_active_export_is_rejected_without_copying_full_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = SimulatorService(data_root=tmp_path, collision_marker=tmp_path / "marker")
+    run_id = "active-run"
+    service.traffic = SimpleNamespace(
+        current=SimpleNamespace(run_id=run_id, finished_at=None),
+        result_is_finalized=lambda _run_id: False,
+    )  # type: ignore[assignment]
+
+    def full_result_forbidden(_run_id: str) -> object:
+        raise AssertionError("active export copied the full result")
+
+    monkeypatch.setattr(service, "traffic_result", full_result_forbidden)
+
+    with TestClient(create_app(service)) as client:
+        response = client.get(f"/api/traffic/runs/{run_id}/export")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "TRAFFIC_RUN_NOT_COMPLETE"

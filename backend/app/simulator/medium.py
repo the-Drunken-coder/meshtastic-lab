@@ -20,7 +20,8 @@ from backend.app.metrics import (
 )
 from backend.app.models import DirectedLink, Scenario
 
-TransmissionHandler = Callable[[str, mesh_pb2.MeshPacket, int], None]
+TrafficCorrelation = tuple[str, int]
+TransmissionHandler = Callable[[str, mesh_pb2.MeshPacket, int], TrafficCorrelation | None]
 DropHandler = Callable[[str, mesh_pb2.MeshPacket, str], None]
 FailureHandler = Callable[[str, Exception], Awaitable[None]]
 LOGGER = logging.getLogger(__name__)
@@ -126,6 +127,12 @@ class DirectedMedium:
         payload_length = mesh_packet_payload_length(packet)
         port_number = mesh_packet_port_number(packet)
         packet_airtime = airtime_ms(payload_length, self._scenario.rf.modem_preset)
+        correlation = (
+            self._transmission_handler(transmitter, packet, packet_airtime)
+            if self._transmission_handler is not None
+            else None
+        )
+        traffic_run_id, traffic_sequence = correlation or (None, None)
         self._event_broker.publish(
             PacketEvent(
                 monotonicSeconds=monotonic_now,
@@ -134,6 +141,8 @@ class DirectedMedium:
                 intendedDestination=self._destination_node(packet.to),
                 receiverSet=[link.to_node for link in enabled],
                 meshPacketId=packet.id,
+                trafficRunId=traffic_run_id,
+                trafficSequence=traffic_sequence,
                 portNumber=port_number,
                 hopLimit=packet.hop_limit,
                 hopStart=packet.hop_start,
@@ -142,8 +151,6 @@ class DirectedMedium:
                 result="transmitted",
             )
         )
-        if self._transmission_handler is not None:
-            self._transmission_handler(transmitter, packet, packet_airtime)
 
         injections: list[asyncio.Task[None]] = []
         for link in links:
@@ -165,6 +172,8 @@ class DirectedMedium:
                         transmitter=transmitter,
                         receiver=link.to_node,
                         meshPacketId=packet.id,
+                        trafficRunId=traffic_run_id,
+                        trafficSequence=traffic_sequence,
                         portNumber=port_number,
                         result="link-disabled",
                     )
@@ -178,7 +187,13 @@ class DirectedMedium:
             received.rx_snr = link.snr_db
             injections.append(
                 asyncio.create_task(
-                    self._inject(link, received, monotonic_now),
+                    self._inject(
+                        link,
+                        received,
+                        monotonic_now,
+                        traffic_run_id=traffic_run_id,
+                        traffic_sequence=traffic_sequence,
+                    ),
                     name=f"inject-{transmitter}-{link.to_node}-{packet.id}",
                 )
             )
@@ -219,7 +234,13 @@ class DirectedMedium:
             )
 
     async def _inject(
-        self, link: DirectedLink, packet: mesh_pb2.MeshPacket, monotonic_now: float
+        self,
+        link: DirectedLink,
+        packet: mesh_pb2.MeshPacket,
+        monotonic_now: float,
+        *,
+        traffic_run_id: str | None,
+        traffic_sequence: int | None,
     ) -> None:
         await self._gateways[link.to_node].inject_simulated_packet(packet)
         self._event_broker.publish(
@@ -229,6 +250,8 @@ class DirectedMedium:
                 transmitter=link.from_node,
                 receiver=link.to_node,
                 meshPacketId=packet.id,
+                trafficRunId=traffic_run_id,
+                trafficSequence=traffic_sequence,
                 portNumber=mesh_packet_port_number(packet),
                 hopLimit=packet.hop_limit,
                 hopStart=packet.hop_start,
