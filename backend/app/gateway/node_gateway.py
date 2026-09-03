@@ -151,6 +151,7 @@ class NodeGateway:
         except BaseException as exc:
             self.state = GatewayState.FAILED
             await self._close_transports()
+            await self._cancel_tasks()
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise GatewayError(f"gateway {self.node_id} failed to start: {exc}") from exc
@@ -162,17 +163,7 @@ class NodeGateway:
                 return
             self.state = GatewayState.STOPPING
             await self._close_transports()
-
-            tasks = tuple(self._tasks)
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                try:
-                    async with asyncio.timeout(self.shutdown_timeout):
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                except TimeoutError:
-                    LOGGER.error("gateway task shutdown timed out", extra={"node_id": self.node_id})
-            self._tasks.clear()
+            await self._cancel_tasks()
             self.external_connected = False
             self.state = GatewayState.STOPPED
             await self._emit("gateway.stopped", "gateway stopped")
@@ -488,6 +479,18 @@ class NodeGateway:
             if not waiter.done():
                 waiter.set_exception(GatewayError(f"gateway {self.node_id} stopped"))
         self._config_waiters.clear()
+
+    async def _cancel_tasks(self) -> None:
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            try:
+                async with asyncio.timeout(self.shutdown_timeout):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            except TimeoutError:
+                LOGGER.error("gateway task shutdown timed out", extra={"node_id": self.node_id})
+        self._tasks.clear()
 
     async def _bounded_wait_closed(self, transport: object, label: str) -> None:
         wait_closed = getattr(transport, "wait_closed", None)

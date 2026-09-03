@@ -5,7 +5,7 @@ import socket
 
 import pytest
 
-from backend.app.gateway import GatewayState, NodeGateway
+from backend.app.gateway import GatewayError, GatewayState, NodeGateway
 
 
 class BlockingReader:
@@ -128,6 +128,70 @@ async def test_cancelled_start_closes_reserved_transports(
         await start_task
 
     assert cleanup_called.is_set()
+    assert gateway.state == GatewayState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_listener_start_failure_cancels_downstream_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = NodeGateway(
+        node_id="node-1",
+        downstream_host="127.0.0.1",
+        downstream_port=1,
+        public_host="127.0.0.1",
+        public_port=45001,
+    )
+    writer_cancelled = asyncio.Event()
+
+    async def lingering_writer() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            writer_cancelled.set()
+
+    async def ready_downstream() -> None:
+        gateway._spawn(lingering_writer(), name="node-1-daemon-writer")
+        await asyncio.sleep(0)
+
+    class ControlSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return "127.0.0.1", 45123
+
+    class ControlServer:
+        sockets = (ControlSocket(),)
+
+        def close(self) -> None:
+            return
+
+        async def wait_closed(self) -> None:
+            return
+
+    start_attempts = 0
+
+    async def start_server(*_args: object, **_kwargs: object) -> ControlServer:
+        nonlocal start_attempts
+        start_attempts += 1
+        if start_attempts == 2:
+            raise OSError("public listener failed")
+        return ControlServer()
+
+    class ReservedSocket:
+        def close(self) -> None:
+            return
+
+    def reserve_public_listener() -> None:
+        gateway._reserved_public_socket = ReservedSocket()  # type: ignore[assignment]
+
+    monkeypatch.setattr(gateway, "reserve_public_listener", reserve_public_listener)
+    monkeypatch.setattr(gateway, "_establish_ready_downstream", ready_downstream)
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+
+    with pytest.raises(GatewayError, match="public listener failed"):
+        await gateway.start()
+
+    assert writer_cancelled.is_set()
+    assert not gateway._tasks
     assert gateway.state == GatewayState.FAILED
 
 
