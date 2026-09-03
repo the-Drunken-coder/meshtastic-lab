@@ -121,6 +121,7 @@ interface IdleTrafficResult {
 }
 
 interface TrafficRunSummary {
+  schemaVersion: 1;
   runId: string;
   state: Exclude<TrafficState, "IDLE">;
   request: TrafficRequest;
@@ -150,6 +151,7 @@ interface TrafficRunSummary {
 export type TrafficResult = IdleTrafficResult | TrafficRunSummary;
 
 export interface PacketEvent {
+  schemaVersion: 1;
   sequence: number;
   utcTimestamp: string;
   monotonicSeconds: number;
@@ -171,6 +173,15 @@ export interface PacketEvent {
   metricUpdate: Record<string, number | Record<string, number> | null>;
   result: string | null;
   detail: string | null;
+}
+
+export interface EventHistoryPage {
+  schemaVersion: 1;
+  events: PacketEvent[];
+  firstAvailableSequence: number | null;
+  latestSequence: number;
+  historyGap: boolean;
+  hasMore: boolean;
 }
 
 export interface TrafficRequest {

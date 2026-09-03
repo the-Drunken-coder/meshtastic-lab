@@ -114,6 +114,28 @@ def test_metrics_count_airtime_once_per_transmitter() -> None:
     assert metrics.drops_by_reason == {"link-disabled": 2}
 
 
+def test_event_history_reports_expired_cursor_and_version() -> None:
+    broker = EventBroker(history_size=2)
+    for packet_id in range(4):
+        broker.publish(
+            PacketEvent(
+                monotonicSeconds=float(packet_id),
+                eventType=EventType.RF_TRANSMIT,
+                meshPacketId=packet_id,
+            )
+        )
+
+    page = broker.history_page(after_sequence=1, limit=1)
+
+    assert page.schema_version == 1
+    assert page.first_available_sequence == 3
+    assert page.latest_sequence == 4
+    assert page.history_gap is True
+    assert page.has_more is True
+    assert [event.sequence for event in page.events] == [3]
+    assert page.events[0].model_dump(by_alias=True)["schemaVersion"] == 1
+
+
 @pytest.mark.asyncio
 async def test_bounded_event_subscription_reports_drops() -> None:
     broker = EventBroker(history_size=2, subscriber_buffer_size=1)

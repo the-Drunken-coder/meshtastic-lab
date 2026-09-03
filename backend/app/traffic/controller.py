@@ -41,6 +41,7 @@ TRAFFIC_PREFIX = "ML1"
 PACKET_ID_QUARANTINE_SECONDS = 5 * 60
 MAX_QUARANTINED_PACKET_IDS_PER_SOURCE = 600 * 60
 MAX_TOPOLOGY_CHANGES_PER_RUN = 10_000
+MAX_TRAFFIC_MESSAGES_PER_RUN = 10_000
 LIVE_LATENCY_SAMPLE_SIZE = 2048
 PACKET_ID_RNG_SALT = 0x4D4C5F5041434B4554
 FIRMWARE_QUEUE_SUCCESS = {0, 35}
@@ -48,6 +49,15 @@ INTERMEDIATE_TRANSMISSION_ATTEMPTS = 2
 RELIABLE_UNICAST_ATTEMPTS = 3
 MAX_DRAIN_SECONDS = 300.0
 LOGGER = logging.getLogger(__name__)
+
+
+def _messages_per_source(*, duration_seconds: float, messages_per_minute: float) -> int:
+    offered = (
+        Decimal(str(duration_seconds))
+        * Decimal(str(messages_per_minute))
+        / Decimal(60)
+    )
+    return max(1, int(offered.to_integral_value(rounding=ROUND_CEILING)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +100,7 @@ class TrafficRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: TrafficKind = TrafficKind.BROADCAST_TEXT
-    source_nodes: list[str] = Field(alias="sourceNodes", min_length=1)
+    source_nodes: list[str] = Field(alias="sourceNodes", min_length=1, max_length=10)
     destination_strategy: DestinationStrategy = Field(
         default=DestinationStrategy.FIXED, alias="destinationStrategy"
     )
@@ -106,10 +116,18 @@ class TrafficRunRequest(BaseModel):
     seed: int = 1
 
     @model_validator(mode="after")
-    def validate_destination(self) -> TrafficRunRequest:
+    def validate_request(self) -> TrafficRunRequest:
         if self.kind == TrafficKind.DIRECT_TEXT:
             if self.destination_strategy == DestinationStrategy.FIXED and self.fixed_destination is None:
                 raise ValueError("fixedDestination is required for fixed direct traffic")
+        scheduled = len(self.source_nodes) * _messages_per_source(
+            duration_seconds=self.duration_seconds,
+            messages_per_minute=self.messages_per_minute,
+        )
+        if scheduled > MAX_TRAFFIC_MESSAGES_PER_RUN:
+            raise ValueError(
+                f"traffic run cannot schedule more than {MAX_TRAFFIC_MESSAGES_PER_RUN} messages"
+            )
         return self
 
 
@@ -139,6 +157,7 @@ class TopologyChange(BaseModel):
 class _ProvenanceFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal[1] = Field(default=1, alias="schemaVersion")
     firmware_commit: str = Field(alias="firmwareCommit")
     collision_patch_sha256: str = Field(alias="collisionPatchSha256")
     firmware_binary_sha256: str = Field(alias="firmwareBinarySha256")
@@ -1262,12 +1281,10 @@ class TrafficController:
 
     @staticmethod
     def _messages_per_source(request: TrafficRunRequest) -> int:
-        offered = (
-            Decimal(str(request.duration_seconds))
-            * Decimal(str(request.messages_per_minute))
-            / Decimal(60)
+        return _messages_per_source(
+            duration_seconds=request.duration_seconds,
+            messages_per_minute=request.messages_per_minute,
         )
-        return max(1, int(offered.to_integral_value(rounding=ROUND_CEILING)))
 
     def _allocate_packet_id(self, source: str, randomizer: random.Random) -> int:
         now = time.monotonic()

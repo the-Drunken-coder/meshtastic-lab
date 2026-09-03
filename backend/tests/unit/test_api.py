@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.main import create_app
-from backend.app.metrics import EventBroker
+from backend.app.metrics import EventBroker, EventType, PacketEvent
 from backend.app.models import default_scenario
 from backend.app.provenance import BuildMetadata
 from backend.app.runtime import ProcessRecord
@@ -105,6 +105,42 @@ def test_openapi_describes_bounded_traffic_responses(tmp_path: Path) -> None:
     assert result["content"]["application/json"]["schema"]["$ref"].endswith(
         "/TrafficRunSummary"
     )
+
+
+def test_event_history_and_websocket_replay_use_sequence_cursor(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, collision_marker=tmp_path / "marker")
+    service.event_broker = EventBroker(history_size=2)
+    for packet_id in range(4):
+        service.event_broker.publish(
+            PacketEvent(
+                monotonicSeconds=float(packet_id),
+                eventType=EventType.RF_TRANSMIT,
+                meshPacketId=packet_id,
+            )
+        )
+
+    with TestClient(create_app(service)) as client:
+        history = client.get("/api/events/history?afterSequence=1&limit=1")
+        with client.websocket_connect("/api/events/ws?afterSequence=1") as websocket:
+            gap = websocket.receive_json()
+            replayed = websocket.receive_json()
+            websocket.close()
+
+    assert history.status_code == 200
+    history_body = history.json()
+    assert history_body["schemaVersion"] == 1
+    assert history_body["firstAvailableSequence"] == 3
+    assert history_body["latestSequence"] == 4
+    assert history_body["historyGap"] is True
+    assert history_body["hasMore"] is True
+    assert len(history_body["events"]) == 1
+    assert history_body["events"][0]["schemaVersion"] == 1
+    assert history_body["events"][0]["sequence"] == 3
+    assert history_body["events"][0]["meshPacketId"] == 2
+    assert gap["eventType"] == "ui_events_dropped"
+    assert gap["result"] == "history-gap"
+    assert replayed["sequence"] == 3
+    assert replayed["schemaVersion"] == 1
 
 
 def test_daemon_logs_remain_available_after_process_cleanup(tmp_path: Path) -> None:

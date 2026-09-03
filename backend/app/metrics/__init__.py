@@ -7,10 +7,11 @@ from .airtime import (
     mesh_packet_port_number,
 )
 from .calculations import MetricsSnapshot, MetricsSummary, calculate_metrics, percentile
-from .events import EventBroker, EventType, PacketEvent
+from .events import EventBroker, EventHistoryPage, EventType, PacketEvent
 
 __all__ = [
     "EventBroker",
+    "EventHistoryPage",
     "EventType",
     "MetricsSnapshot",
     "MetricsSummary",

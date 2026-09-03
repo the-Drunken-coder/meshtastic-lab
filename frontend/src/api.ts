@@ -2,6 +2,7 @@ import type {
   Capability,
   DaemonLogs,
   DirectedLink,
+  EventHistoryPage,
   Lifecycle,
   NodeView,
   PacketEvent,
@@ -54,6 +55,8 @@ export const api = {
   scenario: () => request<Scenario>("/api/scenario"),
   nodes: () => request<NodeView[]>("/api/nodes"),
   events: () => request<PacketEvent[]>("/api/events?limit=500"),
+  eventHistory: (afterSequence = 0) =>
+    request<EventHistoryPage>(`/api/events/history?afterSequence=${afterSequence}&limit=5000`),
   traffic: () => request<TrafficResult>("/api/traffic/runs/current"),
   logs: (nodeId: string, stream: "stdout" | "stderr") =>
     request<DaemonLogs>(`/api/nodes/${encodeURIComponent(nodeId)}/logs?stream=${stream}&limit=100`),

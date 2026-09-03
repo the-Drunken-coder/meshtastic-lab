@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,6 +32,7 @@ class EventType(StrEnum):
 class PacketEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal[1] = Field(default=1, alias="schemaVersion")
     sequence: int = 0
     utc_timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC), alias="utcTimestamp")
     monotonic_seconds: float = Field(alias="monotonicSeconds")
@@ -55,6 +56,19 @@ class PacketEvent(BaseModel):
     )
     result: str | None = None
     detail: str | None = None
+
+
+class EventHistoryPage(BaseModel):
+    """A versioned replay page with enough state to detect an expired cursor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = Field(default=1, alias="schemaVersion")
+    events: list[PacketEvent]
+    first_available_sequence: int | None = Field(alias="firstAvailableSequence")
+    latest_sequence: int = Field(alias="latestSequence")
+    history_gap: bool = Field(alias="historyGap")
+    has_more: bool = Field(alias="hasMore")
 
 
 class EventSubscription:
@@ -126,6 +140,25 @@ class EventBroker:
                 break
         result.reverse()
         return result
+
+    def history_page(self, *, after_sequence: int = 0, limit: int = 5000) -> EventHistoryPage:
+        """Return the earliest retained events after a client cursor."""
+
+        retained = list(self._history)
+        first_available = retained[0].sequence if retained else None
+        history_gap = (
+            after_sequence > 0
+            and first_available is not None
+            and after_sequence < first_available - 1
+        )
+        events = [event for event in retained if event.sequence > after_sequence][:limit]
+        return EventHistoryPage(
+            events=events,
+            firstAvailableSequence=first_available,
+            latestSequence=self._sequence,
+            historyGap=history_gap,
+            hasMore=bool(events) and events[-1].sequence < self._sequence,
+        )
 
     @asynccontextmanager
     async def subscribe(self) -> AsyncIterator[EventSubscription]:

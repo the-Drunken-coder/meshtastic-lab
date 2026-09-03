@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 import type {
   Capability,
@@ -187,6 +187,7 @@ function App() {
   const [traffic, setTraffic] = useState<TrafficResult>({ state: "IDLE" });
   const [trafficDraft, setTrafficDraft] = useState<TrafficRequest>(defaultTraffic);
   const [events, setEvents] = useState<PacketEvent[]>([]);
+  const latestEventSequence = useRef(0);
   const [streamConnected, setStreamConnected] = useState(false);
   const [nodeFilter, setNodeFilter] = useState("");
   const [eventFilter, setEventFilter] = useState("");
@@ -201,6 +202,17 @@ function App() {
 
   const acceptScenario = useCallback((nextScenario: Scenario) => {
     setScenarioEditor({ draft: nextScenario, saved: nextScenario });
+  }, []);
+
+  const acceptEvents = useCallback((incoming: PacketEvent[]) => {
+    setEvents((current) => {
+      const merged = mergeEvents(current, incoming);
+      latestEventSequence.current = merged.reduce(
+        (latest, event) => Math.max(latest, event.sequence),
+        latestEventSequence.current,
+      );
+      return merged;
+    });
   }, []);
 
   const reconcileScenario = useCallback((nextScenario: Scenario, lifecycleState: Lifecycle["state"]) => {
@@ -239,16 +251,16 @@ function App() {
         api.lifecycle(),
         api.scenario(),
         api.nodes(),
-        api.events(),
+        api.eventHistory(),
         api.traffic(),
       ])
-        .then(([nextCapability, nextLifecycle, nextScenario, nextNodes, nextEvents, nextTraffic]) => {
+        .then(([nextCapability, nextLifecycle, nextScenario, nextNodes, eventHistory, nextTraffic]) => {
           if (!active) return;
           setCapability(nextCapability);
           setLifecycle(nextLifecycle);
           acceptScenario(nextScenario);
           setNodes(nextNodes);
-          setEvents((current) => mergeEvents(current, nextEvents));
+          acceptEvents(eventHistory.events);
           setTraffic(nextTraffic);
           setTrafficDraft((current) => trafficDraftForScenario(current, nextScenario));
           setNotice(null);
@@ -265,7 +277,7 @@ function App() {
       active = false;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [acceptScenario]);
+  }, [acceptEvents, acceptScenario]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -294,18 +306,18 @@ function App() {
     let socket: WebSocket | undefined;
     const connect = () => {
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      socket = new WebSocket(`${protocol}://${window.location.host}/api/events/ws`);
+      socket = new WebSocket(
+        `${protocol}://${window.location.host}/api/events/ws?afterSequence=${latestEventSequence.current}`,
+      );
       socket.addEventListener("open", () => {
         setStreamConnected(true);
-        api.events()
-          .then((history) => {
-            if (!closed) setEvents((current) => mergeEvents(current, history));
-          })
-          .catch(() => undefined);
       });
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as PacketEvent;
-        setEvents((current) => mergeEvents(current, [event]));
+        acceptEvents([event]);
+        if (event.eventType === "ui_events_dropped") {
+          refreshCore().catch(() => undefined);
+        }
       });
       socket.addEventListener("close", () => {
         setStreamConnected(false);
@@ -319,7 +331,7 @@ function App() {
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, []);
+  }, [acceptEvents, refreshCore]);
 
   useEffect(() => {
     let active = true;
