@@ -1067,21 +1067,23 @@ class TrafficController:
         """Serialize a stable terminal result outside the asyncio event loop."""
 
         frozen = current.model_copy(deep=True)
-        self.results_root.mkdir(parents=True, exist_ok=True)
         destination = self.results_root / f"{frozen.run_id}.json"
         summary_destination = self.results_root / f"{frozen.run_id}.summary.json"
         temporary = destination.with_suffix(".tmp")
         summary_temporary = summary_destination.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(frozen.model_dump(mode="json", by_alias=True), indent=2) + "\n",
-            encoding="utf-8",
-        )
-        summary_temporary.write_text(
-            json.dumps(summarize_result(frozen).model_dump(mode="json", by_alias=True), indent=2)
-            + "\n",
-            encoding="utf-8",
-        )
         try:
+            self.results_root.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(frozen.model_dump(mode="json", by_alias=True), indent=2) + "\n",
+                encoding="utf-8",
+            )
+            summary_temporary.write_text(
+                json.dumps(
+                    summarize_result(frozen).model_dump(mode="json", by_alias=True), indent=2
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             temporary.replace(destination)
             summary_temporary.replace(summary_destination)
         except Exception:

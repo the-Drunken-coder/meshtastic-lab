@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
@@ -52,6 +53,82 @@ class OrderedServer:
 class HangingWriter(FakeWriter):
     async def wait_closed(self) -> None:
         await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_public_port_is_reserved_before_downstream_start_and_released_on_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReservedSocket:
+        def __init__(self) -> None:
+            self.bound: tuple[str, int] | None = None
+            self.closed = False
+
+        def setsockopt(self, *_args: object) -> None:
+            return
+
+        def setblocking(self, _blocking: bool) -> None:
+            return
+
+        def bind(self, address: tuple[str, int]) -> None:
+            self.bound = address
+
+        def getsockname(self) -> tuple[str, int]:
+            return "127.0.0.1", 45123
+
+        def close(self) -> None:
+            self.closed = True
+
+    reserved = ReservedSocket()
+    monkeypatch.setattr(socket, "socket", lambda *_args: reserved)
+    gateway = NodeGateway(
+        node_id="node-1",
+        downstream_host="127.0.0.1",
+        downstream_port=1,
+        public_host="127.0.0.1",
+        public_port=0,
+    )
+
+    gateway.reserve_public_listener()
+    assert reserved.bound == ("127.0.0.1", 0)
+    assert gateway.public_port == 45123
+    await gateway.stop()
+    assert reserved.closed
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_closes_reserved_transports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = NodeGateway(
+        node_id="node-1",
+        downstream_host="127.0.0.1",
+        downstream_port=1,
+        public_host="127.0.0.1",
+        public_port=45001,
+    )
+    start_entered = asyncio.Event()
+    cleanup_called = asyncio.Event()
+
+    async def blocked_downstream() -> None:
+        start_entered.set()
+        await asyncio.Event().wait()
+
+    async def cleanup() -> None:
+        cleanup_called.set()
+
+    monkeypatch.setattr(gateway, "reserve_public_listener", lambda: None)
+    monkeypatch.setattr(gateway, "_establish_ready_downstream", blocked_downstream)
+    monkeypatch.setattr(gateway, "_close_transports", cleanup)
+
+    start_task = asyncio.create_task(gateway.start())
+    await start_entered.wait()
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert cleanup_called.is_set()
+    assert gateway.state == GatewayState.FAILED
 
 
 @pytest.mark.asyncio

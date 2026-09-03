@@ -94,6 +94,8 @@ class NativeDockerCluster:
                     startup_timeout=30,
                 )
 
+            for gateway in self.gateways.values():
+                gateway.reserve_public_listener()
             await asyncio.gather(*(gateway.start() for gateway in self.gateways.values()))
 
             async def configure(node_id: str) -> NodeVerification:

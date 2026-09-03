@@ -242,6 +242,10 @@ def test_active_export_is_rejected_without_copying_full_result(
         current=SimpleNamespace(run_id=run_id, finished_at=None),
         result_is_finalized=lambda _run_id: False,
     )  # type: ignore[assignment]
+    service.results_root.mkdir(parents=True)
+    (service.results_root / f"{run_id}.json").write_text(
+        '{"state":"COMPLETED"}', encoding="utf-8"
+    )
 
     def full_result_forbidden(_run_id: str) -> object:
         raise AssertionError("active export copied the full result")

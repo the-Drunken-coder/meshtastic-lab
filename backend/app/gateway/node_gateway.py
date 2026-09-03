@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from enum import StrEnum
@@ -102,9 +103,10 @@ class NodeGateway:
         self._client_writer: asyncio.StreamWriter | None = None
         self._server: asyncio.Server | None = None
         self._control_server: asyncio.Server | None = None
+        self._reserved_public_socket: socket.socket | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._config_waiters: dict[int, asyncio.Future[None]] = {}
-        self._stop_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def internal_port(self) -> int:
@@ -113,6 +115,10 @@ class NodeGateway:
         return self.control_port
 
     async def start(self) -> None:
+        async with self._lifecycle_lock:
+            await self._start_unlocked()
+
+    async def _start_unlocked(self) -> None:
         if self.state == GatewayState.RUNNING:
             return
         if self.state not in {GatewayState.STOPPED, GatewayState.FAILED}:
@@ -121,6 +127,7 @@ class NodeGateway:
         self.state = GatewayState.CONNECTING
         self.failed.clear()
         try:
+            self.reserve_public_listener()
             await self._establish_ready_downstream()
             self._control_server = await asyncio.start_server(
                 self._handle_internal_client,
@@ -130,22 +137,28 @@ class NodeGateway:
             )
             control_socket = self._control_server.sockets[0]
             self.control_port = int(control_socket.getsockname()[1])
+            public_socket = self._reserved_public_socket
+            if public_socket is None:
+                raise GatewayError("public listener was not reserved")
             self._server = await asyncio.start_server(
                 self._handle_external_client,
-                host=self.public_host,
-                port=self.public_port,
+                sock=public_socket,
                 limit=4096,
             )
+            self._reserved_public_socket = None
             self.state = GatewayState.RUNNING
             await self._emit("gateway.started", f"public port {self.public_port}")
-        except Exception as exc:
+        except BaseException as exc:
             self.state = GatewayState.FAILED
             await self._close_transports()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise GatewayError(f"gateway {self.node_id} failed to start: {exc}") from exc
 
     async def stop(self) -> None:
-        async with self._stop_lock:
+        async with self._lifecycle_lock:
             if self.state == GatewayState.STOPPED:
+                await self._close_transports()
                 return
             self.state = GatewayState.STOPPING
             await self._close_transports()
@@ -163,6 +176,22 @@ class NodeGateway:
             self.external_connected = False
             self.state = GatewayState.STOPPED
             await self._emit("gateway.stopped", "gateway stopped")
+
+    def reserve_public_listener(self) -> None:
+        """Reserve the fixed API port before local clients can consume it ephemerally."""
+
+        if self._server is not None or self._reserved_public_socket is not None:
+            return
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.setblocking(False)
+            listener.bind((self.public_host, self.public_port))
+        except BaseException:
+            listener.close()
+            raise
+        self.public_port = int(listener.getsockname()[1])
+        self._reserved_public_socket = listener
 
     async def send_to_radio(self, message: mesh_pb2.ToRadio, *, source: str = "controller") -> None:
         if self.state != GatewayState.RUNNING:
@@ -435,6 +464,8 @@ class NodeGateway:
         for server in (self._server, self._control_server):
             if server is not None:
                 server.close()
+        if self._reserved_public_socket is not None:
+            self._reserved_public_socket.close()
 
         for label, server in (("public server", self._server), ("control server", self._control_server)):
             if server is not None:
@@ -448,6 +479,7 @@ class NodeGateway:
 
         self._server = None
         self._control_server = None
+        self._reserved_public_socket = None
         self._client_writer = None
         self._downstream_writer = None
         self._downstream_reader = None

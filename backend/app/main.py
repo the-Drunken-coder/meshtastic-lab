@@ -185,13 +185,13 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
 
     @app.get("/api/traffic/runs/{run_id}/export")
     async def export_traffic_result(run_id: str) -> Response:
-        path = simulator.results_root / f"{run_id}.json"
-        if path.is_file():
-            return FileResponse(path, media_type="application/json", filename=f"{run_id}.json")
         if not simulator.traffic_result_is_complete(run_id):
             raise SimulationConflict(
                 "TRAFFIC_RUN_NOT_COMPLETE", "traffic results can be exported after the run finishes"
             )
+        path = simulator.results_root / f"{run_id}.json"
+        if path.is_file():
+            return FileResponse(path, media_type="application/json", filename=f"{run_id}.json")
         result = simulator.traffic_result(run_id)
         return JSONResponse(
             content=result.model_dump(mode="json", by_alias=True),

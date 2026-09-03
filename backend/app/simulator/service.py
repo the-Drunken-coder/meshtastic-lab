@@ -10,6 +10,7 @@ import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import TypeVar
 
 from meshtastic.protobuf import mesh_pb2, portnums_pb2, telemetry_pb2
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,6 +49,7 @@ from .medium import DirectedMedium
 COLLISION_MARKER_DEFAULT = "/usr/share/meshtastic-lab/native-collision-enabled"
 MAX_VOLATILE_RESULTS = 8
 LOGGER = logging.getLogger(__name__)
+_TaskResult = TypeVar("_TaskResult")
 
 
 class LifecycleState(StrEnum):
@@ -277,6 +279,8 @@ class SimulatorService:
                     )
                     for node in self.scenario.nodes
                 }
+                for gateway in self.gateways.values():
+                    gateway.reserve_public_listener()
                 gateway_starts = [
                     asyncio.create_task(gateway.start(), name=f"gateway-start-{node_id}")
                     for node_id, gateway in self.gateways.items()
@@ -585,8 +589,8 @@ class SimulatorService:
 
     async def _configure_nodes(self) -> dict[str, NodeVerification]:
         async def settle_node_tasks(
-            tasks: list[asyncio.Task[NodeVerification]],
-        ) -> list[NodeVerification]:
+            tasks: list[asyncio.Task[_TaskResult]],
+        ) -> list[_TaskResult]:
             try:
                 return await asyncio.gather(*tasks)
             except asyncio.CancelledError:
@@ -621,36 +625,69 @@ class SimulatorService:
         ]
         await settle_node_tasks(configure_tasks)
 
-        async def reconnect_and_verify(node_id: str) -> NodeVerification:
+        async def wait_for_reboot(node_id: str) -> str:
             gateway = self.gateways[node_id]
             await asyncio.wait_for(gateway.failed.wait(), timeout=12)
-            node = next(candidate for candidate in self.scenario.nodes if candidate.id == node_id)
-            for _attempt in range(3):
-                await gateway.stop()
-                await gateway.start()
-                verification = await asyncio.to_thread(
-                    verify_node,
-                    hostname=gateway.control_host,
-                    port=gateway.control_port,
-                    node=node,
-                    rf=self.scenario.rf,
-                    channel=self.scenario.channel,
-                )
-                await asyncio.wait_for(gateway.client_disconnected.wait(), timeout=5)
-                try:
-                    await asyncio.wait_for(gateway.failed.wait(), timeout=11)
-                except TimeoutError:
-                    return verification
-            raise RuntimeError(f"{node_id} did not stabilize after configuration restarts")
+            return node_id
 
-        reconnect_tasks = [
-            asyncio.create_task(
-                reconnect_and_verify(node.id), name=f"reconnect-and-verify-{node.id}"
+        pending = await settle_node_tasks(
+            [
+                asyncio.create_task(wait_for_reboot(node.id), name=f"wait-for-reboot-{node.id}")
+                for node in self.scenario.nodes
+            ]
+        )
+        verified: dict[str, NodeVerification] = {}
+
+        async def verify_restarted(node_id: str) -> tuple[str, NodeVerification | None]:
+            gateway = self.gateways[node_id]
+            node = next(candidate for candidate in self.scenario.nodes if candidate.id == node_id)
+            verification = await asyncio.to_thread(
+                verify_node,
+                hostname=gateway.control_host,
+                port=gateway.control_port,
+                node=node,
+                rf=self.scenario.rf,
+                channel=self.scenario.channel,
             )
-            for node in self.scenario.nodes
-        ]
-        values = await settle_node_tasks(reconnect_tasks)
-        return {verification.node_id: verification for verification in values}
+            await asyncio.wait_for(gateway.client_disconnected.wait(), timeout=5)
+            try:
+                await asyncio.wait_for(gateway.failed.wait(), timeout=11)
+            except TimeoutError:
+                return node_id, verification
+            return node_id, None
+
+        for _attempt in range(3):
+            await settle_node_tasks(
+                [
+                    asyncio.create_task(self.gateways[node_id].stop(), name=f"stop-{node_id}")
+                    for node_id in pending
+                ]
+            )
+            for node_id in pending:
+                self.gateways[node_id].reserve_public_listener()
+            await settle_node_tasks(
+                [
+                    asyncio.create_task(self.gateways[node_id].start(), name=f"start-{node_id}")
+                    for node_id in pending
+                ]
+            )
+            observations = await settle_node_tasks(
+                [
+                    asyncio.create_task(
+                        verify_restarted(node_id), name=f"verify-restarted-{node_id}"
+                    )
+                    for node_id in pending
+                ]
+            )
+            pending = []
+            for node_id, verification in observations:
+                if verification is None:
+                    pending.append(node_id)
+                else:
+                    verified[node_id] = verification
+            if not pending:
+                return verified
+        raise RuntimeError(f"{', '.join(pending)} did not stabilize after configuration restarts")
 
     async def _on_gateway_event(self, event: GatewayEvent) -> None:
         if event.kind in {

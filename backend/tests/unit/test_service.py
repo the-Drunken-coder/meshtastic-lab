@@ -390,6 +390,9 @@ async def test_process_failure_during_gateway_start_cleans_up_after_start_settle
             self.listening = False
             gateways.append(self)
 
+        def reserve_public_listener(self) -> None:
+            return
+
         async def start(self) -> None:
             gateway_started.set()
             await release_gateways.wait()

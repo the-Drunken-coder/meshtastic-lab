@@ -598,6 +598,31 @@ async def test_partial_persistence_failure_removes_completed_export(
 
 
 @pytest.mark.asyncio
+async def test_temporary_write_failure_removes_partial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    write_text = Path.write_text
+
+    def fail_summary_write(path: Path, data: str, **kwargs: object) -> int:
+        if path.name.endswith(".summary.tmp"):
+            raise OSError("summary write failed")
+        return write_text(path, data, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", fail_summary_write)
+    run_id = controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"], messagesPerMinute=600, durationSeconds=0.01
+        )
+    )
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.state == TrafficRunState.FAILED
+    assert not (tmp_path / f"{run_id}.tmp").exists()
+    assert not (tmp_path / f"{run_id}.summary.tmp").exists()
+
+
+@pytest.mark.asyncio
 async def test_legacy_result_provenance_is_migrated_without_invention(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     request = TrafficRunRequest(
