@@ -423,13 +423,11 @@ class TrafficController:
             startedAt=result.started_at,
             finishedAt=result.finished_at,
             randomSeed=result.random_seed,
-            requested=self._generated_count if self._frozen_result is None else result.requested,
-            submitted=self._submitted_count if self._frozen_result is None else result.submitted,
-            submissionFailed=(
-                self._submission_failed_count if self._frozen_result is None else result.submission_failed
-            ),
-            transmitted=self._transmitted_count if self._frozen_result is None else result.transmitted,
-            delivered=self._unique_deliveries if self._frozen_result is None else result.delivered,
+            requested=self._generated_count,
+            submitted=self._submitted_count,
+            submissionFailed=self._submission_failed_count,
+            transmitted=self._transmitted_count,
+            delivered=self._unique_deliveries,
             failedReceptionMetricsComplete=result.failed_reception_metrics_complete,
             missingLocalStatsNodes=result.missing_local_stats_nodes,
             metrics=metrics,
@@ -468,6 +466,14 @@ class TrafficController:
         if origin != self.hardware_ids[transmitter]:
             self._relay_transmissions += 1
         self._note_activity()
+        self._publish_metric_update(
+            {
+                "rfTransmissions": self._rf_transmission_count,
+                "observedAirtimeMs": self._observed_airtime_ms,
+                "relayTransmissions": self._relay_transmissions,
+                "perNodeTransmitCounts": dict(self._per_node_transmit_counts),
+            }
+        )
 
     def record_drop(self, transmitter: str, packet: mesh_pb2.MeshPacket, reason: str) -> None:
         del transmitter
@@ -479,6 +485,7 @@ class TrafficController:
         self._drop_reasons.append(reason)
         self._drop_counts[reason] += 1
         self._note_activity()
+        self._publish_metric_update({"dropsByReason": dict(self._drop_counts)})
 
     def record_failed_receptions(self, node_id: str, total: int) -> None:
         if self.current is None or self.state not in {
@@ -491,7 +498,10 @@ class TrafficController:
         self._latest_failed_receptions[node_id] = total
         if previous is None:
             return
-        self._failed_receptions += max(0, total - previous)
+        delta = max(0, total - previous)
+        self._failed_receptions += delta
+        if delta:
+            self._publish_metric_update({"failedReceptions": self._failed_receptions})
 
     def record_duplicate_receptions(self, node_id: str, total: int) -> None:
         if self.current is None or self.state not in {
@@ -504,7 +514,10 @@ class TrafficController:
         self._latest_duplicate_receptions[node_id] = total
         if previous is None:
             return
-        self._duplicates += max(0, total - previous)
+        delta = max(0, total - previous)
+        self._duplicates += delta
+        if delta:
+            self._publish_metric_update({"duplicateReceptions": self._duplicates})
 
     def ensure_topology_change_capacity(self, additional_changes: int) -> None:
         if self.current is None or self.state not in {
@@ -535,6 +548,7 @@ class TrafficController:
     def set_event_loop_lag(self, lag_ms: float) -> None:
         if self.current is not None and self.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
             self._event_loop_lag_ms = lag_ms
+            self._publish_metric_update({"eventLoopLagMs": lag_ms})
 
     async def handle_from_radio(self, node_id: str, message: mesh_pb2.FromRadio) -> None:
         if self.current is None or self.state not in {
@@ -566,14 +580,23 @@ class TrafficController:
             if node_id in generated.delivered_to:
                 if self.failed_reception_sampler is None:
                     self._duplicates += 1
+                    self._publish_metric_update({"duplicateReceptions": self._duplicates})
                 return
             generated.delivered_to.append(node_id)
             self._receiver_deliveries += 1
             if sequence not in self._delivered_sequences:
                 self._delivered_sequences.add(sequence)
                 self._unique_deliveries += 1
-            self._latencies_ms.append((time.monotonic() - generated.generated_monotonic) * 1000)
+            latency_ms = (time.monotonic() - generated.generated_monotonic) * 1000
+            self._latencies_ms.append(latency_ms)
             self._note_activity()
+            self._publish_metric_update(
+                {
+                    "uniqueApplicationMessagesDelivered": self._unique_deliveries,
+                    "receiverDeliveries": self._receiver_deliveries,
+                    "latestLatencyMs": latency_ms,
+                }
+            )
             self.event_broker.publish(
                 PacketEvent(
                     monotonicSeconds=time.monotonic(),
@@ -620,6 +643,7 @@ class TrafficController:
                 if not generated.acknowledged:
                     generated.acknowledged = True
                     self._acknowledgments += 1
+                    self._publish_metric_update({"acknowledgments": self._acknowledgments})
                 event_type = EventType.ACKNOWLEDGMENT
                 result = "acknowledged"
             else:
@@ -628,6 +652,7 @@ class TrafficController:
                 self._routing_terminal_sequences.add(generated.sequence)
                 self._drop_reasons.append(result)
                 self._drop_counts[result] += 1
+                self._publish_metric_update({"dropsByReason": dict(self._drop_counts)})
             self._note_activity()
             self.event_broker.publish(
                 PacketEvent(
@@ -660,6 +685,12 @@ class TrafficController:
         self._submission_failed_count += 1
         self.current.submission_failed = self._submission_failed_count
         self._note_activity()
+        self._publish_metric_update(
+            {
+                "submitted": self._submitted_count,
+                "submissionFailed": self._submission_failed_count,
+            }
+        )
         self.event_broker.publish(
             PacketEvent(
                 monotonicSeconds=time.monotonic(),
@@ -710,6 +741,10 @@ class TrafficController:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            LOGGER.exception(
+                "traffic run failed",
+                extra={"traffic_run_id": self.current.run_id if self.current is not None else None},
+            )
             self.state = TrafficRunState.FAILED
             if self.current is not None:
                 self.current.failure = str(exc)
@@ -759,6 +794,7 @@ class TrafficController:
             else 1
         )
         self.current.requested = self._generated_count
+        self._publish_metric_update({"generatedApplicationMessages": self._generated_count})
         self._messages_by_packet[(self.hardware_ids[source], packet_id)] = generated
         self._messages_by_key[(self.current.run_id, self._sequence)] = generated
         self._pending_submissions[(source, packet_id)] = generated
@@ -822,6 +858,12 @@ class TrafficController:
             self.current.submission_failed = self._submission_failed_count
             result = "submission-failed"
         self._note_activity()
+        self._publish_metric_update(
+            {
+                "submitted": self._submitted_count,
+                "submissionFailed": self._submission_failed_count,
+            }
+        )
         self.event_broker.publish(
             PacketEvent(
                 monotonicSeconds=time.monotonic(),
@@ -981,28 +1023,14 @@ class TrafficController:
         current.submission_failed = self._submission_failed_count
         current.transmitted = self._transmitted_count
         current.delivered = self._unique_deliveries
-        self._metrics = self._final_metrics()
+        self._metrics = await asyncio.to_thread(self._final_metrics)
         current.metrics = self._metrics
-        frozen = current.model_copy(deep=True)
+        self._publish_metric_update(
+            self._summary_metrics(self._metrics).model_dump(mode="python", by_alias=True),
+            result="snapshot",
+        )
         try:
-            self.results_root.mkdir(parents=True, exist_ok=True)
-            destination = self.results_root / f"{frozen.run_id}.json"
-            summary_destination = self.results_root / f"{frozen.run_id}.summary.json"
-            temporary = destination.with_suffix(".tmp")
-            summary_temporary = summary_destination.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(frozen.model_dump(mode="json", by_alias=True), indent=2) + "\n",
-                encoding="utf-8",
-            )
-            summary_temporary.write_text(
-                json.dumps(
-                    summarize_result(frozen).model_dump(mode="json", by_alias=True), indent=2
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            temporary.replace(destination)
-            summary_temporary.replace(summary_destination)
+            frozen = await asyncio.to_thread(self._freeze_and_persist, current)
         except Exception as exc:
             self.state = TrafficRunState.FAILED
             current.state = TrafficRunState.FAILED
@@ -1012,13 +1040,35 @@ class TrafficController:
                 if current.failure
                 else persistence_failure
             )
-            frozen = current.model_copy(deep=True)
+            frozen = await asyncio.to_thread(current.model_copy, deep=True)
             LOGGER.exception(
                 "traffic result persistence failed",
                 extra={"traffic_run_id": current.run_id},
             )
         self._frozen_result = frozen
-        self.current = frozen.model_copy(deep=True)
+        self.current = frozen
+
+    def _freeze_and_persist(self, current: TrafficRunResult) -> TrafficRunResult:
+        """Serialize a stable terminal result outside the asyncio event loop."""
+
+        frozen = current.model_copy(deep=True)
+        self.results_root.mkdir(parents=True, exist_ok=True)
+        destination = self.results_root / f"{frozen.run_id}.json"
+        summary_destination = self.results_root / f"{frozen.run_id}.summary.json"
+        temporary = destination.with_suffix(".tmp")
+        summary_temporary = summary_destination.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(frozen.model_dump(mode="json", by_alias=True), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        summary_temporary.write_text(
+            json.dumps(summarize_result(frozen).model_dump(mode="json", by_alias=True), indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+        summary_temporary.replace(summary_destination)
+        return frozen
 
     def _final_metrics(self) -> MetricsSnapshot:
         delivered_ids: set[tuple[str, int]] = set()
@@ -1087,7 +1137,7 @@ class TrafficController:
             delivered_count=self._unique_deliveries,
             acknowledged=self._acknowledgments,
             acknowledgment_expected=expected_acknowledgments,
-            latencies_ms=[],
+            latencies_ms=self._latencies_ms,
             rf_transmitters=[],
             rf_transmission_count=self._rf_transmission_count,
             relay_transmissions=self._relay_transmissions,
@@ -1109,6 +1159,24 @@ class TrafficController:
     def _summary_metrics(metrics: MetricsSnapshot) -> MetricsSummary:
         values = metrics.model_dump(mode="python", by_alias=True, exclude={"receivers_per_broadcast"})
         return MetricsSummary.model_validate(values)
+
+    def _publish_metric_update(
+        self,
+        values: dict[str, int | float | dict[str, int] | None],
+        *,
+        result: str = "update",
+    ) -> None:
+        if self.current is None:
+            return
+        self.event_broker.publish(
+            PacketEvent(
+                monotonicSeconds=time.monotonic(),
+                eventType=EventType.METRICS,
+                trafficRunId=self.current.run_id,
+                metricUpdate=values,
+                result=result,
+            )
+        )
 
     def _validate_request_nodes(
         self, request: TrafficRunRequest, *, scenario_snapshot: Scenario | None = None

@@ -120,7 +120,7 @@ async def assert_not_received(
             raise AcceptanceFailure(f"unexpectedly received {expected!r} across the disabled relay link")
 
 
-def listeners_closed(ports: range) -> None:
+def listeners_closed(ports: list[int]) -> None:
     occupied: list[int] = []
     for port in ports:
         try:
@@ -143,6 +143,7 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
     stack_owned = False
     step = "initialize"
     interfaces: list[tcp_interface.TCPInterface] = []
+    public_ports: list[int] = []
     received: queue.Queue[str] = queue.Queue()
     destination: tcp_interface.TCPInterface | None = None
 
@@ -202,9 +203,12 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
             node_views = (await client.get("/api/nodes")).json()
             if len(node_views) != 3 or any(node.get("nodeNumber") is None for node in node_views):
                 raise AcceptanceFailure(f"node information was not verified: {node_views}")
+            public_ports = [
+                int(str(node["publicEndpoint"]).rsplit(":", 1)[1]) for node in node_views
+            ]
 
             step = "connect three official clients"
-            interfaces = list(await asyncio.gather(*(connect(port) for port in range(45001, 45004))))
+            interfaces = list(await asyncio.gather(*(connect(port) for port in public_ports)))
             if any(interface.myInfo is None for interface in interfaces):
                 raise AcceptanceFailure("an official client did not receive local node information")
             source, _, destination = interfaces
@@ -225,6 +229,9 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
             link = {"from": "node-2", "to": "node-3", "enabled": False, "rssiDbm": -85, "snrDb": 8}
             disabled = await client.put("/api/links", json=link)
             disabled.raise_for_status()
+            while not received.empty():
+                with contextlib.suppress(queue.Empty):
+                    received.get_nowait()
             await asyncio.to_thread(
                 source.sendText, "accept-relay-blocked", destinationId=target_number, wantAck=False
             )
@@ -317,7 +324,7 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
             try:
                 await client.post("/api/simulation/stop")
                 await wait_for_state(client, "STOPPED", 30)
-                listeners_closed(range(45001, 45011))
+                listeners_closed(public_ports)
             except Exception as exc:
                 cleanup_error = exc
             if stack_owned:

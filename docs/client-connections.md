@@ -6,7 +6,7 @@ Every virtual radio exposes the official Meshtastic TCP streaming protocol at it
 
 Both directions use magic bytes `94 c3`, a two-byte big-endian protobuf length, and at most 512 protobuf bytes. An external official client sends its wake bytes and `want_config_id`. The gateway forwards that exact request to the already-owned downstream stream. The firmware emits local information, metadata, node records, channel and configuration records, then a matching `config_complete_id`. Those frames are forwarded byte for byte.
 
-The parser buffers arbitrary TCP boundaries and resynchronizes after invalid bytes. It can extract partial headers and several frames from one read. A length above the protocol maximum closes the offending stream with a logged reason.
+The parser buffers arbitrary TCP boundaries and resynchronizes after invalid bytes. It can extract partial headers and several frames from one read. A length above the protocol maximum is counted as invalid framing, then the parser discards one byte and searches for the next valid frame boundary.
 
 ## One client per node
 

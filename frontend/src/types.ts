@@ -166,6 +166,7 @@ export interface PacketEvent {
   portNumber: number | null;
   packetLength: number | null;
   airtimeMs: number | null;
+  metricUpdate: Record<string, number | Record<string, number> | null>;
   result: string | null;
   detail: string | null;
 }

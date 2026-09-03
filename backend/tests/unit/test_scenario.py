@@ -11,6 +11,8 @@ from backend.app.models import (
     default_scenario,
 )
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
 
 def test_default_scenario_has_five_nodes_and_all_directed_links() -> None:
     scenario = default_scenario()
@@ -96,6 +98,16 @@ def test_incomplete_directed_link_matrix_is_rejected(node_count: int) -> None:
 
 
 def test_bundled_scenarios_validate_and_define_complete_matrices() -> None:
-    for path in Path("scenarios").glob("*.json"):
+    paths = list((REPOSITORY_ROOT / "scenarios").glob("*.json"))
+    assert paths
+    for path in paths:
         scenario = Scenario.model_validate_json(path.read_text(encoding="utf-8"))
         assert len(scenario.links) == scenario.node_count * (scenario.node_count - 1)
+
+
+def test_reachable_pairs_respect_hop_limit() -> None:
+    scenario = apply_topology_preset(default_scenario(3), TopologyPreset.LINE)
+
+    assert ("node-1", "node-3") in scenario.reachable_pairs()
+    assert ("node-1", "node-3") not in scenario.reachable_pairs(max_hops=1)
+    assert ("node-1", "node-2") in scenario.reachable_pairs(max_hops=1)

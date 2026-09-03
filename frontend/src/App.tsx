@@ -34,6 +34,7 @@ const eventTypes = [
   "node_state",
   "lifecycle",
   "traffic",
+  "metrics",
   "ui_events_dropped",
 ] as const;
 
@@ -228,7 +229,14 @@ function App() {
     const connect = () => {
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
       socket = new WebSocket(`${protocol}://${window.location.host}/api/events/ws`);
-      socket.addEventListener("open", () => setStreamConnected(true));
+      socket.addEventListener("open", () => {
+        setStreamConnected(true);
+        api.events()
+          .then((history) => {
+            if (!closed) setEvents((current) => mergeEvents(current, history));
+          })
+          .catch(() => undefined);
+      });
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as PacketEvent;
         setEvents((current) => mergeEvents(current, [event]));
@@ -248,14 +256,24 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
     if (lifecycle?.state === "STOPPED") {
       setLogs(null);
-      return;
+      return () => {
+        active = false;
+      };
     }
     api.logs(logNode, logStream)
-      .then(setLogs)
-      .catch(() => setLogs(null));
-  }, [lifecycle?.state, logNode, logStream, nodes]);
+      .then((nextLogs) => {
+        if (active) setLogs(nextLogs);
+      })
+      .catch(() => {
+        if (active) setLogs(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [lifecycle?.state, logNode, logStream]);
 
   const stopped = lifecycle?.state === "STOPPED";
   const running = lifecycle?.state === "RUNNING";
@@ -315,7 +333,7 @@ function App() {
   };
 
   const updateScenarioCount = (count: number) => {
-    if (!scenario) return;
+    if (!scenario || !Number.isInteger(count) || count < 2 || count > 10) return;
     const nextNodes = makeNodes(count, scenario.nodes);
     setScenario({
       ...scenario,
@@ -392,6 +410,15 @@ function App() {
     void perform("traffic", async () => {
       const request = { ...trafficDraft };
       if (request.kind === "broadcast-text") delete request.fixedDestination;
+      if (
+        request.kind === "direct-text" &&
+        request.destinationStrategy === "fixed" &&
+        !request.fixedDestination
+      ) {
+        request.fixedDestination = scenario?.nodes.find(
+          (node) => !request.sourceNodes.includes(node.id),
+        )?.id;
+      }
       const started = await api.startTraffic(request);
       setNotice({ tone: "good", text: `Traffic run ${started.runId.slice(0, 8)} started.` });
     });
@@ -460,7 +487,7 @@ function App() {
           <section>
             <div className="section-heading"><h2>RF profile</h2>{dirty && <span className="changed">Unsaved</span>}</div>
             <div className="field-grid">
-              <Field label="Nodes"><input type="number" min={2} max={10} value={scenario.nodeCount} disabled={!stopped} onChange={(event) => updateScenarioCount(Number(event.currentTarget.value))} /></Field>
+              <Field label="Nodes"><input type="number" min={2} max={10} step={1} value={scenario.nodeCount} disabled={!stopped} onChange={(event) => updateScenarioCount(Number(event.currentTarget.value))} /></Field>
               <Field label="Region"><input value={scenario.rf.region} disabled={!stopped} onChange={(event) => setScenario({ ...scenario, rf: { ...scenario.rf, region: event.currentTarget.value } })} /></Field>
               <Field label="Modem preset"><select value={scenario.rf.modemPreset} disabled={!stopped} onChange={(event) => setScenario({ ...scenario, rf: { ...scenario.rf, modemPreset: event.currentTarget.value } })}>{["LONG_FAST", "LONG_SLOW", "MEDIUM_SLOW", "MEDIUM_FAST", "SHORT_SLOW", "SHORT_FAST", "LONG_MODERATE", "SHORT_TURBO", "LONG_TURBO"].map((preset) => <option key={preset}>{preset}</option>)}</select></Field>
               <Field label="Frequency slot"><input type="number" min={0} max={255} value={scenario.rf.frequencySlot} disabled={!stopped} onChange={(event) => setScenario({ ...scenario, rf: { ...scenario.rf, frequencySlot: Number(event.currentTarget.value) } })} /></Field>
@@ -539,7 +566,7 @@ function App() {
               <div className="traffic-fields">
                 <Field label="Message kind"><select value={trafficDraft.kind} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, kind: event.currentTarget.value as TrafficRequest["kind"] })}><option value="broadcast-text">Broadcast text</option><option value="direct-text">Direct text</option></select></Field>
                 <Field label="Destination strategy"><select value={trafficDraft.destinationStrategy} disabled={trafficActive || trafficDraft.kind === "broadcast-text"} onChange={(event) => setTrafficDraft({ ...trafficDraft, destinationStrategy: event.currentTarget.value as TrafficRequest["destinationStrategy"] })}><option value="fixed">Fixed</option><option value="round-robin">Round robin</option><option value="deterministic-random">Deterministic random</option></select></Field>
-                <Field label="Fixed destination"><select value={trafficDraft.fixedDestination} disabled={trafficActive || trafficDraft.kind === "broadcast-text" || trafficDraft.destinationStrategy !== "fixed"} onChange={(event) => setTrafficDraft({ ...trafficDraft, fixedDestination: event.currentTarget.value })}>{scenario.nodes.map((node) => <option value={node.id} key={node.id}>{node.displayName}</option>)}</select></Field>
+                <Field label="Fixed destination"><select value={trafficDraft.fixedDestination ?? scenario.nodes.find((node) => !trafficDraft.sourceNodes.includes(node.id))?.id ?? ""} disabled={trafficActive || trafficDraft.kind === "broadcast-text" || trafficDraft.destinationStrategy !== "fixed"} onChange={(event) => setTrafficDraft({ ...trafficDraft, fixedDestination: event.currentTarget.value })}>{scenario.nodes.map((node) => <option value={node.id} key={node.id}>{node.displayName}</option>)}</select></Field>
                 <Field label="Messages/min/source"><input type="number" min={0.1} max={600} step={0.1} value={trafficDraft.messagesPerMinute} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, messagesPerMinute: Number(event.currentTarget.value) })} /></Field>
                 <Field label="Payload bytes"><input type="number" min={48} max={233} value={trafficDraft.payloadBytes} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, payloadBytes: Number(event.currentTarget.value) })} /></Field>
                 <Field label="Duration seconds"><input type="number" min={1} max={3600} value={trafficDraft.durationSeconds} disabled={trafficActive} onChange={(event) => setTrafficDraft({ ...trafficDraft, durationSeconds: Number(event.currentTarget.value) })} /></Field>

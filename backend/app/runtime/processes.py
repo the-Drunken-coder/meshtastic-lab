@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import shutil
 from collections import deque
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TextIO
 
 from backend.app.models import Scenario
 
@@ -61,14 +63,12 @@ class NativeProcessSupervisor:
         binary_path: Path = Path("/usr/bin/meshtasticd"),
         data_root: Path = Path("/data/nodes"),
         internal_port_base: int = 46001,
-        startup_timeout: float = 30.0,
         shutdown_timeout: float = 8.0,
         failure_handler: ProcessFailureHandler | None = None,
     ) -> None:
         self.binary_path = binary_path
         self.data_root = data_root
         self.internal_port_base = internal_port_base
-        self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
         self.failure_handler = failure_handler
         self.records: dict[str, ProcessRecord] = {}
@@ -89,9 +89,10 @@ class NativeProcessSupervisor:
 
         self.data_root.mkdir(parents=True, exist_ok=True)
         self._stopping = False
+        hardware_ids = self._hardware_ids_for(node.id for node in scenario.nodes)
         try:
             for index, node in enumerate(scenario.nodes):
-                record = self._record_for(node.id, index)
+                record = self._record_for(node.id, index, hardware_ids[node.id])
                 self.records[node.id] = record
                 await self._start_one(record, erase=scenario.fresh_state)
         except Exception:
@@ -130,9 +131,11 @@ class NativeProcessSupervisor:
             )
 
         for record in records:
-            _, pending_tasks = await asyncio.wait(
-                tuple(record.tasks), timeout=OUTPUT_DRAIN_TIMEOUT_SECONDS
-            ) if record.tasks else (set(), set())
+            pending_tasks: set[asyncio.Task[None]] = set()
+            if record.tasks:
+                _, pending_tasks = await asyncio.wait(
+                    tuple(record.tasks), timeout=OUTPUT_DRAIN_TIMEOUT_SECONDS
+                )
             for task in pending_tasks:
                 task.cancel()
             if pending_tasks:
@@ -162,11 +165,28 @@ class NativeProcessSupervisor:
     def clear_archived_logs(self) -> None:
         self.archived_logs.clear()
 
-    def _record_for(self, node_id: str, index: int) -> ProcessRecord:
+    @staticmethod
+    def _hardware_ids_for(node_ids: Iterable[str]) -> dict[str, int]:
+        ordered_ids = sorted(node_ids)
+        hardware_ids: dict[str, int] = {}
+        used: set[int] = set()
+        for node_id in ordered_ids:
+            salt = 0
+            while True:
+                digest = hashlib.sha256(f"meshtastic-lab:{node_id}:{salt}".encode()).digest()
+                hardware_id = int.from_bytes(digest[:4], byteorder="big")
+                if hardware_id not in {0, 0xFFFFFFFF} and hardware_id not in used:
+                    break
+                salt += 1
+            hardware_ids[node_id] = hardware_id
+            used.add(hardware_id)
+        return hardware_ids
+
+    def _record_for(self, node_id: str, index: int, hardware_id: int) -> ProcessRecord:
         node_root = self.data_root / node_id
         return ProcessRecord(
             node_id=node_id,
-            hardware_id=0xA11CE001 + index,
+            hardware_id=hardware_id,
             internal_port=self.internal_port_base + index,
             data_directory=node_root / "state",
             stdout_path=node_root / "stdout.log",
@@ -197,18 +217,18 @@ class NativeProcessSupervisor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        record.state = NodeProcessState.RUNNING
         if record.process.stdout is None or record.process.stderr is None:
             raise RuntimeError(f"failed to capture output for {record.node_id}")
+        record.state = NodeProcessState.RUNNING
 
         self._track(
             record,
-            self._drain_output(record, record.process.stdout, record.stdout_path, record.stdout_lines),
+            self._drain_output(record.process.stdout, record.stdout_path, record.stdout_lines),
             f"{record.node_id}-stdout",
         )
         self._track(
             record,
-            self._drain_output(record, record.process.stderr, record.stderr_path, record.stderr_lines),
+            self._drain_output(record.process.stderr, record.stderr_path, record.stderr_lines),
             f"{record.node_id}-stderr",
         )
         self._track(record, self._monitor_exit(record), f"{record.node_id}-exit")
@@ -220,18 +240,36 @@ class NativeProcessSupervisor:
 
     async def _drain_output(
         self,
-        record: ProcessRecord,
         stream: asyncio.StreamReader,
         path: Path,
         recent: deque[str],
     ) -> None:
-        del record
-        with path.open("a", encoding="utf-8") as output:
+        output: TextIO | None = None
+        try:
+            output = await asyncio.to_thread(path.open, "a", encoding="utf-8")
+        except OSError:
+            LOGGER.exception("failed to open firmware log", extra={"path": str(path)})
+        try:
             while line := await stream.readline():
                 text = line.decode("utf-8", errors="replace").rstrip()
                 recent.append(text)
-                output.write(text + "\n")
-                output.flush()
+                if output is not None:
+                    try:
+                        await asyncio.to_thread(self._write_output_line, output, text)
+                    except OSError:
+                        LOGGER.exception("failed to persist firmware log", extra={"path": str(path)})
+                        with contextlib.suppress(OSError):
+                            await asyncio.to_thread(output.close)
+                        output = None
+        finally:
+            if output is not None:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(output.close)
+
+    @staticmethod
+    def _write_output_line(output: TextIO, text: str) -> None:
+        output.write(text + "\n")
+        output.flush()
 
     async def _monitor_exit(self, record: ProcessRecord) -> None:
         if record.process is None:

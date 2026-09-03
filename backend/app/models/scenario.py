@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections import deque
 from enum import StrEnum
 from typing import Annotated, Literal
 
@@ -98,7 +99,7 @@ class ScenarioNode(BaseModel):
 
 
 class DirectedLink(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
     from_node: str = Field(alias="from")
     to_node: str = Field(alias="to")
@@ -157,8 +158,8 @@ class Scenario(BaseModel):
     def link_map(self) -> dict[tuple[str, str], DirectedLink]:
         return {(link.from_node, link.to_node): link for link in self.links}
 
-    def reachable_pairs(self) -> set[tuple[str, str]]:
-        """Return directed node pairs connected by one or more enabled links."""
+    def reachable_pairs(self, *, max_hops: int | None = None) -> set[tuple[str, str]]:
+        """Return pairs connected by enabled links within an optional hop limit."""
 
         adjacency: dict[str, set[str]] = {node.id: set() for node in self.nodes}
         for link in self.links:
@@ -167,15 +168,16 @@ class Scenario(BaseModel):
 
         reachable: set[tuple[str, str]] = set()
         for source in adjacency:
-            pending = list(adjacency[source])
+            pending = deque((target, 1) for target in adjacency[source])
             visited = {source}
             while pending:
-                target = pending.pop()
+                target, hops = pending.popleft()
                 if target in visited:
                     continue
                 visited.add(target)
                 reachable.add((source, target))
-                pending.extend(adjacency[target] - visited)
+                if max_hops is None or hops < max_hops:
+                    pending.extend((neighbor, hops + 1) for neighbor in adjacency[target] - visited)
         return reachable
 
 

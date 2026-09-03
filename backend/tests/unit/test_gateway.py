@@ -37,6 +37,23 @@ class FakeWriter:
         return
 
 
+class OrderedServer:
+    def __init__(self, writer: FakeWriter) -> None:
+        self.writer = writer
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        assert self.writer.closed
+
+
+class HangingWriter(FakeWriter):
+    async def wait_closed(self) -> None:
+        await asyncio.Event().wait()
+
+
 @pytest.mark.asyncio
 async def test_internal_client_is_admitted_while_public_admission_is_disabled() -> None:
     gateway = NodeGateway(
@@ -110,3 +127,74 @@ async def test_enable_public_clients_admits_public_client_after_internal_setup()
     finally:
         public_reader.closed.set()
         await asyncio.gather(*gateway._tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_close_transports_closes_clients_first_and_bounds_waits() -> None:
+    gateway = NodeGateway(
+        node_id="node-1",
+        downstream_host="127.0.0.1",
+        downstream_port=1,
+        public_host="127.0.0.1",
+        public_port=0,
+        shutdown_timeout=0.01,
+    )
+    client = HangingWriter("public-peer")
+    server = OrderedServer(client)
+    gateway._client_writer = client  # type: ignore[assignment]
+    gateway._server = server  # type: ignore[assignment]
+
+    await asyncio.wait_for(gateway._close_transports(), timeout=0.2)
+
+    assert client.closed
+    assert server.closed
+    assert gateway._client_writer is None
+    assert gateway._server is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_retry_clears_stale_failure_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = NodeGateway(
+        node_id="node-1",
+        downstream_host="127.0.0.1",
+        downstream_port=1,
+        public_host="127.0.0.1",
+        public_port=0,
+        startup_timeout=1,
+    )
+    gateway.state = GatewayState.CONNECTING
+    attempts = 0
+    waiter_ready = asyncio.Event()
+
+    class SignalingWaiters(dict[int, asyncio.Future[None]]):
+        def __setitem__(self, key: int, value: asyncio.Future[None]) -> None:
+            super().__setitem__(key, value)
+            waiter_ready.set()
+
+    gateway._config_waiters = SignalingWaiters()
+
+    async def connect(_host: str, _port: int) -> tuple[asyncio.StreamReader, FakeWriter]:
+        return asyncio.StreamReader(), FakeWriter("daemon")
+
+    async def reader_loop() -> None:
+        nonlocal attempts
+        attempts += 1
+        await waiter_ready.wait()
+        waiter_ready.clear()
+        waiter = next(iter(gateway._config_waiters.values()))
+        if attempts == 1:
+            await gateway._fail("daemon restarted")
+        else:
+            waiter.set_result(None)
+
+    monkeypatch.setattr(asyncio, "open_connection", connect)
+    monkeypatch.setattr(gateway, "_downstream_reader_loop", reader_loop)
+
+    await gateway._establish_ready_downstream()
+
+    assert attempts == 2
+    assert gateway.state == GatewayState.CONNECTING
+    assert not gateway.failed.is_set()
+    await gateway.stop()

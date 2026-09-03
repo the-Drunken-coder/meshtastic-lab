@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from meshtastic.protobuf import mesh_pb2, portnums_pb2
 
-from backend.app.metrics import EventBroker
+from backend.app.metrics import EventBroker, EventType
 from backend.app.models import Scenario, default_scenario
 from backend.app.traffic import (
     DestinationStrategy,
@@ -325,6 +325,13 @@ async def test_broadcast_delivery_ratio_counts_messages_once(tmp_path: Path) -> 
     received = _text_from_radio(run_id=run_id, sequence=1, packet_id=7, origin=1)
     await controller.handle_from_radio("node-2", received)
     await controller.handle_from_radio("node-3", received)
+    live = controller.summary()
+    assert live is not None
+    assert live.metrics.median_latency_ms is not None
+    metric_events = [
+        event for event in controller.event_broker.recent() if event.event_type == EventType.METRICS
+    ]
+    assert any("latestLatencyMs" in event.metric_update for event in metric_events)
     await controller.stop()
 
     result = controller.result()

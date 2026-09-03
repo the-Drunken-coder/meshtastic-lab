@@ -270,7 +270,17 @@ class SimulatorService:
                     )
                     for node in self.scenario.nodes
                 }
-                await asyncio.gather(*(gateway.start() for gateway in self.gateways.values()))
+                gateway_starts = [
+                    asyncio.create_task(gateway.start(), name=f"gateway-start-{node_id}")
+                    for node_id, gateway in self.gateways.items()
+                ]
+                try:
+                    await asyncio.gather(*gateway_starts)
+                except BaseException:
+                    for task in gateway_starts:
+                        task.cancel()
+                    await asyncio.gather(*gateway_starts, return_exceptions=True)
+                    raise
                 self.message = "Configuring and verifying native nodes"
                 self.verifications = await self._configure_nodes()
                 hardware_ids = {
@@ -310,6 +320,8 @@ class SimulatorService:
                 await asyncio.gather(
                     *(gateway.enable_public_clients() for gateway in self.gateways.values())
                 )
+                if self.state == LifecycleState.FAILED:
+                    raise RuntimeError(self.message)
                 self.message = f"{len(self.gateways)} native nodes are running"
                 if missing_pairs:
                     self.message += (
@@ -761,7 +773,7 @@ class SimulatorService:
         return self._control_packet_id
 
     async def _warm_up_nodes(self) -> tuple[set[tuple[str, str]], int]:
-        expected = self.scenario.reachable_pairs()
+        expected = self.scenario.reachable_pairs(max_hops=self.scenario.rf.hop_limit)
         self.nodeinfo_observations.clear()
         deadline_seconds = self._warmup_deadline_seconds()
 

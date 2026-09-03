@@ -191,46 +191,49 @@ class NodeGateway:
 
     async def _establish_ready_downstream(self) -> None:
         last_error: OSError | None = None
-        async with asyncio.timeout(self.startup_timeout):
-            while True:
-                try:
-                    self._downstream_reader, self._downstream_writer = await asyncio.open_connection(
-                        self.downstream_host, self.downstream_port
-                    )
-                except OSError as exc:
-                    last_error = exc
-                    await asyncio.sleep(0.05)
-                    continue
+        try:
+            async with asyncio.timeout(self.startup_timeout):
+                while True:
+                    try:
+                        self._downstream_reader, self._downstream_writer = (
+                            await asyncio.open_connection(self.downstream_host, self.downstream_port)
+                        )
+                    except OSError as exc:
+                        last_error = exc
+                        await asyncio.sleep(0.05)
+                        continue
 
-                reader_task = self._spawn(
-                    self._downstream_reader_loop(), name=f"{self.node_id}-daemon-reader"
-                )
-                writer_task = self._spawn(
-                    self._downstream_writer_loop(), name=f"{self.node_id}-daemon-writer"
-                )
-                nonce = 0x4D4C0001
-                waiter = asyncio.get_running_loop().create_future()
-                self._config_waiters[nonce] = waiter
-                request = mesh_pb2.ToRadio(want_config_id=nonce)
-                await self._downstream_writes.put(
-                    _DownstreamWrite(
-                        raw=encode_frame(request.SerializeToString()), source="gateway.readiness"
+                    reader_task = self._spawn(
+                        self._downstream_reader_loop(), name=f"{self.node_id}-daemon-reader"
                     )
-                )
-                try:
-                    await waiter
-                except GatewayError:
-                    self.state = GatewayState.CONNECTING
-                    await self._discard_downstream_attempt(reader_task, writer_task)
-                    last_error = ConnectionResetError("daemon closed during readiness handshake")
-                    await asyncio.sleep(0.05)
-                    continue
-                finally:
-                    self._config_waiters.pop(nonce, None)
-                await self._emit("gateway.downstream_ready", f"config nonce {nonce}")
-                return
-
-        raise GatewayError(f"downstream connection failed: {last_error}")
+                    writer_task = self._spawn(
+                        self._downstream_writer_loop(), name=f"{self.node_id}-daemon-writer"
+                    )
+                    nonce = 0x4D4C0001
+                    waiter = asyncio.get_running_loop().create_future()
+                    self._config_waiters[nonce] = waiter
+                    request = mesh_pb2.ToRadio(want_config_id=nonce)
+                    await self._downstream_writes.put(
+                        _DownstreamWrite(
+                            raw=encode_frame(request.SerializeToString()), source="gateway.readiness"
+                        )
+                    )
+                    try:
+                        await waiter
+                    except GatewayError:
+                        self.state = GatewayState.CONNECTING
+                        self.failed.clear()
+                        await self._discard_downstream_attempt(reader_task, writer_task)
+                        last_error = ConnectionResetError("daemon closed during readiness handshake")
+                        await asyncio.sleep(0.05)
+                        continue
+                    finally:
+                        self._config_waiters.pop(nonce, None)
+                    await self._emit("gateway.downstream_ready", f"config nonce {nonce}")
+                    return
+        except TimeoutError as exc:
+            detail = str(last_error) if last_error is not None else "startup timeout expired"
+            raise GatewayError(f"downstream connection failed: {detail}") from exc
 
     async def _discard_downstream_attempt(
         self, reader_task: asyncio.Task[None], writer_task: asyncio.Task[None]
@@ -240,8 +243,7 @@ class NodeGateway:
         await asyncio.gather(reader_task, writer_task, return_exceptions=True)
         if self._downstream_writer is not None:
             self._downstream_writer.close()
-            with contextlib.suppress(Exception):
-                await self._downstream_writer.wait_closed()
+            await self._bounded_wait_closed(self._downstream_writer, "downstream retry writer")
         self._downstream_reader = None
         self._downstream_writer = None
         self._clear_queue(self._downstream_writes)
@@ -282,15 +284,13 @@ class NodeGateway:
             self.rejected_clients += 1
             await self._emit("gateway.client_rejected", f"public client admission disabled: {peer}")
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+            await self._bounded_wait_closed(writer, "rejected public client")
             return
         if self._client_writer is not None:
             self.rejected_clients += 1
             await self._emit("gateway.client_rejected", f"second client rejected: {peer}")
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+            await self._bounded_wait_closed(writer, "rejected extra client")
             return
 
         self.external_connected = public
@@ -322,8 +322,7 @@ class NodeGateway:
             self.client_disconnected.set()
             self._clear_queue(self._external_writes)
             writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
+            await self._bounded_wait_closed(writer, "disconnected client")
             await self._emit("gateway.client_disconnected", str(peer))
 
     async def _external_reader_loop(self, reader: asyncio.StreamReader) -> None:
@@ -428,20 +427,27 @@ class NodeGateway:
             )
 
     async def _close_transports(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        if self._control_server is not None:
-            self._control_server.close()
-            await self._control_server.wait_closed()
-            self._control_server = None
-
+        # Close active streams before waiting for listeners. A server may be
+        # waiting for a client handler whose read is released only by this close.
         for writer in (self._client_writer, self._downstream_writer):
             if writer is not None:
                 writer.close()
-                with contextlib.suppress(Exception):
-                    await writer.wait_closed()
+        for server in (self._server, self._control_server):
+            if server is not None:
+                server.close()
+
+        for label, server in (("public server", self._server), ("control server", self._control_server)):
+            if server is not None:
+                await self._bounded_wait_closed(server, label)
+        for label, writer in (
+            ("client writer", self._client_writer),
+            ("downstream writer", self._downstream_writer),
+        ):
+            if writer is not None:
+                await self._bounded_wait_closed(writer, label)
+
+        self._server = None
+        self._control_server = None
         self._client_writer = None
         self._downstream_writer = None
         self._downstream_reader = None
@@ -450,6 +456,27 @@ class NodeGateway:
             if not waiter.done():
                 waiter.set_exception(GatewayError(f"gateway {self.node_id} stopped"))
         self._config_waiters.clear()
+
+    async def _bounded_wait_closed(self, transport: object, label: str) -> None:
+        wait_closed = getattr(transport, "wait_closed", None)
+        if not callable(wait_closed):
+            return
+        try:
+            async with asyncio.timeout(self.shutdown_timeout):
+                await wait_closed()
+        except TimeoutError:
+            LOGGER.warning(
+                "%s close timed out",
+                label,
+                extra={"node_id": self.node_id},
+            )
+        except Exception:
+            LOGGER.debug(
+                "%s close failed",
+                label,
+                extra={"node_id": self.node_id},
+                exc_info=True,
+            )
 
     @staticmethod
     def _clear_queue(queue: asyncio.Queue[QueueItem]) -> None:

@@ -25,6 +25,7 @@ class EventType(StrEnum):
     NODE_STATE = "node_state"
     LIFECYCLE = "lifecycle"
     TRAFFIC = "traffic"
+    METRICS = "metrics"
     UI_EVENTS_DROPPED = "ui_events_dropped"
 
 
@@ -49,6 +50,9 @@ class PacketEvent(BaseModel):
     port_number: int | None = Field(default=None, alias="portNumber")
     packet_length: int | None = Field(default=None, alias="packetLength")
     airtime_ms: int | None = Field(default=None, alias="airtimeMs")
+    metric_update: dict[str, int | float | dict[str, int] | None] = Field(
+        default_factory=dict, alias="metricUpdate"
+    )
     result: str | None = None
     detail: str | None = None
 

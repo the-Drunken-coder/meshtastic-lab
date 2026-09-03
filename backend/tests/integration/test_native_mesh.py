@@ -15,9 +15,13 @@ from pubsub import pub
 from backend.app.models import DirectedLink, Scenario, default_scenario
 from backend.tests.integration.native_cluster import NativeDockerCluster
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
 
 def load_scenario(name: str) -> Scenario:
-    return Scenario.model_validate_json(Path("scenarios", name).read_text(encoding="utf-8"))
+    return Scenario.model_validate_json(
+        (REPOSITORY_ROOT / "scenarios" / name).read_text(encoding="utf-8")
+    )
 
 
 async def connect(cluster: NativeDockerCluster, node_id: str) -> tcp_interface.TCPInterface:
@@ -176,6 +180,9 @@ async def test_three_node_firmware_relay_and_runtime_link_changes() -> None:
         await cluster.medium.update_link(
             DirectedLink(**{"from": "node-2", "to": "node-3", "enabled": False})
         )
+        while not received.empty():
+            with contextlib.suppress(queue.Empty):
+                received.get_nowait()
         await asyncio.to_thread(source.sendText, "relay-blocked", destinationId=target, wantAck=False)
         with pytest.raises(queue.Empty):
             await asyncio.to_thread(received.get, True, 6)

@@ -36,9 +36,13 @@ def test_scenario_can_change_only_while_stopped(tmp_path: Path) -> None:
         data = client.get("/api/scenario").json()
         data["name"] = "edited"
         replaced = client.put("/api/scenario", json=data)
+        service.state = LifecycleState.RUNNING
+        locked = client.put("/api/scenario", json=data)
 
     assert replaced.status_code == 200
     assert replaced.json()["name"] == "edited"
+    assert locked.status_code == 409
+    assert locked.json()["error"]["code"] == "SCENARIO_LOCKED"
 
 
 def test_scenario_export_uses_header_safe_unicode_filename(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import os
 import queue
 import socket
 import subprocess
+import uuid
 
 import pytest
 from meshtastic import tcp_interface
@@ -33,35 +34,7 @@ def _unused_port() -> int:
 async def test_official_client_gateway_handshake_rf_and_reconnect() -> None:
     daemon_port = _unused_port()
     public_port = _unused_port()
-    container_name = f"meshtastic-lab-gateway-spike-{os.getpid()}"
-    run = await asyncio.to_thread(
-        subprocess.run,
-        [
-            "docker",
-            "run",
-            "--detach",
-            "--rm",
-            "--name",
-            container_name,
-            "--publish",
-            f"127.0.0.1:{daemon_port}:46001",
-            FIRMWARE_IMAGE,
-            "/usr/bin/meshtasticd",
-            "--erase",
-            "--sim",
-            "--fsdir",
-            "/tmp/node-1",
-            "--hwid",
-            "16",
-            "--port",
-            "46001",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert run.stdout.strip()
-
+    container_name = f"meshtastic-lab-gateway-spike-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     gateway = NodeGateway(
         node_id="node-1",
         downstream_host="127.0.0.1",
@@ -83,6 +56,33 @@ async def test_official_client_gateway_handshake_rf_and_reconnect() -> None:
 
     pub.subscribe(on_receive, "meshtastic.receive.text")
     try:
+        run = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "docker",
+                "run",
+                "--detach",
+                "--rm",
+                "--name",
+                container_name,
+                "--publish",
+                f"127.0.0.1:{daemon_port}:46001",
+                FIRMWARE_IMAGE,
+                "/usr/bin/meshtasticd",
+                "--erase",
+                "--sim",
+                "--fsdir",
+                "/tmp/node-1",
+                "--hwid",
+                "16",
+                "--port",
+                "46001",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert run.stdout.strip()
         await gateway.start()
 
         blocked_reader, blocked_writer = await asyncio.open_connection("127.0.0.1", public_port)

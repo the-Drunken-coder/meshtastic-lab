@@ -21,10 +21,12 @@ BOUNDED_BROADCAST_COMPLETION_SECONDS = 60
 BOUNDED_TRAFFIC_COMPLETION_SECONDS = 330
 
 
-def unused_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
+def unused_ports(count: int) -> list[int]:
+    with contextlib.ExitStack() as stack:
+        listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
+        for listener in listeners:
+            listener.bind(("127.0.0.1", 0))
+        return [int(listener.getsockname()[1]) for listener in listeners]
 
 
 def public_listener_is_closed(port: int) -> bool:
@@ -87,8 +89,7 @@ async def test_product_lifecycle_failure_and_five_node_cleanup() -> None:
         pytest.skip(f"build {image} before running product runtime integration")
 
     name = f"ml-product-{uuid.uuid4().hex[:8]}"
-    web_port = unused_port()
-    node_ports = [unused_port() for _ in range(10)]
+    web_port, *node_ports = unused_ports(11)
     command = [
         "docker",
         "run",

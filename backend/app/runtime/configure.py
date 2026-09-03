@@ -94,7 +94,7 @@ def configure_and_verify_node(
     finally:
         interface.close()
 
-    verified = _connect(hostname, port, deadline)
+    verified = _connect(hostname, port, time.monotonic() + deadline_seconds)
     try:
         result = _verify(verified, node=node, rf=rf, channel=channel)
         if reboot_after_apply:
@@ -148,7 +148,9 @@ def request_node_info(
 
 def _connect(hostname: str, port: int, deadline: float) -> tcp_interface.TCPInterface:
     last_error: Exception | None = None
+    attempted = False
     while time.monotonic() < deadline:
+        attempted = True
         try:
             return tcp_interface.TCPInterface(
                 hostname=hostname,
@@ -158,7 +160,8 @@ def _connect(hostname: str, port: int, deadline: float) -> tcp_interface.TCPInte
         except Exception as exc:
             last_error = exc
             time.sleep(0.1)
-    raise NodeConfigurationError(f"official client could not complete config handshake: {last_error}")
+    detail = str(last_error) if attempted and last_error is not None else "deadline expired before connect"
+    raise NodeConfigurationError(f"official client could not complete config handshake: {detail}")
 
 
 def _send_admin_and_wait(

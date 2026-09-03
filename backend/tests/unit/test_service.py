@@ -203,8 +203,11 @@ async def test_ten_node_line_warmup_is_best_effort(
 
     missing, expected = await service._warm_up_nodes()
 
-    assert expected == len(service.scenario.reachable_pairs())
-    assert ("node-1", "node-10") in missing
+    assert expected == len(
+        service.scenario.reachable_pairs(max_hops=service.scenario.rf.hop_limit)
+    )
+    assert ("node-1", "node-8") in missing
+    assert ("node-1", "node-10") not in missing
 
 
 @pytest.mark.asyncio

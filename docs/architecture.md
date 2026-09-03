@@ -47,15 +47,15 @@ Warm-up sends one best-effort NodeInfo request through each private gateway endp
 
 ## Processes and concurrency
 
-`NativeProcessSupervisor` assigns each child a unique hardware ID, data directory, internal port, stdout file, stderr file, and state record. It starts children with `asyncio.create_subprocess_exec`. Stream-drain and exit-monitor tasks are bounded by the process record. Tini is container PID 1 and reaps adopted descendants.
+`NativeProcessSupervisor` derives each child's unique hardware ID from its stable scenario node ID, then assigns a data directory, internal port, stdout file, stderr file, and state record. Reordering nodes does not change their firmware identities. It starts children with `asyncio.create_subprocess_exec`. Stream-drain and exit-monitor tasks are bounded by the process record. Tini is container PID 1 and reaps adopted descendants.
 
-The backend event loop owns gateways, medium loops, traffic scheduling, lifecycle state, and WebSocket subscriptions. Blocking official-client configuration calls run in worker threads. Each WebSocket subscriber has a bounded 256-event queue; slow clients receive a dropped-event notice while aggregate metrics remain authoritative. Recent history is a bounded 5,000-event deque.
+The backend event loop owns gateways, medium loops, traffic scheduling, lifecycle state, and WebSocket subscriptions. Blocking official-client configuration calls run in worker threads. Each WebSocket subscriber has a bounded 256-event queue; slow clients receive a dropped-event notice while bounded absolute metric updates remain authoritative. Reconnecting clients backfill and merge recent history by sequence before consuming live events. Recent history is a bounded 5,000-event deque.
 
 ## Failure handling
 
 A child exit, gateway failure, RF queue overflow, or unexpected medium-worker exit identifies the node and moves the simulator to `FAILED`. Transport overload uses the explicit `SIMULATOR_OVERLOAD` category so it cannot masquerade as mesh congestion. One serialized failure task freezes an active traffic result, archives recent daemon output, stops traffic and medium tasks, closes gateways, and terminates the remaining children. Start and Stop await that task. Graceful child shutdown has an eight-second deadline followed by force-kill. Gateway startup and shutdown also have deadlines. Stop cancels an active traffic run before dismantling the RF path.
 
-Results use a temporary file followed by an atomic rename under `/data/runs`. Terminal results are frozen before that rename, and later firmware packets cannot change them. If persistence fails, the last eight unpersisted terminal results remain available through the API until the backend restarts. The polled live summary contains only bounded counters and aggregate maps; full generated-message records stay in the completed export. No packet or UI queue is unbounded.
+Results use a temporary file followed by an atomic rename under `/data/runs`. Terminal result cloning, serialization, and file writes run in a worker thread so large exports do not block the event loop. Results are frozen before the rename, and later firmware packets cannot change them. If persistence fails, the last eight unpersisted terminal results remain available through the API until the backend restarts. The polled live summary contains only bounded counters and aggregate maps; full generated-message records stay in the completed export. No packet or UI queue is unbounded.
 
 ## Extension seams
 

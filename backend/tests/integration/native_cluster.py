@@ -177,7 +177,7 @@ class NativeDockerCluster:
             self.nodeinfo_changed.set()
 
     async def _warm_up(self, public_ports: dict[str, int]) -> None:
-        expected = self.scenario.reachable_pairs()
+        expected = self.scenario.reachable_pairs(max_hops=self.scenario.rf.hop_limit)
         if not expected:
             return
         self.nodeinfo_observations.clear()
@@ -211,22 +211,24 @@ class NativeDockerCluster:
         await asyncio.sleep(2)
 
     async def stop(self) -> None:
-        if self.medium is not None:
-            await self.medium.stop()
-            self.medium = None
-        if self.gateways:
-            await asyncio.gather(*(gateway.stop() for gateway in self.gateways.values()))
-            self.gateways.clear()
-        for name in self.container_names:
-            await asyncio.to_thread(
-                subprocess.run,
-                ["docker", "rm", "--force", name],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        self.container_names.clear()
-        self.container_by_node.clear()
+        try:
+            if self.medium is not None:
+                await self.medium.stop()
+                self.medium = None
+            if self.gateways:
+                await asyncio.gather(*(gateway.stop() for gateway in self.gateways.values()))
+                self.gateways.clear()
+        finally:
+            for name in self.container_names:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "rm", "--force", name],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            self.container_names.clear()
+            self.container_by_node.clear()
 
     def daemon_log_tail(self) -> str:
         tails: list[str] = []
