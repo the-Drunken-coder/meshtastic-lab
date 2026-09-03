@@ -6,6 +6,7 @@ RUN npm install --global pnpm@11.0.9
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY frontend/ ./
+COPY scenarios/ /src/scenarios/
 RUN pnpm build
 
 FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1 AS firmware-builder
