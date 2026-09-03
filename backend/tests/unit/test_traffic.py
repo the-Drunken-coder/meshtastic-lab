@@ -755,9 +755,18 @@ async def test_routing_ack_rf_frames_are_correlated_with_original_message(tmp_pa
         origin=3,
         destination=1,
     )
-    controller.record_rf_transmission("node-3", acknowledgment, 5)
-    controller.record_rf_transmission("node-2", acknowledgment, 5)
-    controller.record_drop("node-2", acknowledgment, "link-disabled")
+    acknowledgment.decoded.request_id = 0
+    acknowledgment.decoded.payload = mesh_pb2.Compressed(
+        portnum=portnums_pb2.UNKNOWN_APP,
+        data=b"encrypted-routing-payload",
+    ).SerializeToString()
+    acknowledgment.rx_time = 7
+    assert controller.record_rf_transmission("node-3", acknowledgment, 5) == (run_id, 1)
+    encrypted_relay = mesh_pb2.MeshPacket()
+    encrypted_relay.CopyFrom(acknowledgment)
+    encrypted_relay.rx_time = 1_700_000_000
+    assert controller.record_rf_transmission("node-2", encrypted_relay, 5) == (run_id, 1)
+    controller.record_drop("node-2", encrypted_relay, "link-disabled")
     await controller.stop()
 
     result = controller.result()

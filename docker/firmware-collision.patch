@@ -1,20 +1,26 @@
-diff --git a/variants/native/portduino/platformio.ini b/variants/native/portduino/platformio.ini
---- a/variants/native/portduino/platformio.ini
-+++ b/variants/native/portduino/platformio.ini
-@@ -12,8 +12,9 @@ build_src_filter = ${portduino_base.build_src_filter}
- [env:native]
- extends = native_base
- ; The pkg-config commands below optionally add link flags.
- ; the || : is just a "or run the null command" to avoid returning an error code
- build_flags = ${native_base.build_flags}
-+  -DUSERPREFS_SIMRADIO_EMULATE_COLLISIONS=1
-   !pkg-config --libs libulfius --silence-errors || :
-   !pkg-config --libs openssl --silence-errors || :
-   !pkg-config --cflags --libs sdl2 --silence-errors || :
+diff --git a/src/mesh/Router.cpp b/src/mesh/Router.cpp
+--- a/src/mesh/Router.cpp
++++ b/src/mesh/Router.cpp
+@@ -364,3 +364,4 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
+     // If the packet is not yet encrypted, do so now
+     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
++        const uint32_t simulatorRequestId = p->decoded.request_id;
+         ChannelIndex chIndex = p->channel; // keep as a local because we are about to change it
+@@ -382,5 +383,9 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
+             mqtt->onSend(*p, *p_decoded, chIndex);
+         }
+ #endif
++        // rx_time is not sent over RF and is replaced by the receiver before normal delivery.
++        // SimRadio exposes it only long enough for the host to correlate encrypted routing frames.
++        if (simulatorRequestId != 0)
++            p->rx_time = simulatorRequestId;
+         packetPool.release(p_decoded);
+     }
 diff --git a/src/platform/portduino/SimRadio.cpp b/src/platform/portduino/SimRadio.cpp
 --- a/src/platform/portduino/SimRadio.cpp
 +++ b/src/platform/portduino/SimRadio.cpp
-@@ -258,6 +258,6 @@ void SimRadio::startReceive(meshtastic_MeshPacket *p)
+@@ -257,7 +257,7 @@ void SimRadio::startReceive(meshtastic_MeshPacket *p)
+     if (isActivelyReceiving()) {
          LOG_WARN("Collision detected, dropping current and previous packet!");
          rxBad++;
 -        airTime->logAirtime(RX_ALL_LOG, getPacketTime(receivingPacket, true));
@@ -31,3 +37,16 @@ diff --git a/src/platform/portduino/SimRadio.cpp b/src/platform/portduino/SimRad
      notifyLater(airtimeMsec, ISR_RX, false); // Model the time it is busy receiving
  #else
      isReceiving = true;
+diff --git a/variants/native/portduino/platformio.ini b/variants/native/portduino/platformio.ini
+--- a/variants/native/portduino/platformio.ini
++++ b/variants/native/portduino/platformio.ini
+@@ -12,8 +12,9 @@ build_src_filter = ${portduino_base.build_src_filter}
+ [env:native]
+ extends = native_base
+ ; The pkg-config commands below optionally add link flags.
+ ; the || : is just a "or run the null command" to avoid returning an error code
+ build_flags = ${native_base.build_flags}
++  -DUSERPREFS_SIMRADIO_EMULATE_COLLISIONS=1
+   !pkg-config --libs libulfius --silence-errors || :
+   !pkg-config --libs openssl --silence-errors || :
+   !pkg-config --cflags --libs sdl2 --silence-errors || :

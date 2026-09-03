@@ -14,6 +14,12 @@ make dev
 
 Open <http://127.0.0.1:8080>. `make dev` records the current clean repository commit in the image, then compiles collision-enabled native firmware from the pinned source commit. The initial build can take several minutes; later builds use Docker’s cache.
 
+For direct Compose use, start from a clean checkout and supply its revision explicitly. The image build rejects a missing or malformed revision instead of creating a runtime that cannot start:
+
+```sh
+MESHTASTICATOR_COMMIT="$(git rev-parse HEAD)" docker compose up --build
+```
+
 The application binds only to loopback:
 
 | Purpose | Address |

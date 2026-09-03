@@ -155,19 +155,21 @@ function makeNodes(count: number, previous: Scenario["nodes"]): Scenario["nodes"
   return next;
 }
 
-function makeLinks(nodeIds: string[], preset: TopologyPreset): DirectedLink[] {
-  const hub = nodeIds[0];
-  return nodeIds.flatMap((source, sourceIndex) =>
+function resizeLinks(nodeIds: string[], previous: DirectedLink[]): DirectedLink[] {
+  const existing = new Map(previous.map((link) => [`${link.from}\0${link.to}`, link]));
+  return nodeIds.flatMap((source) =>
     nodeIds
       .filter((target) => target !== source)
-      .map((target) => {
-        const targetIndex = nodeIds.indexOf(target);
-        const enabled =
-          preset === "full-mesh" ||
-          (preset === "line" && Math.abs(sourceIndex - targetIndex) === 1) ||
-          (preset === "star" && (source === hub || target === hub));
-        return { from: source, to: target, enabled, rssiDbm: -85, snrDb: 8 };
-      }),
+      .map(
+        (target) =>
+          existing.get(`${source}\0${target}`) ?? {
+            from: source,
+            to: target,
+            enabled: true,
+            rssiDbm: -85,
+            snrDb: 8,
+          },
+      ),
   );
 }
 
@@ -396,10 +398,10 @@ function App() {
     const nextNodes = makeNodes(count, scenario.nodes);
     setScenario({
       ...scenario,
-      name: count === 5 ? "five-node-full-mesh" : `${count}-node-full-mesh`,
+      name: `${count}-node-custom`,
       nodeCount: count,
       nodes: nextNodes,
-      links: makeLinks(nextNodes.map((node) => node.id), "full-mesh"),
+      links: resizeLinks(nextNodes.map((node) => node.id), scenario.links),
     });
     setTrafficDraft((current) => {
       const sourceNodes = current.sourceNodes.filter((source) =>

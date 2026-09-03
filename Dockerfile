@@ -13,7 +13,6 @@ FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d380
 ARG FIRMWARE_COMMIT=54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb
 ARG CLIENT_LIBRARY_VERSION=2.7.11
 ARG UPSTREAM_BASE_IMAGE_DIGEST=sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4
-ARG MESHTASTICATOR_COMMIT=unavailable
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -42,6 +41,9 @@ RUN git apply --check /tmp/firmware-collision.patch \
     && strings /tmp/meshtasticd | grep -F 'Collision detected, dropping current and previous packet!'
 RUN install -d /tmp/capability \
     && printf '%s\n' "firmware=${FIRMWARE_COMMIT}" "flag=USERPREFS_SIMRADIO_EMULATE_COLLISIONS=1" > /tmp/capability/native-collision-enabled
+ARG MESHTASTICATOR_COMMIT
+RUN printf '%s\n' "${MESHTASTICATOR_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' \
+    || { echo 'MESHTASTICATOR_COMMIT must be the exact 40-character source revision.' >&2; exit 1; }
 RUN patch_sha256="$(sha256sum /tmp/firmware-collision.patch | cut -d' ' -f1)" \
     && binary_sha256="$(sha256sum /tmp/meshtasticd | cut -d' ' -f1)" \
     && architecture="$(uname -m)" \

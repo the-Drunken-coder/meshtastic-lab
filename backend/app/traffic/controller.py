@@ -466,7 +466,7 @@ class TrafficController:
     ) -> tuple[str, int] | None:
         if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
             return None
-        message = self._message_for_packet_identity(packet)
+        message = self._message_for_packet_identity(packet, transmitter=transmitter)
         if message is None or not message.submitted:
             return None
         origin = self._packet_origin(packet)
@@ -494,10 +494,9 @@ class TrafficController:
         return self.current.run_id, message.sequence
 
     def record_drop(self, transmitter: str, packet: mesh_pb2.MeshPacket, reason: str) -> None:
-        del transmitter
         if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
             return
-        message = self._message_for_packet_identity(packet)
+        message = self._message_for_packet_identity(packet, transmitter=transmitter)
         if message is None or not message.submitted:
             return
         self._drop_reasons.append(reason)
@@ -1327,14 +1326,25 @@ class TrafficController:
             quarantined.discard(packet_id)
 
     def _message_for_packet_identity(
-        self, packet: mesh_pb2.MeshPacket
+        self, packet: mesh_pb2.MeshPacket, *, transmitter: str | None = None
     ) -> GeneratedMessage | None:
-        if (
-            mesh_packet_port_number(packet) == portnums_pb2.ROUTING_APP
-            and packet.decoded.request_id
+        port_number = mesh_packet_port_number(packet)
+        request_id: int | None = None
+        if port_number == portnums_pb2.ROUTING_APP and packet.decoded.request_id:
+            request_id = int(packet.decoded.request_id)
+        elif (
+            # The native patch uses this local-only field when PKI ciphertext cannot
+            # be decoded by its sender. Receivers replace rx_time before delivery.
+            port_number == portnums_pb2.UNKNOWN_APP
+            and packet.rx_time
+            and transmitter is not None
+            and self.hardware_ids.get(transmitter) == self._packet_origin(packet)
         ):
-            response = self._messages_by_packet.get((int(packet.to), packet.decoded.request_id))
+            request_id = int(packet.rx_time)
+        if request_id is not None:
+            response = self._messages_by_packet.get((int(packet.to), request_id))
             if response is not None:
+                self._messages_by_packet[(self._packet_origin(packet), packet.id)] = response
                 return response
         return self._messages_by_packet.get((self._packet_origin(packet), packet.id))
 

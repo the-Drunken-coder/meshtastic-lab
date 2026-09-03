@@ -26,11 +26,35 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
     nodes: lineScenario.nodes.map((node) =>
       node.id === "node-1" ? { ...node, displayName: "External Node 1" } : node,
     ),
+    links: lineScenario.links.map((link) =>
+      link.from === "node-1" && link.to === "node-2"
+        ? { ...link, rssiDbm: -101, snrDb: 2.5 }
+        : link,
+    ),
   };
   const externalUpdate = await request.put("/api/scenario", { data: externalScenario });
   expect(externalUpdate.ok()).toBeTruthy();
   await expect(page.getByText("five-node-line-external", { exact: true })).toBeVisible();
   await expect(page.getByText("External Node 1", { exact: true }).first()).toBeVisible();
+
+  await page.getByLabel("Nodes").fill("6");
+  await expect(
+    page.getByRole("button", { name: "Disable link from External Node 1 to Node 6" }),
+  ).toBeVisible();
+  await page.getByLabel("Nodes").fill("5");
+  await page.getByRole("button", { name: "Save scenario" }).click();
+  const resizedScenarioResponse = await request.get("/api/scenario");
+  const resizedScenario = (await resizedScenarioResponse.json()) as typeof lineScenario;
+  expect(
+    resizedScenario.links.find(
+      (link) => link.from === "node-1" && link.to === "node-2",
+    ),
+  ).toMatchObject({ enabled: true, rssiDbm: -101, snrDb: 2.5 });
+  expect(
+    resizedScenario.links.find(
+      (link) => link.from === "node-1" && link.to === "node-3",
+    ),
+  ).toMatchObject({ enabled: false, rssiDbm: -85, snrDb: 8 });
 
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(page.getByText("RUNNING", { exact: true }).first()).toBeVisible();

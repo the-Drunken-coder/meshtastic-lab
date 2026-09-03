@@ -303,6 +303,21 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
                 raise AcceptanceFailure(f"traffic metrics were not internally useful: {metrics}")
             if metrics["rfTransmissions"] < result["transmitted"]:
                 raise AcceptanceFailure("RF transmission count is below transmitted application count")
+            rf_event_response = await client.get(
+                "/api/events", params={"limit": 5000, "eventType": "rf_transmit"}
+            )
+            rf_event_response.raise_for_status()
+            rf_events = rf_event_response.json()
+            if not any(
+                event.get("trafficRunId") == run_id
+                and event.get("trafficSequence") is not None
+                and event.get("transmitter") == "node-3"
+                and event.get("intendedDestination") == "node-1"
+                for event in rf_events
+            ):
+                raise AcceptanceFailure(
+                    "encrypted acknowledgment RF evidence was not correlated to the traffic run"
+                )
             persisted = await client.get(f"/api/traffic/runs/{run_id}")
             persisted.raise_for_status()
             if persisted.json().get("scenarioSnapshot", {}).get("name") != "three-node-relay":
