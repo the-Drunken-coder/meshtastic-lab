@@ -624,7 +624,7 @@ function App() {
         <main className="experiment-area">
           <section className="topology-section">
             <div className="section-toolbar">
-              <div><h2>Directed topology</h2><p>Rows transmit. Columns receive. RSSI −85 dBm · SNR 8 dB.</p></div>
+              <div><h2>Directed topology</h2><p>Rows transmit. Columns receive.</p></div>
               <label className="inline-check"><input type="checkbox" checked={symmetric} onChange={(event) => setSymmetric(event.currentTarget.checked)} /> Edit symmetrically</label>
               <div className="preset-actions">{presets.map(([label, preset]) => <button key={preset} onClick={() => applyPreset(preset)} disabled={busy !== null || (!stopped && !running)}>{label}</button>)}</div>
             </div>

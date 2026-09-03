@@ -6,7 +6,6 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-MESHTASTICATOR_COMMIT = "17ceb8231079d87b070abc6132181e4c6b20202d"
 DEFAULT_METADATA_PATH = Path("/usr/share/meshtastic-lab/build-metadata.json")
 
 
@@ -21,9 +20,7 @@ class BuildMetadata(BaseModel):
     build_architecture: str = Field(alias="buildArchitecture")
     client_library_version: str = Field(alias="clientLibraryVersion")
     upstream_base_image_digest: str = Field(alias="upstreamBaseImageDigest")
-    meshtasticator_commit: str = Field(
-        default=MESHTASTICATOR_COMMIT, alias="meshtasticatorCommit"
-    )
+    meshtasticator_commit: str = Field(alias="meshtasticatorCommit")
 
     @property
     def available(self) -> bool:
@@ -51,6 +48,7 @@ class BuildMetadata(BaseModel):
             buildArchitecture="unavailable",
             clientLibraryVersion="unavailable",
             upstreamBaseImageDigest="unavailable",
+            meshtasticatorCommit="unavailable",
         )
 
 

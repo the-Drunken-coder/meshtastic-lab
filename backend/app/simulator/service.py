@@ -93,6 +93,7 @@ class CapabilityView(BaseModel):
     build_architecture: str = Field(alias="buildArchitecture")
     client_library_version: str = Field(alias="clientLibraryVersion")
     upstream_base_image_digest: str = Field(alias="upstreamBaseImageDigest")
+    meshtasticator_commit: str = Field(alias="meshtasticatorCommit")
 
 
 class NodeView(BaseModel):
@@ -214,6 +215,7 @@ class SimulatorService:
             buildArchitecture=self.build_metadata.build_architecture,
             clientLibraryVersion=self.build_metadata.client_library_version,
             upstreamBaseImageDigest=self.build_metadata.upstream_base_image_digest,
+            meshtasticatorCommit=self.build_metadata.meshtasticator_commit,
         )
 
     def lifecycle(self) -> LifecycleView:

@@ -59,6 +59,31 @@ def test_percentiles_are_unavailable_with_too_few_samples() -> None:
     assert percentile(list(range(20)), 0.95, minimum_samples=20) == pytest.approx(18.05)
 
 
+@pytest.mark.parametrize("sample_count", [1, 19, 20, 99, 100])
+def test_calculated_metric_percentile_boundaries(sample_count: int) -> None:
+    metrics = calculate_metrics(
+        generated=sample_count,
+        delivered_ids={("run", sequence) for sequence in range(sample_count)},
+        acknowledged=0,
+        acknowledgment_expected=0,
+        latencies_ms=[float(value) for value in range(sample_count)],
+        rf_transmitters=[],
+        relay_transmissions=0,
+        duplicate_receptions=0,
+        failed_receptions=0,
+        drop_reasons=[],
+        airtimes_ms=[],
+    )
+
+    assert metrics.median_latency_ms == (sample_count - 1) * 0.5
+    assert metrics.p95_latency_ms == (
+        pytest.approx((sample_count - 1) * 0.95) if sample_count >= 20 else None
+    )
+    assert metrics.p99_latency_ms == (
+        pytest.approx((sample_count - 1) * 0.99) if sample_count >= 100 else None
+    )
+
+
 def test_metrics_count_airtime_once_per_transmitter() -> None:
     metrics = calculate_metrics(
         generated=2,

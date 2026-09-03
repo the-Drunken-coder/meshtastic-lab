@@ -793,6 +793,32 @@ def test_live_latency_percentiles_use_a_bounded_window(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_persistence_uses_full_latency_history(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    run_id = controller.start(
+        TrafficRunRequest(sourceNodes=["node-1"], messagesPerMinute=0.1, durationSeconds=1)
+    )
+    await controller._cancel_run_task()
+    latencies = [float(index) for index in range(2058)]
+    controller._latencies_ms.extend(latencies)
+    controller._live_latencies_ms.extend([9999.0] * 2048)
+    controller._receiver_deliveries = len(latencies)
+    controller._receiver_opportunities = len(latencies)
+
+    await controller._finish(TrafficRunState.COMPLETED)
+
+    result = controller.result()
+    persisted = json.loads((tmp_path / f"{run_id}.json").read_text(encoding="utf-8"))
+    assert result is not None
+    assert result.metrics.receiver_deliveries == 2058
+    assert result.metrics.median_latency_ms == 1028.5
+    assert result.metrics.p95_latency_ms == pytest.approx(1954.15)
+    assert result.metrics.p99_latency_ms == pytest.approx(2036.43)
+    assert persisted["metrics"]["medianLatencyMs"] == 1028.5
+    assert persisted["metrics"]["p99LatencyMs"] == pytest.approx(2036.43)
+
+
+@pytest.mark.asyncio
 async def test_traffic_start_captures_scenario_snapshot(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     snapshot = controller.scenario.model_copy(

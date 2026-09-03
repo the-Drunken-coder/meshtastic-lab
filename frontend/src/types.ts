@@ -30,6 +30,7 @@ export interface Capability {
   buildArchitecture: string;
   clientLibraryVersion: string;
   upstreamBaseImageDigest: string;
+  meshtasticatorCommit: string;
 }
 
 export interface ScenarioNode {

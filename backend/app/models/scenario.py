@@ -228,7 +228,14 @@ def generate_links(
 
 
 def apply_topology_preset(scenario: Scenario, preset: TopologyPreset) -> Scenario:
-    links = generate_links([node.id for node in scenario.nodes], preset)
+    enabled_by_pair = {
+        (link.from_node, link.to_node): link.enabled
+        for link in generate_links([node.id for node in scenario.nodes], preset)
+    }
+    links = [
+        link.model_copy(update={"enabled": enabled_by_pair[link.from_node, link.to_node]})
+        for link in scenario.links
+    ]
     return scenario.model_copy(update={"links": links})
 
 

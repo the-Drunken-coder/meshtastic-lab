@@ -47,7 +47,7 @@ Warm-up sends one best-effort NodeInfo request through each private gateway endp
 
 ## Processes and concurrency
 
-`NativeProcessSupervisor` derives each child's unique hardware ID from its stable scenario node ID, then assigns a data directory, internal port, stdout file, stderr file, and state record. Reordering nodes does not change their firmware identities. It starts children with `asyncio.create_subprocess_exec`. Stream-drain and exit-monitor tasks are bounded by the process record. Tini is container PID 1 and reaps adopted descendants.
+`NativeProcessSupervisor` derives each child's unique hardware ID from its stable scenario node ID, then assigns a data directory, internal port, stdout file, stderr file, and state record. Reordering nodes does not change their firmware identities. It starts children with `asyncio.create_subprocess_exec`. Stream-drain and exit-monitor tasks are bounded by the process record. Each persisted output stream is capped at 8 MiB with one rotated backup, independently of retained firmware state. Tini is container PID 1 and reaps adopted descendants.
 
 The backend event loop owns gateways, medium loops, traffic scheduling, lifecycle state, and WebSocket subscriptions. Blocking official-client configuration calls run in worker threads. Each WebSocket subscriber has a bounded 256-event queue; slow clients receive a dropped-event notice while bounded absolute metric updates remain authoritative. Reconnecting clients backfill and merge recent history by sequence before consuming live events. Recent history is a bounded 5,000-event deque.
 

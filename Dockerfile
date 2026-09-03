@@ -13,6 +13,7 @@ FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d380
 ARG FIRMWARE_COMMIT=54e0d8d0ab2ff56b3a9ce967e53f79e49af560fb
 ARG CLIENT_LIBRARY_VERSION=2.7.11
 ARG UPSTREAM_BASE_IMAGE_DIGEST=sha256:23e92b1331a3a471eaef0c63cbca4365ca40b3111a9781cfdbe5a5114e5773d4
+ARG MESHTASTICATOR_COMMIT=unavailable
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_ROOT_USER_ACTION=ignore
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -44,9 +45,9 @@ RUN install -d /tmp/capability \
 RUN patch_sha256="$(sha256sum /tmp/firmware-collision.patch | cut -d' ' -f1)" \
     && binary_sha256="$(sha256sum /tmp/meshtasticd | cut -d' ' -f1)" \
     && architecture="$(uname -m)" \
-    && printf '{"firmwareCommit":"%s","collisionPatchSha256":"%s","firmwareBinarySha256":"%s","buildArchitecture":"%s","clientLibraryVersion":"%s","upstreamBaseImageDigest":"%s"}\n' \
+    && printf '{"firmwareCommit":"%s","collisionPatchSha256":"%s","firmwareBinarySha256":"%s","buildArchitecture":"%s","clientLibraryVersion":"%s","upstreamBaseImageDigest":"%s","meshtasticatorCommit":"%s"}\n' \
       "${FIRMWARE_COMMIT}" "${patch_sha256}" "${binary_sha256}" "${architecture}" \
-      "${CLIENT_LIBRARY_VERSION}" "${UPSTREAM_BASE_IMAGE_DIGEST}" \
+      "${CLIENT_LIBRARY_VERSION}" "${UPSTREAM_BASE_IMAGE_DIGEST}" "${MESHTASTICATOR_COMMIT}" \
       > /tmp/capability/build-metadata.json
 
 FROM python:3.13.7-slim-trixie@sha256:5f55cdf0c5d9dc1a415637a5ccc4a9e18663ad203673173b8cda8f8dcacef689 AS runtime

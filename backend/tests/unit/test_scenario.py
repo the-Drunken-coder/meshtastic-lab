@@ -49,6 +49,25 @@ def test_topology_preset_generation(preset: TopologyPreset, enabled: int) -> Non
     assert sum(link.enabled for link in scenario.links) == enabled
 
 
+def test_topology_preset_preserves_link_signal_levels() -> None:
+    scenario = default_scenario(3)
+    custom_links = [
+        link.model_copy(update={"rssi_dbm": -117, "snr_db": -4.5})
+        if link.from_node == "node-1" and link.to_node == "node-2"
+        else link
+        for link in scenario.links
+    ]
+
+    updated = apply_topology_preset(
+        scenario.model_copy(update={"links": custom_links}), TopologyPreset.LINE
+    )
+
+    link = updated.link_map()["node-1", "node-2"]
+    assert link.enabled
+    assert link.rssi_dbm == -117
+    assert link.snr_db == -4.5
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

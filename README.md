@@ -9,10 +9,10 @@ The firmware still creates, encrypts, queues, retries, floods, relays, acknowled
 Requirements are Docker Engine 24 or newer with Compose v2, or current Docker Desktop. Allocate at least 4 CPU cores and 6 GB of memory for a 10-node run.
 
 ```sh
-docker compose up --build
+make dev
 ```
 
-Open <http://127.0.0.1:8080>. The initial image build compiles collision-enabled native firmware from the pinned source commit and can take several minutes. Later builds use Docker’s cache.
+Open <http://127.0.0.1:8080>. `make dev` records the current clean repository commit in the image, then compiles collision-enabled native firmware from the pinned source commit. The initial build can take several minutes; later builds use Docker’s cache.
 
 The application binds only to loopback:
 
@@ -92,7 +92,7 @@ The supported container paths are Linux `amd64` and Linux `arm64`. Docker Deskto
 ## Troubleshooting
 
 - **Start is disabled:** inspect `/api/capabilities`. The image refuses to claim native collision support if its build marker is absent. Rebuild without cache if a partial old image is present.
-- **Startup becomes FAILED:** select the named node and `stderr` in Daemon diagnostics. Startup is all-or-nothing and preserves recent child output.
+- **Startup becomes FAILED:** select the named node and `stderr` in Daemon diagnostics. Startup is all-or-nothing and preserves recent child output. Persisted stdout and stderr each retain one rotated 8 MiB backup.
 - **Client is rejected:** another external client is already attached to that node. Disconnect it or select another node endpoint.
 - **Ports are occupied:** stop another stack or local Meshtastic process using `8080` or `45001` through `45010`. `docker compose down` removes the application container without deleting the result volume.
 - **Warm-up reports missing pairs:** local firmware configuration is the readiness gate. NodeInfo exchange is timed and best effort because hop limits, non-relaying roles, and collisions can make graph-connected pairs unobservable. Missing pairs remain visible in the lifecycle message but do not invalidate a correctly configured simulation.

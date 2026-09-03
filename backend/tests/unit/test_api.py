@@ -42,6 +42,7 @@ def test_simulation_start_rejects_partial_build_provenance(tmp_path: Path) -> No
         buildArchitecture="aarch64",
         clientLibraryVersion="2.7.11",
         upstreamBaseImageDigest="sha256:base",
+        meshtasticatorCommit="simulator",
     )
 
     with TestClient(create_app(service)) as client:

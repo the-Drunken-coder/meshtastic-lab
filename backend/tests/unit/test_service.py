@@ -463,6 +463,7 @@ async def test_process_failure_during_gateway_start_cleans_up_after_start_settle
         buildArchitecture="aarch64",
         clientLibraryVersion="2.7.11",
         upstreamBaseImageDigest="sha256:base",
+        meshtasticatorCommit="simulator",
     )
     gateway_started = asyncio.Event()
     release_gateways = asyncio.Event()
@@ -727,6 +728,7 @@ async def test_stop_cleans_resources_created_by_concurrent_restart(
         buildArchitecture="aarch64",
         clientLibraryVersion="2.7.11",
         upstreamBaseImageDigest="sha256:base",
+        meshtasticatorCommit="simulator",
     )
     service.state = LifecycleState.FAILED
     cleanup_release = asyncio.Event()

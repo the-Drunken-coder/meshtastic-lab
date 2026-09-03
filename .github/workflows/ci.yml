@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: 3.13.7
@@ -42,10 +43,12 @@ jobs:
     env:
       MESHTASTIC_TEST_FIRMWARE_IMAGE: meshtastic-lab:0.1.0
       MESHTASTIC_PRODUCT_IMAGE: meshtastic-lab:0.1.0
+      MESHTASTICATOR_COMMIT: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           python-version: 3.13.7

@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import queue
 import socket
 import subprocess
@@ -188,12 +189,23 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
                 "buildArchitecture",
                 "clientLibraryVersion",
                 "upstreamBaseImageDigest",
+                "meshtasticatorCommit",
             )
             if not capabilities.get("provenanceAvailable") or any(
                 capabilities.get(field) in {None, "", "unavailable"}
                 for field in provenance_fields
             ):
                 raise AcceptanceFailure(f"native build provenance unavailable: {capabilities}")
+            expected_simulator_commit = os.environ.get("MESHTASTICATOR_COMMIT")
+            if (
+                expected_simulator_commit
+                and expected_simulator_commit != "unavailable"
+                and capabilities.get("meshtasticatorCommit") != expected_simulator_commit
+            ):
+                raise AcceptanceFailure(
+                    "native simulator provenance differs from the checked-out revision: "
+                    f"{capabilities.get('meshtasticatorCommit')} != {expected_simulator_commit}"
+                )
 
             step = "load and start three-node relay scenario"
             await client.post("/api/simulation/stop")

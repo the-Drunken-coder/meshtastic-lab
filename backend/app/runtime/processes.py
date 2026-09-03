@@ -12,13 +12,59 @@ from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import TextIO
+from typing import BinaryIO
 
 from backend.app.models import Scenario
 
 LOGGER = logging.getLogger(__name__)
 ProcessFailureHandler = Callable[[str, int | None], Coroutine[object, object, None]]
 OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
+PERSISTED_LOG_MAX_BYTES = 8 * 1024 * 1024
+
+
+class _BoundedLogWriter:
+    """Append daemon output while retaining one size-bounded backup."""
+
+    def __init__(self, path: Path, *, max_bytes: int) -> None:
+        self.path = path
+        self.backup_path = path.with_name(f"{path.name}.1")
+        self.max_bytes = max_bytes
+        self.stream: BinaryIO = path.open("a+b")
+        self.stream.seek(0, 2)
+        self.size = self.stream.tell()
+        if self.size > self.max_bytes:
+            self._trim_existing()
+
+    def write_line(self, text: str) -> None:
+        payload = (text + "\n").encode("utf-8")
+        if len(payload) > self.max_bytes:
+            payload = payload[-self.max_bytes :].decode("utf-8", errors="ignore").encode("utf-8")
+        if self.size and self.size + len(payload) > self.max_bytes:
+            self._rotate()
+        self.stream.write(payload)
+        self.stream.flush()
+        self.size += len(payload)
+
+    def close(self) -> None:
+        self.stream.close()
+
+    def _trim_existing(self) -> None:
+        self.stream.seek(-self.max_bytes, 2)
+        tail = self.stream.read(self.max_bytes)
+        first_newline = tail.find(b"\n")
+        tail = tail[first_newline + 1 :] if first_newline >= 0 else b""
+        self.stream.seek(0)
+        self.stream.truncate()
+        self.stream.write(tail)
+        self.stream.flush()
+        self.size = len(tail)
+
+    def _rotate(self) -> None:
+        self.stream.close()
+        self.backup_path.unlink(missing_ok=True)
+        self.path.replace(self.backup_path)
+        self.stream = self.path.open("a+b")
+        self.size = 0
 
 
 class NodeProcessState(StrEnum):
@@ -64,12 +110,16 @@ class NativeProcessSupervisor:
         data_root: Path = Path("/data/nodes"),
         internal_port_base: int = 46001,
         shutdown_timeout: float = 8.0,
+        log_max_bytes: int = PERSISTED_LOG_MAX_BYTES,
         failure_handler: ProcessFailureHandler | None = None,
     ) -> None:
+        if log_max_bytes <= 0:
+            raise ValueError("log_max_bytes must be positive")
         self.binary_path = binary_path
         self.data_root = data_root
         self.internal_port_base = internal_port_base
         self.shutdown_timeout = shutdown_timeout
+        self.log_max_bytes = log_max_bytes
         self.failure_handler = failure_handler
         self.records: dict[str, ProcessRecord] = {}
         self.archived_logs: dict[str, ArchivedProcessLogs] = {}
@@ -244,9 +294,11 @@ class NativeProcessSupervisor:
         path: Path,
         recent: deque[str],
     ) -> None:
-        output: TextIO | None = None
+        output: _BoundedLogWriter | None = None
         try:
-            output = await asyncio.to_thread(path.open, "a", encoding="utf-8")
+            output = await asyncio.to_thread(
+                _BoundedLogWriter, path, max_bytes=self.log_max_bytes
+            )
         except OSError:
             LOGGER.exception("failed to open firmware log", extra={"path": str(path)})
         try:
@@ -255,7 +307,7 @@ class NativeProcessSupervisor:
                 recent.append(text)
                 if output is not None:
                     try:
-                        await asyncio.to_thread(self._write_output_line, output, text)
+                        await asyncio.to_thread(output.write_line, text)
                     except OSError:
                         LOGGER.exception("failed to persist firmware log", extra={"path": str(path)})
                         with contextlib.suppress(OSError):
@@ -265,11 +317,6 @@ class NativeProcessSupervisor:
             if output is not None:
                 with contextlib.suppress(OSError):
                     await asyncio.to_thread(output.close)
-
-    @staticmethod
-    def _write_output_line(output: TextIO, text: str) -> None:
-        output.write(text + "\n")
-        output.flush()
 
     async def _monitor_exit(self, record: ProcessRecord) -> None:
         if record.process is None:
