@@ -15,6 +15,7 @@ def unavailable_ports(host: str, ports: Iterable[int]) -> list[int]:
     for port in ports:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((host, port))
         except OSError:
             unavailable.append(port)
