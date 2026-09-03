@@ -89,3 +89,18 @@ def mesh_packet_payload_length(packet: mesh_pb2.MeshPacket) -> int:
         data.portnum = compressed.portnum
         data.payload = compressed.data
     return len(data.SerializeToString()) + MESH_PACKET_HEADER_BYTES
+
+
+def mesh_packet_port_number(packet: mesh_pb2.MeshPacket) -> int | None:
+    """Return the application port carried by a decoded RF packet."""
+
+    if packet.WhichOneof("payload_variant") != "decoded":
+        return None
+    if packet.decoded.portnum != portnums_pb2.SIMULATOR_APP:
+        return int(packet.decoded.portnum)
+    compressed = mesh_pb2.Compressed()
+    try:
+        compressed.ParseFromString(packet.decoded.payload)
+    except Exception:
+        return int(portnums_pb2.SIMULATOR_APP)
+    return int(compressed.portnum)

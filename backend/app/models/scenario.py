@@ -7,7 +7,8 @@ import binascii
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from meshtastic.protobuf import config_pb2
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PUBLIC_PORT_MIN = 45001
 PUBLIC_PORT_MAX = 45010
@@ -50,6 +51,15 @@ class RFSettings(BaseModel):
     frequency_slot: Annotated[int, Field(ge=0, le=255)] = Field(default=20, alias="frequencySlot")
     hop_limit: Annotated[int, Field(ge=1, le=7)] = Field(default=4, alias="hopLimit")
     collision_mode: CollisionMode = Field(default=CollisionMode.NATIVE, alias="collisionMode")
+
+    @field_validator("region")
+    @classmethod
+    def validate_region(cls, value: str) -> str:
+        try:
+            config_pb2.Config.LoRaConfig.RegionCode.Value(value)
+        except ValueError as exc:
+            raise ValueError(f"unsupported Meshtastic region: {value}") from exc
+        return value
 
     @model_validator(mode="after")
     def validate_preset(self) -> RFSettings:

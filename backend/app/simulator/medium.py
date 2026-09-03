@@ -10,7 +10,14 @@ from collections.abc import Awaitable, Callable, Mapping
 from meshtastic.protobuf import mesh_pb2
 
 from backend.app.gateway import NodeGateway
-from backend.app.metrics import EventBroker, EventType, PacketEvent, airtime_ms, mesh_packet_payload_length
+from backend.app.metrics import (
+    EventBroker,
+    EventType,
+    PacketEvent,
+    airtime_ms,
+    mesh_packet_payload_length,
+    mesh_packet_port_number,
+)
 from backend.app.models import DirectedLink, Scenario
 
 TransmissionHandler = Callable[[str, mesh_pb2.MeshPacket, int], None]
@@ -117,6 +124,7 @@ class DirectedMedium:
 
         enabled = [link for link in links if link.enabled]
         payload_length = mesh_packet_payload_length(packet)
+        port_number = mesh_packet_port_number(packet)
         packet_airtime = airtime_ms(payload_length, self._scenario.rf.modem_preset)
         self._event_broker.publish(
             PacketEvent(
@@ -126,6 +134,7 @@ class DirectedMedium:
                 intendedDestination=self._destination_node(packet.to),
                 receiverSet=[link.to_node for link in enabled],
                 meshPacketId=packet.id,
+                portNumber=port_number,
                 hopLimit=packet.hop_limit,
                 hopStart=packet.hop_start,
                 packetLength=payload_length,
@@ -156,6 +165,7 @@ class DirectedMedium:
                         transmitter=transmitter,
                         receiver=link.to_node,
                         meshPacketId=packet.id,
+                        portNumber=port_number,
                         result="link-disabled",
                     )
                 )
@@ -219,6 +229,7 @@ class DirectedMedium:
                 transmitter=link.from_node,
                 receiver=link.to_node,
                 meshPacketId=packet.id,
+                portNumber=mesh_packet_port_number(packet),
                 hopLimit=packet.hop_limit,
                 hopStart=packet.hop_start,
                 rssiDbm=link.rssi_dbm,

@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.main import create_app
@@ -38,6 +39,19 @@ def test_scenario_can_change_only_while_stopped(tmp_path: Path) -> None:
 
     assert replaced.status_code == 200
     assert replaced.json()["name"] == "edited"
+
+
+def test_scenario_export_uses_header_safe_unicode_filename(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, collision_marker=tmp_path / "marker")
+    service.scenario = service.scenario.model_copy(update={"name": 'field \"lab\"\n café'})
+
+    with TestClient(create_app(service)) as client:
+        response = client.get("/api/scenario/export")
+
+    disposition = response.headers["content-disposition"]
+    assert response.status_code == 200
+    assert 'filename="scenario.json"' in disposition
+    assert "filename*=UTF-8''field%20%22lab%22%0A%20caf%C3%A9.json" in disposition
 
 
 def test_incomplete_scenario_link_matrix_returns_validation_error(tmp_path: Path) -> None:
@@ -133,6 +147,8 @@ def test_unpersisted_terminal_result_survives_cleanup_and_exports(tmp_path: Path
     first_run_id, second_run_id = asyncio.run(finish_replace_and_cleanup())
     assert service.traffic is None
     assert set(service.completed_runs()) == {first_run_id, second_run_id}
+    current = service.current_traffic_summary()
+    assert current is not None and current.run_id == second_run_id
 
     with TestClient(create_app(service)) as client:
         summary = client.get(f"/api/traffic/runs/{first_run_id}")
@@ -142,3 +158,48 @@ def test_unpersisted_terminal_result_survives_cleanup_and_exports(tmp_path: Path
     assert summary.json()["state"] == "FAILED"
     assert exported.status_code == 200
     assert exported.json()["runId"] == first_run_id
+
+
+def test_persisted_summary_does_not_load_full_message_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = SimulatorService(data_root=tmp_path, collision_marker=tmp_path / "marker")
+    scenario = default_scenario(2)
+
+    class Gateway:
+        async def send_to_radio(self, _message: object, *, source: str) -> None:
+            del source
+
+    controller = TrafficController(
+        scenario=scenario,
+        gateways={node.id: Gateway() for node in scenario.nodes},  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=service.results_root,
+        settle_seconds=0,
+    )
+
+    async def finish() -> str:
+        run_id = controller.start(
+            TrafficRunRequest(
+                sourceNodes=["node-1"],
+                messagesPerMinute=600,
+                durationSeconds=0.01,
+                payloadBytes=64,
+            )
+        )
+        await controller.wait(deadline_seconds=2)
+        return run_id
+
+    run_id = asyncio.run(finish())
+    service.traffic = None
+
+    def full_export_forbidden(_run_id: str) -> object:
+        raise AssertionError("summary endpoint loaded the full export")
+
+    monkeypatch.setattr(service, "traffic_result", full_export_forbidden)
+
+    summary = service.traffic_summary(run_id)
+
+    assert summary.run_id == run_id
+    assert service.completed_runs() == [run_id]

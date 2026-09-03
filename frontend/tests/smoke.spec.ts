@@ -6,6 +6,16 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
   const replaced = await request.put("/api/scenario", { data: lineScenario });
   expect(replaced.ok()).toBeTruthy();
 
+  let initialCapabilitiesFailed = false;
+  await page.route("**/api/capabilities", async (route) => {
+    if (!initialCapabilitiesFailed) {
+      initialCapabilitiesFailed = true;
+      await route.fulfill({ status: 503, json: { error: { message: "temporary failure" } } });
+      return;
+    }
+    await route.continue();
+  });
+
   await page.goto("/");
   await expect(page.getByText("five-node-line", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Start", exact: true }).click();

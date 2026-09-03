@@ -185,6 +185,7 @@ class SimulatorService:
         self.medium: DirectedMedium | None = None
         self.traffic: TrafficController | None = None
         self._volatile_results: dict[str, TrafficRunResult] = {}
+        self._last_traffic_summary: TrafficRunSummary | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._topology_lock = asyncio.Lock()
@@ -226,13 +227,16 @@ class SimulatorService:
 
     async def start(self) -> CommandResult:
         command_id = str(uuid.uuid4())
-        await self._await_failure_cleanup()
+        failure_cleanup_awaited = await self._await_failure_cleanup()
         async with self._lifecycle_lock:
-            await self._await_failure_cleanup()
+            if not failure_cleanup_awaited:
+                failure_cleanup_awaited = await self._await_failure_cleanup()
             if self.state in {LifecycleState.RUNNING, LifecycleState.WARMING_UP}:
                 return CommandResult(commandId=command_id, state=self.state, detail="already running")
             if self.state not in {LifecycleState.STOPPED, LifecycleState.FAILED}:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", f"cannot start from {self.state}")
+            if self.state == LifecycleState.FAILED and not failure_cleanup_awaited:
+                await self._cleanup_resources()
             capabilities = self.capabilities()
             if not capabilities.collision_available:
                 raise SimulationConflict(
@@ -370,6 +374,11 @@ class SimulatorService:
             if self.state != LifecycleState.RUNNING or self.medium is None:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", "runtime links require RUNNING state")
             existing = self.scenario.link_map().get((link.from_node, link.to_node))
+            if existing is None:
+                raise SimulationConflict(
+                    "UNKNOWN_LINK",
+                    f"unknown directed link: {link.from_node} -> {link.to_node}",
+                )
             if existing == link:
                 return link
             try:
@@ -468,11 +477,25 @@ class SimulatorService:
                 summary = self.traffic.summary()
                 if summary is not None:
                     return summary
+        summary_path = self.results_root / f"{run_id}.summary.json"
+        if summary_path.is_file():
+            return TrafficRunSummary.model_validate_json(summary_path.read_text(encoding="utf-8"))
         return summarize_result(self.traffic_result(run_id))
+
+    def current_traffic_summary(self) -> TrafficRunSummary | None:
+        if self.traffic is not None:
+            summary = self.traffic.summary()
+            if summary is not None:
+                return summary
+        return self._last_traffic_summary
 
     def completed_runs(self) -> list[str]:
         persisted = (
-            {path.stem for path in self.results_root.glob("*.json")}
+            {
+                path.stem
+                for path in self.results_root.glob("*.json")
+                if not path.name.endswith(".summary.json")
+            }
             if self.results_root.is_dir()
             else set()
         )
@@ -633,6 +656,9 @@ class SimulatorService:
                     self.traffic.record_failed_receptions(
                         node_id, telemetry.local_stats.num_packets_rx_bad
                     )
+                    self.traffic.record_duplicate_receptions(
+                        node_id, telemetry.local_stats.num_rx_dupe
+                    )
                 if telemetry.local_stats.num_packets_rx_bad > previous_bad:
                     self.event_broker.publish(
                         PacketEvent(
@@ -656,7 +682,7 @@ class SimulatorService:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.local_stats_deadline_seconds
 
-        async def sample_node(node_id: str) -> int | None:
+        async def sample_node(node_id: str) -> tuple[int, int] | None:
             expected_packet_ids: set[int] = set()
 
             def response_arrived() -> bool:
@@ -695,18 +721,26 @@ class SimulatorService:
                                 self._local_stats_condition.wait_for(response_arrived),
                                 timeout=wait_seconds,
                             )
-                        return self.node_metrics[node_id].rx_bad
+                        metrics = self.node_metrics[node_id]
+                        return metrics.rx_bad, metrics.rx_duplicate
                     except TimeoutError:
                         pass
 
         values = await asyncio.gather(*(sample_node(node_id) for node_id in node_ids))
         totals = {
-            node_id: value
+            node_id: value[0]
+            for node_id, value in zip(node_ids, values, strict=True)
+            if value is not None
+        }
+        duplicate_totals = {
+            node_id: value[1]
             for node_id, value in zip(node_ids, values, strict=True)
             if value is not None
         }
         missing = tuple(node_id for node_id in node_ids if node_id not in totals)
-        return FailedReceptionSample(totals=totals, missing_nodes=missing)
+        return FailedReceptionSample(
+            totals=totals, duplicate_totals=duplicate_totals, missing_nodes=missing
+        )
 
     def _local_stats_request(self, node_id: str) -> mesh_pb2.ToRadio:
         telemetry = telemetry_pb2.Telemetry()
@@ -798,9 +832,14 @@ class SimulatorService:
         task = self._failure_cleanup_task
         if task is None or task is asyncio.current_task():
             return False
-        await asyncio.shield(task)
-        if self._failure_cleanup_task is task:
-            self._failure_cleanup_task = None
+        try:
+            await asyncio.shield(task)
+        except Exception:
+            LOGGER.exception("failed simulation cleanup did not complete")
+            return False
+        finally:
+            if self._failure_cleanup_task is task:
+                self._failure_cleanup_task = None
         return True
 
     async def _cleanup_resources(self) -> None:
@@ -814,6 +853,7 @@ class SimulatorService:
             await asyncio.gather(lag_task, return_exceptions=True)
         if self.traffic is not None:
             await self.traffic.stop()
+            self._last_traffic_summary = self.traffic.summary()
             self._archive_unpersisted_traffic_result()
         if self.medium is not None:
             await self.medium.stop()

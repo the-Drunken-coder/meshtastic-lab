@@ -75,6 +75,26 @@ const defaultTraffic: TrafficRequest = {
   seed: 1,
 };
 
+function mergeEvents(current: PacketEvent[], incoming: PacketEvent[]): PacketEvent[] {
+  const sequenced = new Map<number, PacketEvent>();
+  const unsequenced: PacketEvent[] = [];
+  for (const event of [...current, ...incoming]) {
+    if (event.sequence > 0) sequenced.set(event.sequence, event);
+    else unsequenced.push(event);
+  }
+  return [...unsequenced, ...sequenced.values()]
+    .sort((left, right) => left.sequence - right.sequence)
+    .slice(-500);
+}
+
+function trafficDraftForScenario(current: TrafficRequest, nextScenario: Scenario): TrafficRequest {
+  return {
+    ...current,
+    sourceNodes: [nextScenario.nodes[0]?.id ?? "node-1"],
+    fixedDestination: nextScenario.nodes[1]?.id,
+  };
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return `${error.code}: ${error.message}`;
   return error instanceof Error ? error.message : "Unexpected request failure";
@@ -156,33 +176,39 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    Promise.all([
-      api.capabilities(),
-      api.lifecycle(),
-      api.scenario(),
-      api.nodes(),
-      api.events(),
-      api.traffic(),
-    ])
-      .then(([nextCapability, nextLifecycle, nextScenario, nextNodes, nextEvents, nextTraffic]) => {
-        if (!active) return;
-        setCapability(nextCapability);
-        setLifecycle(nextLifecycle);
-        setScenario(nextScenario);
-        setSavedScenario(nextScenario);
-        setNodes(nextNodes);
-        setEvents(nextEvents);
-        setTraffic(nextTraffic);
-        setTrafficDraft((current) => ({
-          ...current,
-          sourceNodes: [nextScenario.nodes[0]?.id ?? "node-1"],
-          fixedDestination: nextScenario.nodes[1]?.id,
-        }));
-      })
-      .catch((error: unknown) => active && setNotice({ tone: "bad", text: errorMessage(error) }))
-      .finally(() => active && setLoading(false));
+    let retryTimer: number | undefined;
+    const loadInitialState = () => {
+      Promise.all([
+        api.capabilities(),
+        api.lifecycle(),
+        api.scenario(),
+        api.nodes(),
+        api.events(),
+        api.traffic(),
+      ])
+        .then(([nextCapability, nextLifecycle, nextScenario, nextNodes, nextEvents, nextTraffic]) => {
+          if (!active) return;
+          setCapability(nextCapability);
+          setLifecycle(nextLifecycle);
+          setScenario(nextScenario);
+          setSavedScenario(nextScenario);
+          setNodes(nextNodes);
+          setEvents((current) => mergeEvents(current, nextEvents));
+          setTraffic(nextTraffic);
+          setTrafficDraft((current) => trafficDraftForScenario(current, nextScenario));
+          setNotice(null);
+          setLoading(false);
+        })
+        .catch((error: unknown) => {
+          if (!active) return;
+          setNotice({ tone: "bad", text: errorMessage(error) });
+          retryTimer = window.setTimeout(loadInitialState, 1500);
+        });
+    };
+    loadInitialState();
     return () => {
       active = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
   }, []);
 
@@ -205,7 +231,7 @@ function App() {
       socket.addEventListener("open", () => setStreamConnected(true));
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as PacketEvent;
-        setEvents((current) => [...current, event].slice(-500));
+        setEvents((current) => mergeEvents(current, [event]));
       });
       socket.addEventListener("close", () => {
         setStreamConnected(false);
@@ -283,6 +309,7 @@ function App() {
         const updated = await api.scenario();
         setScenario(updated);
         setSavedScenario(updated);
+        setTrafficDraft((current) => trafficDraftForScenario(current, updated));
       }
     });
   };

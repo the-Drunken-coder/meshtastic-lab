@@ -16,8 +16,8 @@ from backend.app.models import (
     apply_topology_preset,
     default_scenario,
 )
-from backend.app.runtime import ProcessRecord
-from backend.app.simulator import LifecycleState, SimulatorService
+from backend.app.runtime import NativeProcessSupervisor, ProcessRecord
+from backend.app.simulator import LifecycleState, SimulationConflict, SimulatorService
 from backend.app.traffic import TrafficController, TrafficRunRequest
 
 
@@ -125,6 +125,22 @@ async def test_runtime_link_snapshot_is_atomic_with_traffic_start(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_unknown_runtime_link_returns_structured_conflict(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.scenario = default_scenario(2)
+    service.state = LifecycleState.RUNNING
+    service.medium = FakeMedium()  # type: ignore[assignment]
+
+    unknown = DirectedLink.model_validate(
+        {"from": "node-1", "to": "deleted-node", "enabled": False}
+    )
+    with pytest.raises(SimulationConflict) as raised:
+        await service.update_link(unknown)
+
+    assert raised.value.code == "UNKNOWN_LINK"
+
+
+@pytest.mark.asyncio
 async def test_traffic_stop_waits_for_started_topology_update(tmp_path: Path) -> None:
     service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
     service.scenario = default_scenario(2)
@@ -223,9 +239,10 @@ async def test_local_stats_sampler_waits_for_fresh_per_node_responses(tmp_path: 
     }  # type: ignore[assignment]
 
     class StatsGateway:
-        def __init__(self, node_id: str, rx_bad: int) -> None:
+        def __init__(self, node_id: str, rx_bad: int, rx_duplicate: int) -> None:
             self.node_id = node_id
             self.rx_bad = rx_bad
+            self.rx_duplicate = rx_duplicate
             self.requests: list[mesh_pb2.ToRadio] = []
             self.reply_task: asyncio.Task[None] | None = None
 
@@ -248,20 +265,22 @@ async def test_local_stats_sampler_waits_for_fresh_per_node_responses(tmp_path: 
                 response.packet.decoded.request_id = request.packet.id
                 telemetry = service_module.telemetry_pb2.Telemetry()
                 telemetry.local_stats.num_packets_rx_bad = self.rx_bad
+                telemetry.local_stats.num_rx_dupe = self.rx_duplicate
                 response.packet.decoded.payload = telemetry.SerializeToString()
                 await service._on_from_radio(self.node_id, response)
 
             self.reply_task = asyncio.create_task(reply())
 
     gateways = {
-        "node-1": StatsGateway("node-1", 3),
-        "node-2": StatsGateway("node-2", 5),
+        "node-1": StatsGateway("node-1", 3, 2),
+        "node-2": StatsGateway("node-2", 5, 4),
     }
     service.gateways = gateways  # type: ignore[assignment]
 
     result = await service._sample_local_stats()
 
     assert result.totals == {"node-1": 3, "node-2": 5}
+    assert result.duplicate_totals == {"node-1": 2, "node-2": 4}
     assert result.missing_nodes == ()
     for gateway in gateways.values():
         packet = gateway.requests[0].packet
@@ -343,6 +362,59 @@ async def test_stop_waits_for_in_flight_failure_cleanup(tmp_path: Path) -> None:
 
     assert result.state == LifecycleState.STOPPED
     assert service._failure_cleanup_task is None
+
+
+@pytest.mark.asyncio
+async def test_stop_retries_cleanup_after_failure_task_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.state = LifecycleState.FAILED
+    cleanup_called = asyncio.Event()
+
+    async def failed_cleanup() -> None:
+        raise RuntimeError("cleanup failed")
+
+    async def retry_cleanup() -> None:
+        cleanup_called.set()
+
+    service._failure_cleanup_task = asyncio.create_task(failed_cleanup())
+    monkeypatch.setattr(service, "_cleanup_resources", retry_cleanup)
+
+    result = await service.stop()
+
+    assert result.state == LifecycleState.STOPPED
+    assert cleanup_called.is_set()
+    assert service._failure_cleanup_task is None
+
+
+@pytest.mark.asyncio
+async def test_supervisor_stop_waits_for_process_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "meshtasticd"
+    binary.write_text("test binary", encoding="utf-8")
+    supervisor = NativeProcessSupervisor(binary_path=binary, data_root=tmp_path / "nodes")
+    allocation_started = asyncio.Event()
+    release_allocation = asyncio.Event()
+
+    async def start_one(_record: ProcessRecord, *, erase: bool) -> None:
+        del erase
+        allocation_started.set()
+        await release_allocation.wait()
+
+    monkeypatch.setattr(supervisor, "_start_one", start_one)
+    start_task = asyncio.create_task(supervisor.start(default_scenario(2)))
+    await allocation_started.wait()
+    stop_task = asyncio.create_task(supervisor.stop())
+    await asyncio.sleep(0)
+
+    assert not stop_task.done()
+    release_allocation.set()
+    await start_task
+    await stop_task
+
+    assert supervisor.records == {}
 
 
 @pytest.mark.asyncio

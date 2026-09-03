@@ -66,7 +66,7 @@ Use **Export scenario** in the UI or `GET /api/scenario/export` to save the curr
 - Relay TX counts transmissions where the transmitting firmware did not originate the packet.
 - Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it.
 - ACK success is separate from destination delivery. It applies only to firmware-accepted direct messages because firmware disables acknowledgments for broadcasts. Percentiles remain unavailable until their configured sample minimum is met.
-- Failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. A partial sample keeps the run exportable and sets `failedReceptionMetricsComplete` to false with the missing nodes listed in `missingLocalStatsNodes`. Collision results are labeled `native` only in the collision-enabled image.
+- Duplicate and failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. A partial sample keeps the run exportable and sets `failedReceptionMetricsComplete` to false with the missing nodes listed in `missingLocalStatsNodes`. Collision results are labeled `native` only in the collision-enabled image.
 
 See [fidelity](docs/fidelity.md) for exact boundaries.
 

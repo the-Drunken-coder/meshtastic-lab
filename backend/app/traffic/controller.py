@@ -10,7 +10,7 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
@@ -31,6 +31,7 @@ from backend.app.metrics import (
     calculate_metrics,
     maximum_retransmission_delay_ms,
     mesh_packet_payload_length,
+    mesh_packet_port_number,
 )
 from backend.app.models import DirectedLink, Scenario
 from backend.app.provenance import BuildMetadata
@@ -50,6 +51,7 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class FailedReceptionSample:
     totals: Mapping[str, int]
+    duplicate_totals: Mapping[str, int] = field(default_factory=dict)
     missing_nodes: tuple[str, ...] = ()
 
 
@@ -271,6 +273,7 @@ class TrafficController:
         self._duplicates = 0
         self._failed_receptions = 0
         self._latest_failed_receptions: dict[str, int] = {}
+        self._latest_duplicate_receptions: dict[str, int] = {}
         self._drop_reasons: list[str] = []
         self._drop_counts: Counter[str] = Counter()
         self._event_loop_lag_ms: float | None = None
@@ -313,6 +316,7 @@ class TrafficController:
         self._reset_accumulators()
         baseline = self._normalize_failed_reception_sample(failed_reception_baseline)
         self._latest_failed_receptions.update(baseline.totals)
+        self._latest_duplicate_receptions.update(baseline.duplicate_totals)
         self._run_scenario = snapshot
         expected_stats_nodes = {node.id for node in snapshot.nodes}
         missing_stats_nodes = set(baseline.missing_nodes)
@@ -489,6 +493,19 @@ class TrafficController:
             return
         self._failed_receptions += max(0, total - previous)
 
+    def record_duplicate_receptions(self, node_id: str, total: int) -> None:
+        if self.current is None or self.state not in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+            TrafficRunState.FAILED,
+        }:
+            return
+        previous = self._latest_duplicate_receptions.get(node_id)
+        self._latest_duplicate_receptions[node_id] = total
+        if previous is None:
+            return
+        self._duplicates += max(0, total - previous)
+
     def ensure_topology_change_capacity(self, additional_changes: int) -> None:
         if self.current is None or self.state not in {
             TrafficRunState.RUNNING,
@@ -547,7 +564,8 @@ class TrafficController:
                 return
             sequence = generated.sequence
             if node_id in generated.delivered_to:
-                self._duplicates += 1
+                if self.failed_reception_sampler is None:
+                    self._duplicates += 1
                 return
             generated.delivered_to.append(node_id)
             self._receiver_deliveries += 1
@@ -566,6 +584,7 @@ class TrafficController:
                     meshPacketId=packet.id,
                     trafficRunId=self.current.run_id,
                     trafficSequence=sequence,
+                    portNumber=int(portnums_pb2.TEXT_MESSAGE_APP),
                     result="delivered",
                 )
             )
@@ -618,6 +637,7 @@ class TrafficController:
                     meshPacketId=packet.decoded.request_id,
                     trafficRunId=self.current.run_id,
                     trafficSequence=generated.sequence,
+                    portNumber=int(portnums_pb2.ROUTING_APP),
                     result=result,
                 )
             )
@@ -649,6 +669,7 @@ class TrafficController:
                 meshPacketId=generated.packet_id,
                 trafficRunId=self.current.run_id,
                 trafficSequence=generated.sequence,
+                portNumber=int(portnums_pb2.TEXT_MESSAGE_APP),
                 result="submission-failed",
                 detail=reason,
             )
@@ -810,6 +831,7 @@ class TrafficController:
                 meshPacketId=generated.packet_id,
                 trafficRunId=self.current.run_id,
                 trafficSequence=generated.sequence,
+                portNumber=int(portnums_pb2.TEXT_MESSAGE_APP),
                 result=result,
                 detail=error,
             )
@@ -965,12 +987,22 @@ class TrafficController:
         try:
             self.results_root.mkdir(parents=True, exist_ok=True)
             destination = self.results_root / f"{frozen.run_id}.json"
+            summary_destination = self.results_root / f"{frozen.run_id}.summary.json"
             temporary = destination.with_suffix(".tmp")
+            summary_temporary = summary_destination.with_suffix(".tmp")
             temporary.write_text(
                 json.dumps(frozen.model_dump(mode="json", by_alias=True), indent=2) + "\n",
                 encoding="utf-8",
             )
+            summary_temporary.write_text(
+                json.dumps(
+                    summarize_result(frozen).model_dump(mode="json", by_alias=True), indent=2
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             temporary.replace(destination)
+            summary_temporary.replace(summary_destination)
         except Exception as exc:
             self.state = TrafficRunState.FAILED
             current.state = TrafficRunState.FAILED
@@ -1088,10 +1120,14 @@ class TrafficController:
             raise ValueError(f"unknown traffic sources: {sorted(unknown_sources)}")
         if len(set(request.source_nodes)) != len(request.source_nodes):
             raise ValueError("traffic source nodes must be unique")
-        if request.fixed_destination is not None:
+        if (
+            request.kind == TrafficKind.DIRECT_TEXT
+            and request.destination_strategy == DestinationStrategy.FIXED
+            and request.fixed_destination is not None
+        ):
             if request.fixed_destination not in known:
                 raise ValueError(f"unknown fixed destination: {request.fixed_destination}")
-            if request.kind == TrafficKind.DIRECT_TEXT and request.fixed_destination in request.source_nodes:
+            if request.fixed_destination in request.source_nodes:
                 raise ValueError("direct traffic destination cannot be one of its source nodes")
 
     @staticmethod
@@ -1147,6 +1183,9 @@ class TrafficController:
                 missing.add(node_id)
                 continue
             self.record_failed_receptions(node_id, total)
+        for node_id, total in sample.duplicate_totals.items():
+            if node_id in self._latest_duplicate_receptions:
+                self.record_duplicate_receptions(node_id, total)
         expected = {node.id for node in self._run_scenario.nodes}
         missing.update(expected - set(sample.totals))
         self.current.missing_local_stats_nodes = sorted(missing)
@@ -1192,6 +1231,13 @@ class TrafficController:
     def _message_for_packet_identity(
         self, packet: mesh_pb2.MeshPacket
     ) -> GeneratedMessage | None:
+        if (
+            mesh_packet_port_number(packet) == portnums_pb2.ROUTING_APP
+            and packet.decoded.request_id
+        ):
+            response = self._messages_by_packet.get((int(packet.to), packet.decoded.request_id))
+            if response is not None:
+                return response
         return self._messages_by_packet.get((self._packet_origin(packet), packet.id))
 
     def _correlated_delivery_message(
@@ -1257,6 +1303,7 @@ class TrafficController:
         self._duplicates = 0
         self._failed_receptions = 0
         self._latest_failed_receptions.clear()
+        self._latest_duplicate_receptions.clear()
         self._drop_reasons.clear()
         self._drop_counts.clear()
         self._event_loop_lag_ms = None

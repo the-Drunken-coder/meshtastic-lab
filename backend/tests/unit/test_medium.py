@@ -63,6 +63,11 @@ async def test_asymmetric_medium_injects_only_enabled_direction() -> None:
     assert gateways["node-2"].injected[0].rx_rssi == -85
     assert gateways["node-1"].injected == []
     assert sum(event.event_type == EventType.RF_TRANSMIT for event in broker.recent()) == 2
+    assert all(
+        event.port_number == portnums_pb2.TEXT_MESSAGE_APP
+        for event in broker.recent()
+        if event.event_type in {EventType.RF_TRANSMIT, EventType.LINK_DISABLED, EventType.RX_INJECTED}
+    )
 
 
 @pytest.mark.asyncio

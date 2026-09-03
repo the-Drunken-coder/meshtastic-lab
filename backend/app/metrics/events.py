@@ -63,6 +63,8 @@ class EventSubscription:
             self.queue.put_nowait(event)
         except asyncio.QueueFull:
             self.dropped += 1
+            self.queue.get_nowait()
+            self.queue.put_nowait(event)
 
     async def next(self) -> PacketEvent:
         if self.dropped:

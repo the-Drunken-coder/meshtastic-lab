@@ -79,6 +79,7 @@ async def test_deterministic_traffic_schedule_and_persistence(tmp_path: Path) ->
         108967520,
     ]
     assert (tmp_path / f"{run_id}.json").is_file()
+    assert (tmp_path / f"{run_id}.summary.json").is_file()
 
 
 def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:
@@ -138,6 +139,22 @@ def _rf_packet(
     packet = mesh_pb2.MeshPacket(id=packet_id)
     setattr(packet, "from", origin)
     packet.decoded.portnum = portnums_pb2.SIMULATOR_APP
+    packet.decoded.payload = compressed.SerializeToString()
+    return packet
+
+
+def _routing_rf_packet(
+    *, request_id: int, packet_id: int, origin: int, destination: int
+) -> mesh_pb2.MeshPacket:
+    routing = mesh_pb2.Routing(error_reason=mesh_pb2.Routing.Error.NONE)
+    compressed = mesh_pb2.Compressed(
+        portnum=portnums_pb2.ROUTING_APP,
+        data=routing.SerializeToString(),
+    )
+    packet = mesh_pb2.MeshPacket(id=packet_id, to=destination)
+    setattr(packet, "from", origin)
+    packet.decoded.portnum = portnums_pb2.SIMULATOR_APP
+    packet.decoded.request_id = request_id
     packet.decoded.payload = compressed.SerializeToString()
     return packet
 
@@ -551,6 +568,99 @@ async def test_payload_checks_largest_sequence_and_rejects_source_destination(tm
     )
     with pytest.raises(ValueError, match="one of its source nodes"):
         controller.start(direct)
+
+    stale_destination = TrafficRunRequest(
+        kind=TrafficKind.DIRECT_TEXT,
+        sourceNodes=["node-1"],
+        destinationStrategy=DestinationStrategy.ROUND_ROBIN,
+        fixedDestination="deleted-node",
+        payloadBytes=64,
+    )
+    controller.start(stale_destination)
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_duplicate_counter_is_measured_from_explicit_baseline(tmp_path: Path) -> None:
+    async def sample_local_stats() -> FailedReceptionSample:
+        return FailedReceptionSample(
+            totals={"node-1": 0, "node-2": 0, "node-3": 0},
+            duplicate_totals={"node-1": 1, "node-2": 5, "node-3": 2},
+        )
+
+    selected = default_scenario(3)
+    controller = TrafficController(
+        scenario=selected,
+        gateways={node.id: FakeGateway(node.id) for node in selected.nodes},  # type: ignore[arg-type]
+        hardware_ids={node.id: index for index, node in enumerate(selected.nodes, start=1)},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0,
+        failed_reception_sampler=sample_local_stats,
+    )
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        ),
+        failed_reception_baseline=FailedReceptionSample(
+            totals={"node-1": 0, "node-2": 0, "node-3": 0},
+            duplicate_totals={"node-1": 0, "node-2": 2, "node-3": 2},
+        ),
+    )
+
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.metrics.duplicate_receptions == 4
+
+
+@pytest.mark.asyncio
+async def test_routing_ack_rf_frames_are_correlated_with_original_message(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    run_id = controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1"],
+            fixedDestination="node-3",
+            messagesPerMinute=0.1,
+            durationSeconds=1,
+            payloadBytes=64,
+        )
+    )
+
+    class FixedRandom:
+        def randrange(self, _start: int, _stop: int) -> int:
+            return 7
+
+    await controller._submit("node-1", "node-3", FixedRandom())  # type: ignore[arg-type]
+    controller.record_rf_transmission(
+        "node-1", _rf_packet(run_id=run_id, sequence=1, packet_id=7, origin=1), 10
+    )
+    acknowledgment = _routing_rf_packet(
+        request_id=7,
+        packet_id=91,
+        origin=3,
+        destination=1,
+    )
+    controller.record_rf_transmission("node-3", acknowledgment, 5)
+    controller.record_rf_transmission("node-2", acknowledgment, 5)
+    controller.record_drop("node-2", acknowledgment, "link-disabled")
+    await controller.stop()
+
+    result = controller.result()
+    assert result is not None
+    assert result.transmitted == 1
+    assert result.metrics.rf_transmissions == 3
+    assert result.metrics.relay_transmissions == 1
+    assert result.metrics.observed_airtime_ms == 20
+    assert result.metrics.per_node_transmit_counts == {
+        "node-1": 1,
+        "node-2": 1,
+        "node-3": 1,
+    }
+    assert result.metrics.drops_by_reason == {"link-disabled": 1}
 
 
 @pytest.mark.asyncio

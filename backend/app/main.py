@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -109,7 +110,10 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
         return JSONResponse(
             content=simulator.scenario.model_dump(mode="json", by_alias=True),
             headers={
-                "Content-Disposition": f'attachment; filename="{simulator.scenario.name}.json"'
+                "Content-Disposition": (
+                    "attachment; filename=\"scenario.json\"; "
+                    f"filename*=UTF-8''{quote(f'{simulator.scenario.name}.json', safe='')}"
+                )
             },
         )
 
@@ -168,7 +172,7 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
         "/api/traffic/runs/current", response_model=TrafficRunSummary | IdleTraffic
     )
     async def current_traffic() -> TrafficRunSummary | IdleTraffic:
-        summary = simulator.traffic.summary() if simulator.traffic is not None else None
+        summary = simulator.current_traffic_summary()
         return summary or IdleTraffic()
 
     @app.get("/api/traffic/runs")

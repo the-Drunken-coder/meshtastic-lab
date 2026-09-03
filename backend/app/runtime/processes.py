@@ -74,8 +74,13 @@ class NativeProcessSupervisor:
         self.records: dict[str, ProcessRecord] = {}
         self.archived_logs: dict[str, ArchivedProcessLogs] = {}
         self._stopping = False
+        self._lifecycle_lock = asyncio.Lock()
 
     async def start(self, scenario: Scenario) -> Mapping[str, ProcessRecord]:
+        async with self._lifecycle_lock:
+            return await self._start_unlocked(scenario)
+
+    async def _start_unlocked(self, scenario: Scenario) -> Mapping[str, ProcessRecord]:
         if self.records:
             raise RuntimeError("firmware processes are already allocated")
         self.clear_archived_logs()
@@ -90,11 +95,15 @@ class NativeProcessSupervisor:
                 self.records[node.id] = record
                 await self._start_one(record, erase=scenario.fresh_state)
         except Exception:
-            await self.stop()
+            await self._stop_unlocked()
             raise
         return self.records
 
     async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self) -> None:
         if not self.records:
             return
         self._stopping = True

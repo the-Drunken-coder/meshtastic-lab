@@ -75,6 +75,14 @@ def test_duplicate_directed_link_is_rejected() -> None:
         Scenario.model_validate(data)
 
 
+def test_unknown_meshtastic_region_is_rejected_at_scenario_boundary() -> None:
+    data = default_scenario(2).model_dump(by_alias=True)
+    data["rf"]["region"] = "NOT_A_REGION"
+
+    with pytest.raises(ValidationError, match="unsupported Meshtastic region"):
+        Scenario.model_validate(data)
+
+
 @pytest.mark.parametrize("node_count", [2, 3])
 def test_incomplete_directed_link_matrix_is_rejected(node_count: int) -> None:
     data = default_scenario(node_count).model_dump(by_alias=True)

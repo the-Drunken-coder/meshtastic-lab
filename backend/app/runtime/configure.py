@@ -228,11 +228,15 @@ def _verify(
         "channel_name": channel.name,
         "channel_psk": channel.key_bytes(),
     }
-    differences = {
-        key: {"expected": expected[key], "actual": actual[key]}
-        for key in expected
-        if actual[key] != expected[key]
-    }
+    differences = {}
+    for key in expected:
+        if actual[key] == expected[key]:
+            continue
+        differences[key] = (
+            {"expected": "<redacted>", "actual": "<redacted>"}
+            if key == "channel_psk"
+            else {"expected": expected[key], "actual": actual[key]}
+        )
     if differences:
         raise NodeConfigurationError(f"{node.id} configuration verification failed: {differences}")
 

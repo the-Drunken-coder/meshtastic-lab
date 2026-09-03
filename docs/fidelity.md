@@ -48,7 +48,7 @@ airtime = Tpreamble + payloadSymbols × Tsymbol
 
 The packet length is recovered from the actual firmware-created simulated frame. Encrypted packets count ciphertext plus the 16-byte mesh header. Decoded simulator wrappers are unwrapped before measuring. Tests cover every supported modem preset and reference values taken from the upstream function.
 
-One RF transmitter event contributes airtime once, regardless of receiver count. Receiver delivery, duplicate reception, goodput, raw packet size, RF transmissions, relay transmissions, and per-node transmit airtime remain distinct measures.
+One RF transmitter event contributes airtime once, regardless of receiver count. Duplicate reception counts come from firmware `num_rx_dupe` deltas. Receiver delivery, goodput, raw packet size, RF transmissions, relay transmissions, and per-node transmit airtime remain distinct measures.
 
 After the final request, traffic enters a bounded drain phase. Direct runs wait for each firmware-accepted message to deliver and, when requested, acknowledge or return a routing error. Broadcast runs wait for correlated activity to remain quiet. Quiet and absolute deadlines derive from the largest generated packet airtime, hop limit, and the pinned firmware's origin and intermediate retry budgets, including contention and processing delay, with a hard upper bound.
 

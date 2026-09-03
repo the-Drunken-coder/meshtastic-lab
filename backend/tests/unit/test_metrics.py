@@ -13,6 +13,7 @@ from backend.app.metrics import (
     calculate_metrics,
     maximum_retransmission_delay_ms,
     mesh_packet_payload_length,
+    mesh_packet_port_number,
     percentile,
 )
 
@@ -49,6 +50,7 @@ def test_simulator_wrapper_is_not_counted_as_extra_airtime() -> None:
     original = mesh_pb2.Data(portnum=portnums_pb2.TEXT_MESSAGE_APP, payload=b"hello")
 
     assert mesh_packet_payload_length(wrapped) == len(original.SerializeToString()) + 16
+    assert mesh_packet_port_number(wrapped) == portnums_pb2.TEXT_MESSAGE_APP
 
 
 def test_percentiles_are_unavailable_with_too_few_samples() -> None:
@@ -99,8 +101,10 @@ async def test_bounded_event_subscription_reports_drops() -> None:
                 )
             )
         dropped = await asyncio.wait_for(subscription.next(), timeout=1)
+        latest = await asyncio.wait_for(subscription.next(), timeout=1)
 
     assert dropped.event_type == EventType.UI_EVENTS_DROPPED
     assert dropped.detail == "2 UI events dropped because the client was slow"
+    assert latest.mesh_packet_id == 2
     assert broker.history_evictions == 1
     assert [event.mesh_packet_id for event in broker.recent()] == [1, 2]
