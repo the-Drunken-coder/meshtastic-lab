@@ -128,7 +128,19 @@ def listeners_closed(ports: list[int]) -> None:
         except OSError:
             continue
         with probe:
-            occupied.append(port)
+            probe.settimeout(0.5)
+            try:
+                probe.sendall(b"\x94\xc3\x00\x00")
+                if probe.recv(1) != b"":
+                    occupied.append(port)
+            except TimeoutError:
+                # Docker can accept a published-port connection briefly after
+                # the container listener closes, but then confirms that close
+                # with EOF or a reset. A timeout confirms neither and therefore
+                # still represents a live, silent gateway listener.
+                occupied.append(port)
+            except OSError:
+                continue
     if occupied:
         raise AcceptanceFailure(f"public listeners remained open after stop: {occupied}")
 
