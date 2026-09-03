@@ -120,14 +120,6 @@ class TrafficRunRequest(BaseModel):
         if self.kind == TrafficKind.DIRECT_TEXT:
             if self.destination_strategy == DestinationStrategy.FIXED and self.fixed_destination is None:
                 raise ValueError("fixedDestination is required for fixed direct traffic")
-        scheduled = len(self.source_nodes) * _messages_per_source(
-            duration_seconds=self.duration_seconds,
-            messages_per_minute=self.messages_per_minute,
-        )
-        if scheduled > MAX_TRAFFIC_MESSAGES_PER_RUN:
-            raise ValueError(
-                f"traffic run cannot schedule more than {MAX_TRAFFIC_MESSAGES_PER_RUN} messages"
-            )
         return self
 
 
@@ -337,6 +329,10 @@ class TrafficController:
         run_id = str(uuid.uuid4())
         snapshot = (scenario_snapshot or self.scenario).model_copy(deep=True)
         max_sequence = self._maximum_sequence(request)
+        if max_sequence > MAX_TRAFFIC_MESSAGES_PER_RUN:
+            raise ValueError(
+                f"traffic run cannot schedule more than {MAX_TRAFFIC_MESSAGES_PER_RUN} messages"
+            )
         marker_size = len(f"{TRAFFIC_PREFIX}:{run_id}:{max_sequence}:")
         if request.payload_bytes < marker_size:
             raise ValueError(

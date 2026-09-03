@@ -152,6 +152,7 @@ export type TrafficResult = IdleTrafficResult | TrafficRunSummary;
 
 export interface PacketEvent {
   schemaVersion: 1;
+  streamId: string;
   sequence: number;
   utcTimestamp: string;
   monotonicSeconds: number;
@@ -177,6 +178,8 @@ export interface PacketEvent {
 
 export interface EventHistoryPage {
   schemaVersion: 1;
+  streamId: string;
+  streamChanged: boolean;
   events: PacketEvent[];
   firstAvailableSequence: number | null;
   latestSequence: number;

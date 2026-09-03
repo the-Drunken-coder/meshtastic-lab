@@ -115,7 +115,7 @@ def test_metrics_count_airtime_once_per_transmitter() -> None:
 
 
 def test_event_history_reports_expired_cursor_and_version() -> None:
-    broker = EventBroker(history_size=2)
+    broker = EventBroker(history_size=2, stream_id="stream-a")
     for packet_id in range(4):
         broker.publish(
             PacketEvent(
@@ -128,12 +128,37 @@ def test_event_history_reports_expired_cursor_and_version() -> None:
     page = broker.history_page(after_sequence=1, limit=1)
 
     assert page.schema_version == 1
+    assert page.stream_id == "stream-a"
+    assert page.stream_changed is False
     assert page.first_available_sequence == 3
     assert page.latest_sequence == 4
     assert page.history_gap is True
     assert page.has_more is True
     assert [event.sequence for event in page.events] == [3]
     assert page.events[0].model_dump(by_alias=True)["schemaVersion"] == 1
+    assert page.events[0].stream_id == "stream-a"
+
+
+def test_event_history_restarts_replay_for_a_different_stream() -> None:
+    broker = EventBroker(history_size=2, stream_id="current-stream")
+    for packet_id in range(2):
+        broker.publish(
+            PacketEvent(
+                monotonicSeconds=float(packet_id),
+                eventType=EventType.RF_TRANSMIT,
+                meshPacketId=packet_id,
+            )
+        )
+
+    page = broker.history_page(
+        after_sequence=5000,
+        stream_id="previous-stream",
+    )
+
+    assert page.stream_id == "current-stream"
+    assert page.stream_changed is True
+    assert page.history_gap is False
+    assert [event.sequence for event in page.events] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -152,6 +177,7 @@ async def test_bounded_event_subscription_reports_drops() -> None:
         latest = await asyncio.wait_for(subscription.next(), timeout=1)
 
     assert dropped.event_type == EventType.UI_EVENTS_DROPPED
+    assert dropped.stream_id == broker.stream_id
     assert dropped.detail == "2 UI events dropped because the client was slow"
     assert latest.mesh_packet_id == 2
     assert broker.history_evictions == 1

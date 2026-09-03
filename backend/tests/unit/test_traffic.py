@@ -19,6 +19,8 @@ from backend.app.traffic import (
     TrafficRunRequest,
     TrafficRunResult,
     TrafficRunState,
+    TrafficRunSummary,
+    summarize_result,
 )
 
 
@@ -705,6 +707,37 @@ async def test_legacy_result_provenance_is_migrated_without_invention(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_persisted_results_keep_pre_cap_long_requests_readable(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=0.1,
+            durationSeconds=1,
+            payloadBytes=64,
+        )
+    )
+    await controller.stop()
+    result = controller.result()
+    assert result is not None
+
+    result_data = result.model_dump(mode="python", by_alias=True)
+    summary_data = summarize_result(result).model_dump(mode="python", by_alias=True)
+    for data in (result_data, summary_data):
+        data.pop("schemaVersion")
+        request_data = data["request"]
+        assert isinstance(request_data, dict)
+        request_data["messagesPerMinute"] = 600
+        request_data["durationSeconds"] = 3600
+
+    loaded_result = TrafficRunResult.model_validate(result_data)
+    loaded_summary = TrafficRunSummary.model_validate(summary_data)
+
+    assert loaded_result.request.duration_seconds == 3600
+    assert loaded_summary.request.duration_seconds == 3600
+
+
+@pytest.mark.asyncio
 async def test_payload_checks_largest_sequence_and_rejects_source_destination(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     request = TrafficRunRequest(
@@ -740,14 +773,16 @@ async def test_payload_checks_largest_sequence_and_rejects_source_destination(tm
     await controller.stop()
 
 
-def test_traffic_request_caps_total_scheduled_messages() -> None:
+def test_traffic_start_caps_total_scheduled_messages(tmp_path: Path) -> None:
+    request = TrafficRunRequest(
+        sourceNodes=["node-1"],
+        messagesPerMinute=600,
+        durationSeconds=1001,
+        payloadBytes=64,
+    )
+
     with pytest.raises(ValueError, match="cannot schedule more than 10000 messages"):
-        TrafficRunRequest(
-            sourceNodes=["node-1"],
-            messagesPerMinute=600,
-            durationSeconds=1001,
-            payloadBytes=64,
-        )
+        _controller(tmp_path).start(request)
 
 
 @pytest.mark.asyncio

@@ -188,6 +188,7 @@ function App() {
   const [trafficDraft, setTrafficDraft] = useState<TrafficRequest>(defaultTraffic);
   const [events, setEvents] = useState<PacketEvent[]>([]);
   const latestEventSequence = useRef(0);
+  const eventStreamId = useRef<string | null>(null);
   const [streamConnected, setStreamConnected] = useState(false);
   const [nodeFilter, setNodeFilter] = useState("");
   const [eventFilter, setEventFilter] = useState("");
@@ -204,12 +205,18 @@ function App() {
     setScenarioEditor({ draft: nextScenario, saved: nextScenario });
   }, []);
 
-  const acceptEvents = useCallback((incoming: PacketEvent[]) => {
+  const acceptEvents = useCallback((incoming: PacketEvent[], streamId?: string) => {
+    const incomingStreamId = streamId ?? incoming[0]?.streamId;
+    if (!incomingStreamId) return;
     setEvents((current) => {
-      const merged = mergeEvents(current, incoming);
+      const streamChanged =
+        eventStreamId.current !== null && eventStreamId.current !== incomingStreamId;
+      eventStreamId.current = incomingStreamId;
+      const matchingEvents = incoming.filter((event) => event.streamId === incomingStreamId);
+      const merged = mergeEvents(streamChanged ? [] : current, matchingEvents);
       latestEventSequence.current = merged.reduce(
         (latest, event) => Math.max(latest, event.sequence),
-        latestEventSequence.current,
+        0,
       );
       return merged;
     });
@@ -260,7 +267,7 @@ function App() {
           setLifecycle(nextLifecycle);
           acceptScenario(nextScenario);
           setNodes(nextNodes);
-          acceptEvents(eventHistory.events);
+          acceptEvents(eventHistory.events, eventHistory.streamId);
           setTraffic(nextTraffic);
           setTrafficDraft((current) => trafficDraftForScenario(current, nextScenario));
           setNotice(null);
@@ -306,15 +313,19 @@ function App() {
     let socket: WebSocket | undefined;
     const connect = () => {
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const query = new URLSearchParams({
+        afterSequence: String(latestEventSequence.current),
+      });
+      if (eventStreamId.current) query.set("streamId", eventStreamId.current);
       socket = new WebSocket(
-        `${protocol}://${window.location.host}/api/events/ws?afterSequence=${latestEventSequence.current}`,
+        `${protocol}://${window.location.host}/api/events/ws?${query}`,
       );
       socket.addEventListener("open", () => {
         setStreamConnected(true);
       });
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as PacketEvent;
-        acceptEvents([event]);
+        acceptEvents([event], event.streamId);
         if (event.eventType === "ui_events_dropped") {
           refreshCore().catch(() => undefined);
         }

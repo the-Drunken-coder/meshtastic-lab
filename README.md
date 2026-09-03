@@ -6,7 +6,7 @@ The firmware still creates, encrypts, queues, retries, floods, relays, acknowled
 
 ## Start
 
-Requirements are Docker Engine 24 or newer with Compose v2, or current Docker Desktop. Allocate at least 4 CPU cores and 6 GB of memory for a 10-node run.
+Requirements are Docker Engine 24 or newer with Compose v2, or current Docker Desktop. The `make dev` port preflight needs Python 3.13; the direct Compose path below does not. Allocate at least 4 CPU cores and 6 GB of memory for a 10-node run.
 
 ```sh
 make dev
@@ -66,7 +66,7 @@ curl -X PUT http://127.0.0.1:8080/api/scenario \
 
 Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. A request may schedule at most 10,000 messages, with at most 600 messages per minute per source and a one-hour duration. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
 
-Packet events and traffic-result exports use `schemaVersion: 1`. Reconnecting event clients pass their last sequence to `/api/events/ws?afterSequence=<n>`. The server replays retained events after that cursor and reports a history gap when the cursor predates the 5,000-event buffer. The UI refreshes the authoritative lifecycle, scenario, node, and traffic snapshots after any drop notice.
+Packet events and traffic-result exports use `schemaVersion: 1`. Packet cursors pair a per-process `streamId` with the event sequence. Reconnecting clients send both values to `/api/events/ws`; the server replays retained events after the cursor. A changed stream clears the old client history before replay, while an expired sequence reports a history gap. The UI refreshes the authoritative lifecycle, scenario, node, and traffic snapshots after any drop notice.
 
 ## Metrics
 

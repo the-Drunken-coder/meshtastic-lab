@@ -7,7 +7,7 @@ require-source-revision:
 	@test -n "$(MESHTASTICATOR_COMMIT)" || { echo "Commit or stash local changes before building a provenance-bearing image." >&2; exit 1; }
 
 preflight:
-	UV_CACHE_DIR=.uv-cache uv run python scripts/preflight.py
+	python3 scripts/preflight.py
 
 dev: require-source-revision preflight
 	docker compose up --build

@@ -216,16 +216,25 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
     async def event_history(
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=5000)] = 5000,
+        stream_id: Annotated[
+            str | None,
+            Query(alias="streamId", min_length=1, max_length=64),
+        ] = None,
     ) -> EventHistoryPage:
         return simulator.event_broker.history_page(
             after_sequence=after_sequence,
             limit=limit,
+            stream_id=stream_id,
         )
 
     @app.websocket("/api/events/ws")
     async def event_stream(
         websocket: WebSocket,
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
+        stream_id: Annotated[
+            str | None,
+            Query(alias="streamId", min_length=1, max_length=64),
+        ] = None,
     ) -> None:
         await websocket.accept()
         try:
@@ -233,9 +242,22 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
                 history = simulator.event_broker.history_page(
                     after_sequence=after_sequence,
                     limit=5000,
+                    stream_id=stream_id,
                 )
-                if history.history_gap:
+                if history.stream_changed:
+                    reset_notice = PacketEvent(
+                        streamId=history.stream_id,
+                        monotonicSeconds=asyncio.get_running_loop().time(),
+                        eventType=EventType.UI_EVENTS_DROPPED,
+                        result="stream-reset",
+                        detail="the event stream restarted; replaying retained history",
+                    )
+                    await websocket.send_json(
+                        reset_notice.model_dump(mode="json", by_alias=True)
+                    )
+                elif history.history_gap:
                     gap_notice = PacketEvent(
+                        streamId=history.stream_id,
                         monotonicSeconds=asyncio.get_running_loop().time(),
                         eventType=EventType.UI_EVENTS_DROPPED,
                         result="history-gap",
