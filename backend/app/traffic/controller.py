@@ -672,7 +672,7 @@ class TrafficController:
                     monotonicSeconds=time.monotonic(),
                     eventType=event_type,
                     receiver=node_id,
-                    meshPacketId=packet.decoded.request_id,
+                    meshPacketId=packet.id,
                     trafficRunId=self.current.run_id,
                     trafficSequence=generated.sequence,
                     portNumber=int(portnums_pb2.ROUTING_APP),

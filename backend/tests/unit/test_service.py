@@ -36,8 +36,9 @@ class FakeGateway:
 
 
 class FakeMedium:
-    def __init__(self) -> None:
+    def __init__(self, scenario: Scenario) -> None:
         self.links: list[DirectedLink] = []
+        self._links = scenario.link_map()
 
     async def update_link(self, link: DirectedLink) -> PacketEvent:
         self.links.append(link)
@@ -50,17 +51,36 @@ class FakeMedium:
             result="enabled" if link.enabled else "disabled",
         )
 
+    async def apply_links(self, links: list[DirectedLink]) -> list[PacketEvent]:
+        replacement = {(link.from_node, link.to_node): link for link in links}
+        changed = [link for key, link in replacement.items() if self._links[key] != link]
+        self._links = replacement
+        events: list[PacketEvent] = []
+        for link in changed:
+            self.links.append(link)
+            events.append(
+                PacketEvent(
+                    sequence=len(self.links),
+                    monotonicSeconds=float(len(self.links)),
+                    eventType=EventType.LINK_UPDATED,
+                    transmitter=link.from_node,
+                    receiver=link.to_node,
+                    result="enabled" if link.enabled else "disabled",
+                )
+            )
+        return events
+
 
 class BlockingMedium(FakeMedium):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, scenario: Scenario) -> None:
+        super().__init__(scenario)
         self.update_started = asyncio.Event()
         self.release_update = asyncio.Event()
 
-    async def update_link(self, link: DirectedLink) -> PacketEvent:
+    async def apply_links(self, links: list[DirectedLink]) -> list[PacketEvent]:
         self.update_started.set()
         await self.release_update.wait()
-        return await super().update_link(link)
+        return await super().apply_links(links)
 
 
 class WarmupGateway:
@@ -93,7 +113,7 @@ async def test_runtime_link_snapshot_is_atomic_with_traffic_start(tmp_path: Path
     service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
     service.scenario = default_scenario(2)
     service.state = LifecycleState.RUNNING
-    medium = FakeMedium()
+    medium = FakeMedium(service.scenario)
     service.medium = medium  # type: ignore[assignment]
     gateways = {node.id: FakeGateway() for node in service.scenario.nodes}
     service.traffic = TrafficController(
@@ -261,7 +281,7 @@ async def test_unknown_runtime_link_returns_structured_conflict(tmp_path: Path) 
     service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
     service.scenario = default_scenario(2)
     service.state = LifecycleState.RUNNING
-    service.medium = FakeMedium()  # type: ignore[assignment]
+    service.medium = FakeMedium(service.scenario)  # type: ignore[assignment]
 
     unknown = DirectedLink.model_validate(
         {"from": "node-1", "to": "deleted-node", "enabled": False}
@@ -273,11 +293,74 @@ async def test_unknown_runtime_link_returns_structured_conflict(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_runtime_link_batch_is_atomic_when_history_capacity_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.scenario = default_scenario(2)
+    service.state = LifecycleState.RUNNING
+    medium = FakeMedium(service.scenario)
+    service.medium = medium  # type: ignore[assignment]
+
+    class OneRemainingChange:
+        def ensure_topology_change_capacity(self, additional_changes: int) -> None:
+            if additional_changes > 1:
+                raise RuntimeError("only one topology change remains")
+
+    service.traffic = OneRemainingChange()  # type: ignore[assignment]
+    updates = [
+        link.model_copy(update={"enabled": False}) for link in service.scenario.links
+    ]
+
+    with pytest.raises(SimulationConflict) as raised:
+        await service.update_links(updates)
+
+    assert raised.value.code == "TOPOLOGY_HISTORY_FULL"
+    assert all(link.enabled for link in service.scenario.links)
+    assert medium.links == []
+
+    service.traffic = None
+    assert await service.update_links(updates) == updates
+    assert not any(link.enabled for link in service.scenario.links)
+    assert medium.links == updates
+
+
+def test_new_traffic_controller_does_not_expose_previous_simulation_summary(
+    tmp_path: Path,
+) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service._last_traffic_summary = SimpleNamespace(run_id="previous")  # type: ignore[assignment]
+    service.traffic = SimpleNamespace(summary=lambda: None)  # type: ignore[assignment]
+
+    assert service.current_traffic_summary() is None
+
+
+def test_persisted_result_is_not_cloned_for_volatile_archive(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    run_id = "persisted-run"
+    service.results_root.mkdir(parents=True)
+    (service.results_root / f"{run_id}.json").write_text("{}", encoding="utf-8")
+
+    def clone_forbidden() -> object:
+        raise AssertionError("persisted result was cloned")
+
+    service.traffic = SimpleNamespace(
+        current=SimpleNamespace(run_id=run_id),
+        result_is_finalized=lambda _run_id: True,
+        result=clone_forbidden,
+    )  # type: ignore[assignment]
+
+    service._archive_unpersisted_traffic_result()
+
+    assert service._volatile_results == {}
+
+
+@pytest.mark.asyncio
 async def test_traffic_stop_waits_for_started_topology_update(tmp_path: Path) -> None:
     service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
     service.scenario = default_scenario(2)
     service.state = LifecycleState.RUNNING
-    medium = BlockingMedium()
+    medium = BlockingMedium(service.scenario)
     service.medium = medium  # type: ignore[assignment]
     service.traffic = TrafficController(
         scenario=service.scenario,

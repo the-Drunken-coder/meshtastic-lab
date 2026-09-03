@@ -300,6 +300,7 @@ async def test_same_packet_id_from_different_sources_keeps_ack_correlation(tmp_p
     )
 
     acknowledgment = mesh_pb2.FromRadio()
+    acknowledgment.packet.id = 91
     setattr(acknowledgment.packet, "from", 3)
     acknowledgment.packet.decoded.portnum = portnums_pb2.ROUTING_APP
     acknowledgment.packet.decoded.request_id = 7
@@ -310,6 +311,13 @@ async def test_same_packet_id_from_different_sources_keeps_ack_correlation(tmp_p
 
     assert first.acknowledged
     assert not second.acknowledged
+    acknowledgment_event = next(
+        event
+        for event in controller.event_broker.recent()
+        if event.event_type == EventType.ACKNOWLEDGMENT
+    )
+    assert acknowledgment_event.mesh_packet_id == 91
+    assert acknowledgment_event.traffic_sequence == first.sequence
     await controller.stop()
 
 

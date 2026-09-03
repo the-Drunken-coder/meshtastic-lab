@@ -56,6 +56,8 @@ class RFSettings(BaseModel):
     @field_validator("region")
     @classmethod
     def validate_region(cls, value: str) -> str:
+        if value == "UNSET":
+            raise ValueError("Meshtastic region must be set")
         try:
             config_pb2.Config.LoRaConfig.RegionCode.Value(value)
         except ValueError as exc:

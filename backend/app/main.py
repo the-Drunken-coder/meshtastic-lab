@@ -151,6 +151,10 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
     async def update_link(link: DirectedLink) -> DirectedLink:
         return await simulator.update_link(link)
 
+    @app.put("/api/links/batch", response_model=list[DirectedLink])
+    async def update_links(links: list[DirectedLink]) -> list[DirectedLink]:
+        return await simulator.update_links(links)
+
     @app.post("/api/topology", response_model=Scenario)
     async def apply_topology(request: TopologyRequest) -> Scenario:
         return await simulator.apply_topology(request.preset)

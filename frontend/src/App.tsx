@@ -318,17 +318,22 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    api.logs(logNode, logStream)
-      .then((nextLogs) => {
-        if (active) setLogs(nextLogs);
-      })
-      .catch(() => {
-        if (active) setLogs(null);
-      });
+    const refreshLogs = () => {
+      api.logs(logNode, logStream)
+        .then((nextLogs) => {
+          if (active) setLogs(nextLogs);
+        })
+        .catch(() => {
+          if (active) setLogs(null);
+        });
+    };
+    refreshLogs();
+    const timer = window.setInterval(refreshLogs, 1500);
     return () => {
       active = false;
+      window.clearInterval(timer);
     };
-  }, [lifecycle?.state, logNode, logStream]);
+  }, [logNode, logStream]);
 
   const stopped = lifecycle?.state === "STOPPED";
   const running = lifecycle?.state === "RUNNING";
@@ -428,7 +433,7 @@ function App() {
     ];
     void perform(`link-${link.from}-${link.to}`, async () => {
       if (running) {
-        await Promise.all(nextLinks.map((nextLink) => api.updateLink(nextLink)));
+        await api.updateLinks(nextLinks);
         const updated = await api.scenario();
         acceptScenario(updated);
       } else if (stopped) {
@@ -488,6 +493,12 @@ function App() {
       <main className="loading-shell" aria-busy="true">
         <h1>Meshtastic Lab</h1>
         <p>Loading simulator state and native capability…</p>
+        {notice && (
+          <div className={`global-notice notice-${notice.tone}`} role="alert">
+            <span>{notice.text}</span>
+            <button className="quiet" onClick={() => setNotice(null)} aria-label="Dismiss notice">Dismiss</button>
+          </div>
+        )}
         <div className="loading-lines" aria-hidden="true"><i /><i /><i /></div>
       </main>
     );

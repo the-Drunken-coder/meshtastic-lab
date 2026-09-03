@@ -391,33 +391,30 @@ class SimulatorService:
         return self.scenario
 
     async def update_link(self, link: DirectedLink) -> DirectedLink:
+        return (await self.update_links([link]))[0]
+
+    async def update_links(self, updates: list[DirectedLink]) -> list[DirectedLink]:
+        if not updates:
+            raise SimulationConflict("INVALID_LINK_UPDATE", "at least one link update is required")
+        update_map = {(link.from_node, link.to_node): link for link in updates}
+        if len(update_map) != len(updates):
+            raise SimulationConflict("INVALID_LINK_UPDATE", "link updates must be unique")
         async with self._topology_lock:
             if self.state != LifecycleState.RUNNING or self.medium is None:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", "runtime links require RUNNING state")
-            existing = self.scenario.link_map().get((link.from_node, link.to_node))
-            if existing is None:
+            existing = self.scenario.link_map()
+            unknown = next((key for key in update_map if key not in existing), None)
+            if unknown is not None:
                 raise SimulationConflict(
                     "UNKNOWN_LINK",
-                    f"unknown directed link: {link.from_node} -> {link.to_node}",
+                    f"unknown directed link: {unknown[0]} -> {unknown[1]}",
                 )
-            if existing == link:
-                return link
-            try:
-                if self.traffic is not None:
-                    self.traffic.ensure_topology_change_capacity(1)
-            except RuntimeError as exc:
-                raise SimulationConflict("TOPOLOGY_HISTORY_FULL", str(exc)) from exc
-            event = await self.medium.update_link(link)
             links = [
-                link
-                if (current.from_node, current.to_node) == (link.from_node, link.to_node)
-                else current
+                update_map.get((current.from_node, current.to_node), current)
                 for current in self.scenario.links
             ]
-            self.scenario = self.scenario.model_copy(update={"links": links})
-            if self.traffic is not None:
-                self.traffic.record_topology_change(event, link)
-            return link
+            await self._apply_runtime_scenario(self.scenario.model_copy(update={"links": links}))
+            return updates
 
     async def apply_topology(self, preset: TopologyPreset) -> Scenario:
         async with self._topology_lock:
@@ -429,23 +426,26 @@ class SimulatorService:
                 raise SimulationConflict(
                     "INVALID_LIFECYCLE_STATE", f"cannot apply topology from {self.state}"
                 )
-            previous = self.scenario.link_map()
-            changed = [
-                link
-                for link in updated.links
-                if previous[(link.from_node, link.to_node)] != link
-            ]
-            try:
-                if self.traffic is not None:
-                    self.traffic.ensure_topology_change_capacity(len(changed))
-            except RuntimeError as exc:
-                raise SimulationConflict("TOPOLOGY_HISTORY_FULL", str(exc)) from exc
-            events = await self.medium.apply_links(updated.links)
-            self.scenario = updated
-            if self.traffic is not None:
-                for event, link in zip(events, changed, strict=True):
-                    self.traffic.record_topology_change(event, link)
+            await self._apply_runtime_scenario(updated)
             return updated
+
+    async def _apply_runtime_scenario(self, updated: Scenario) -> None:
+        if self.medium is None:
+            raise RuntimeError("runtime medium is unavailable")
+        previous = self.scenario.link_map()
+        changed = [
+            link for link in updated.links if previous[(link.from_node, link.to_node)] != link
+        ]
+        try:
+            if self.traffic is not None:
+                self.traffic.ensure_topology_change_capacity(len(changed))
+        except RuntimeError as exc:
+            raise SimulationConflict("TOPOLOGY_HISTORY_FULL", str(exc)) from exc
+        events = await self.medium.apply_links(updated.links)
+        self.scenario = updated
+        if self.traffic is not None:
+            for event, link in zip(events, changed, strict=True):
+                self.traffic.record_topology_change(event, link)
 
     async def start_traffic(self, request: TrafficRunRequest) -> str:
         async with self._topology_lock:
@@ -521,9 +521,7 @@ class SimulatorService:
 
     def current_traffic_summary(self) -> TrafficRunSummary | None:
         if self.traffic is not None:
-            summary = self.traffic.summary()
-            if summary is not None:
-                return summary
+            return self.traffic.summary()
         return self._last_traffic_summary
 
     def completed_runs(self) -> list[str]:
@@ -539,14 +537,15 @@ class SimulatorService:
         return sorted(persisted | self._volatile_results.keys())
 
     def _archive_unpersisted_traffic_result(self) -> None:
-        if self.traffic is None:
+        if self.traffic is None or self.traffic.current is None:
+            return
+        run_id = self.traffic.current.run_id
+        if not self.traffic.result_is_finalized(run_id):
+            return
+        if (self.results_root / f"{run_id}.json").is_file():
             return
         result = self.traffic.result()
-        if (
-            result is None
-            or result.finished_at is None
-            or (self.results_root / f"{result.run_id}.json").is_file()
-        ):
+        if result is None or result.finished_at is None:
             return
         self._volatile_results[result.run_id] = result
         while len(self._volatile_results) > MAX_VOLATILE_RESULTS:

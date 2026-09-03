@@ -61,6 +61,11 @@ export const api = {
     request<Scenario>("/api/scenario", { method: "PUT", body: JSON.stringify(scenario) }),
   updateLink: (link: DirectedLink) =>
     request<DirectedLink>("/api/links", { method: "PUT", body: JSON.stringify(link) }),
+  updateLinks: (links: DirectedLink[]) =>
+    request<DirectedLink[]>("/api/links/batch", {
+      method: "PUT",
+      body: JSON.stringify(links),
+    }),
   applyTopology: (preset: TopologyPreset) => post<Scenario>("/api/topology", { preset }),
   start: () => post<Lifecycle>("/api/simulation/start"),
   stop: () => post<Lifecycle>("/api/simulation/stop"),
