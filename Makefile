@@ -1,12 +1,15 @@
 MESHTASTICATOR_COMMIT ?= $(shell test -z "$$(git status --porcelain)" && git rev-parse HEAD)
 export MESHTASTICATOR_COMMIT
 
-.PHONY: dev test lint gateway-spike integration-test acceptance browser-smoke clean require-source-revision
+.PHONY: dev test lint gateway-spike integration-test acceptance browser-smoke clean preflight require-source-revision
 
 require-source-revision:
 	@test -n "$(MESHTASTICATOR_COMMIT)" || { echo "Commit or stash local changes before building a provenance-bearing image." >&2; exit 1; }
 
-dev: require-source-revision
+preflight:
+	python3 scripts/preflight.py
+
+dev: require-source-revision preflight
 	docker compose up --build
 
 test:

@@ -947,6 +947,28 @@ async def test_archived_process_logs_survive_cleanup_until_reset(tmp_path: Path)
         "fatal detail",
         "final buffered detail",
     ]
+    service.results_root.mkdir()
+    saved_result = service.results_root / "saved.json"
+    saved_result.write_text("{}\n", encoding="utf-8")
+    service.scenario = service.scenario.model_copy(update={"name": "edited"})
 
-    await service.reset()
+    result = await service.reset()
+
+    assert result.detail == "Scenario reset to the five-node full mesh; saved runs were preserved"
+    assert service.scenario.name == "five-node-full-mesh"
     assert not service.supervisor.has_logs("node-1")
+    assert saved_result.read_text(encoding="utf-8") == "{}\n"
+
+
+@pytest.mark.asyncio
+async def test_reset_waits_for_lifecycle_lock(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    await service._lifecycle_lock.acquire()
+    reset_task = asyncio.create_task(service.reset())
+    await asyncio.sleep(0)
+
+    assert not reset_task.done()
+    service._lifecycle_lock.release()
+    result = await reset_task
+
+    assert result.state == LifecycleState.STOPPED

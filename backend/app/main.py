@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.logging_config import configure_logging
-from backend.app.metrics import EventType
+from backend.app.metrics import EventHistoryPage, EventType, PacketEvent
 from backend.app.models import DirectedLink, Scenario, TopologyPreset
 from backend.app.simulator import SimulationConflict, SimulatorService
 from backend.app.traffic import TrafficRunRequest, TrafficRunState, TrafficRunSummary
@@ -212,11 +212,65 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
             limit=limit, node_id=node_id, event_type=event_type
         )
 
+    @app.get("/api/events/history", response_model=EventHistoryPage)
+    async def event_history(
+        after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=5000)] = 5000,
+        stream_id: Annotated[
+            str | None,
+            Query(alias="streamId", min_length=1, max_length=64),
+        ] = None,
+    ) -> EventHistoryPage:
+        return simulator.event_broker.history_page(
+            after_sequence=after_sequence,
+            limit=limit,
+            stream_id=stream_id,
+        )
+
     @app.websocket("/api/events/ws")
-    async def event_stream(websocket: WebSocket) -> None:
+    async def event_stream(
+        websocket: WebSocket,
+        after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
+        stream_id: Annotated[
+            str | None,
+            Query(alias="streamId", min_length=1, max_length=64),
+        ] = None,
+    ) -> None:
         await websocket.accept()
         try:
             async with simulator.event_broker.subscribe() as subscription:
+                history = simulator.event_broker.history_page(
+                    after_sequence=after_sequence,
+                    limit=5000,
+                    stream_id=stream_id,
+                )
+                if history.stream_changed:
+                    reset_notice = PacketEvent(
+                        streamId=history.stream_id,
+                        monotonicSeconds=asyncio.get_running_loop().time(),
+                        eventType=EventType.UI_EVENTS_DROPPED,
+                        result="stream-reset",
+                        detail="the event stream restarted; replaying retained history",
+                    )
+                    await websocket.send_json(
+                        reset_notice.model_dump(mode="json", by_alias=True)
+                    )
+                elif history.history_gap:
+                    gap_notice = PacketEvent(
+                        streamId=history.stream_id,
+                        monotonicSeconds=asyncio.get_running_loop().time(),
+                        eventType=EventType.UI_EVENTS_DROPPED,
+                        result="history-gap",
+                        detail=(
+                            f"event history before sequence {history.first_available_sequence} "
+                            "is no longer available"
+                        ),
+                    )
+                    await websocket.send_json(
+                        gap_notice.model_dump(mode="json", by_alias=True)
+                    )
+                for event in history.events:
+                    await websocket.send_json(event.model_dump(mode="json", by_alias=True))
                 while True:
                     event_task = asyncio.create_task(subscription.next())
                     receive_task = asyncio.create_task(websocket.receive())
@@ -233,6 +287,8 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
                             return
                     if event_task in done:
                         event = event_task.result()
+                        if event.sequence and event.sequence <= history.latest_sequence:
+                            continue
                         await websocket.send_json(event.model_dump(mode="json", by_alias=True))
         except WebSocketDisconnect:
             return

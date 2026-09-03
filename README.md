@@ -6,13 +6,13 @@ The firmware still creates, encrypts, queues, retries, floods, relays, acknowled
 
 ## Start
 
-Requirements are Docker Engine 24 or newer with Compose v2, or current Docker Desktop. Allocate at least 4 CPU cores and 6 GB of memory for a 10-node run.
+Requirements are Docker Engine 24 or newer with Compose v2, or current Docker Desktop. The `make dev` port preflight needs Python 3.13; the direct Compose path below does not. Allocate at least 4 CPU cores and 6 GB of memory for a 10-node run.
 
 ```sh
 make dev
 ```
 
-Open <http://127.0.0.1:8080>. `make dev` records the current clean repository commit in the image, then compiles collision-enabled native firmware from the pinned source commit. The initial build can take several minutes; later builds use Docker’s cache.
+Open <http://127.0.0.1:8080>. `make dev` first checks the fixed loopback ports, records the current clean repository commit in the image, then compiles collision-enabled native firmware from the pinned source commit. The initial build can take several minutes; later builds use Docker’s cache.
 
 For direct Compose use, start from a clean checkout and supply its revision explicitly. The image build rejects a missing or malformed revision instead of creating a runtime that cannot start:
 
@@ -29,6 +29,8 @@ The application binds only to loopback:
 | Virtual nodes 2 through 10 | `127.0.0.1:45002` through `127.0.0.1:45010` |
 
 Internal daemon ports `46001` through `46010` are never published.
+
+The host and container port numbers are intentionally one-to-one. A scenario's `apiPort` is the public node port in the container and on the host. Exported scenarios do not carry a separate host-port mapping.
 
 ## Connect a normal Meshtastic client
 
@@ -52,7 +54,7 @@ V1 permits one external client per node. A second client to that same node is re
 
 ## Scenarios and runs
 
-Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running, including during traffic runs. Completed exports keep the starting scenario and an ordered timeline of changes made during the run.
+Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. Reset is also stopped-only. It restores the five-node full-mesh scenario and clears archived in-memory daemon logs. It does not delete completed run files. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running, including during traffic runs. Completed exports keep the starting scenario and an ordered timeline of changes made during the run.
 
 The checked-in JSON scenarios under `scenarios/` are valid API payloads. To load one without the UI:
 
@@ -62,7 +64,9 @@ curl -X PUT http://127.0.0.1:8080/api/scenario \
   --data-binary @scenarios/five-node-line.json
 ```
 
-Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
+Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. A request may schedule at most 10,000 messages, with at most 600 messages per minute per source and a one-hour duration. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
+
+Packet events and traffic-result exports use `schemaVersion: 1`. Packet cursors pair a per-process `streamId` with the event sequence. Reconnecting clients send both values to `/api/events/ws`; the server replays retained events after the cursor. A changed stream clears the old client history before replay, while an expired sequence reports a history gap. The UI refreshes the authoritative lifecycle, scenario, node, and traffic snapshots after any drop notice.
 
 ## Metrics
 
