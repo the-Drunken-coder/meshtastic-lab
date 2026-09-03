@@ -571,6 +571,33 @@ async def test_persistence_failure_returns_failed_result(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_partial_persistence_failure_removes_completed_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    replace = Path.replace
+
+    def fail_summary_commit(source: Path, target: Path) -> Path:
+        if source.name.endswith(".summary.tmp"):
+            raise OSError("summary commit failed")
+        return replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", fail_summary_commit)
+    run_id = controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"], messagesPerMinute=600, durationSeconds=0.01
+        )
+    )
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.state == TrafficRunState.FAILED
+    assert not (tmp_path / f"{run_id}.json").exists()
+    assert not (tmp_path / f"{run_id}.summary.json").exists()
+    assert not (tmp_path / f"{run_id}.tmp").exists()
+    assert not (tmp_path / f"{run_id}.summary.tmp").exists()
+
+
+@pytest.mark.asyncio
 async def test_legacy_result_provenance_is_migrated_without_invention(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     request = TrafficRunRequest(
@@ -942,7 +969,9 @@ async def test_missing_final_local_stats_do_not_fail_run(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_long_slow_direct_delivery_after_three_seconds_is_included(tmp_path: Path) -> None:
+async def test_direct_drain_includes_rf_activity_after_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     scenario = default_scenario(2)
     scenario = scenario.model_copy(
         deep=True,
@@ -958,6 +987,7 @@ async def test_long_slow_direct_delivery_after_three_seconds_is_included(tmp_pat
     )
     for gateway in gateways.values():
         gateway.controller = controller
+    monkeypatch.setattr(controller, "_drain_windows", lambda: (0.05, 0.5))
     run_id = controller.start(
         TrafficRunRequest(
             kind=TrafficKind.DIRECT_TEXT,
@@ -970,9 +1000,8 @@ async def test_long_slow_direct_delivery_after_three_seconds_is_included(tmp_pat
         )
     )
 
-    async def deliver_after_old_settle_window() -> None:
+    async def deliver_then_relay() -> None:
         await gateways["node-1"].sent_event.wait()
-        await asyncio.sleep(3.1)
         assert controller.current is not None
         generated = controller.current.generated_messages[0]
         await controller.handle_from_radio(
@@ -984,15 +1013,27 @@ async def test_long_slow_direct_delivery_after_three_seconds_is_included(tmp_pat
                 origin=1,
             ),
         )
+        await asyncio.sleep(0.01)
+        controller.record_rf_transmission(
+            "node-2",
+            _rf_packet(
+                run_id=run_id,
+                sequence=generated.sequence,
+                packet_id=generated.packet_id,
+                origin=1,
+            ),
+            17,
+        )
 
-    delivery = asyncio.create_task(deliver_after_old_settle_window())
-    result = await controller.wait(deadline_seconds=5)
+    delivery = asyncio.create_task(deliver_then_relay())
+    result = await controller.wait(deadline_seconds=1)
     await delivery
 
     assert result.state == TrafficRunState.COMPLETED
     assert result.delivered == 1
+    assert result.metrics.rf_transmissions == 1
+    assert result.metrics.observed_airtime_ms == 17
     assert controller.settle_seconds is None
-    assert controller._drain_windows()[0] > 3
 
 
 @pytest.mark.asyncio

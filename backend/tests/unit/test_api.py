@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from backend.app.main import create_app
 from backend.app.metrics import EventBroker
 from backend.app.models import default_scenario
+from backend.app.provenance import BuildMetadata
 from backend.app.runtime import ProcessRecord
 from backend.app.simulator import LifecycleState, SimulatorService
 from backend.app.traffic import TrafficController, TrafficRunRequest
@@ -28,6 +29,28 @@ def test_health_scenario_and_structured_collision_failure(tmp_path: Path) -> Non
     assert scenario.json()["nodeCount"] == 5
     assert start.status_code == 409
     assert start.json()["error"]["code"] == "NATIVE_COLLISION_UNAVAILABLE"
+
+
+def test_simulation_start_rejects_partial_build_provenance(tmp_path: Path) -> None:
+    marker = tmp_path / "marker"
+    marker.touch()
+    service = SimulatorService(data_root=tmp_path, collision_marker=marker)
+    service.build_metadata = BuildMetadata(
+        firmwareCommit="firmware",
+        collisionPatchSha256="patch",
+        firmwareBinarySha256="",
+        buildArchitecture="aarch64",
+        clientLibraryVersion="2.7.11",
+        upstreamBaseImageDigest="sha256:base",
+    )
+
+    with TestClient(create_app(service)) as client:
+        capabilities = client.get("/api/capabilities")
+        start = client.post("/api/simulation/start")
+
+    assert capabilities.json()["provenanceAvailable"] is False
+    assert start.status_code == 409
+    assert start.json()["error"]["code"] == "BUILD_METADATA_UNAVAILABLE"
 
 
 def test_scenario_can_change_only_while_stopped(tmp_path: Path) -> None:

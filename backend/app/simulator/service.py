@@ -124,10 +124,11 @@ class LifecycleView(BaseModel):
 
 
 class _NodeMetrics:
-    def __init__(self) -> None:
+    def __init__(self, *, rx_bad_initialized: bool = False) -> None:
         self.tx = 0
         self.rx = 0
         self.rx_bad = 0
+        self.rx_bad_initialized = rx_bad_initialized
         self.rx_duplicate = 0
         self.channel_utilization: float | None = None
 
@@ -190,11 +191,12 @@ class SimulatorService:
         self._cleanup_lock = asyncio.Lock()
         self._topology_lock = asyncio.Lock()
         self._failure_cleanup_task: asyncio.Task[None] | None = None
+        self._startup_task: asyncio.Task[object] | None = None
         self._event_loop_lag_task: asyncio.Task[None] | None = None
 
     def capabilities(self) -> CapabilityView:
         available = self.collision_marker.is_file()
-        provenance_available = self.build_metadata.firmware_commit != "unavailable"
+        provenance_available = self.build_metadata.available
         return CapabilityView(
             collisionModel="native",
             collisionAvailable=available,
@@ -253,9 +255,14 @@ class SimulatorService:
             self.state = LifecycleState.STARTING
             self.message = "Starting native firmware processes"
             self._publish_lifecycle()
+            self._startup_task = asyncio.current_task()
             try:
                 records = await self.supervisor.start(self.scenario)
-                self.node_metrics = {node.id: _NodeMetrics() for node in self.scenario.nodes}
+                self._raise_if_startup_failed()
+                self.node_metrics = {
+                    node.id: _NodeMetrics(rx_bad_initialized=self.scenario.fresh_state)
+                    for node in self.scenario.nodes
+                }
                 self._local_stats_response_ids.clear()
                 self.gateways = {
                     node.id: NodeGateway(
@@ -281,8 +288,10 @@ class SimulatorService:
                         task.cancel()
                     await asyncio.gather(*gateway_starts, return_exceptions=True)
                     raise
+                self._raise_if_startup_failed()
                 self.message = "Configuring and verifying native nodes"
                 self.verifications = await self._configure_nodes()
+                self._raise_if_startup_failed()
                 hardware_ids = {
                     node_id: verification.node_number
                     for node_id, verification in self.verifications.items()
@@ -306,6 +315,7 @@ class SimulatorService:
                     failure_handler=self._on_medium_failure,
                 )
                 await self.medium.start()
+                self._raise_if_startup_failed()
                 self.state = LifecycleState.WARMING_UP
                 self.message = "Firmware is exchanging NodeInfo and establishing routes"
                 warmup_deadline = self._warmup_deadline_seconds()
@@ -334,7 +344,7 @@ class SimulatorService:
                 )
                 self._publish_lifecycle()
                 return CommandResult(commandId=command_id, state=self.state, detail=self.message)
-            except Exception as exc:
+            except BaseException as exc:
                 self.state = LifecycleState.FAILED
                 self.message = f"Startup failed: {exc}"
                 self._publish_lifecycle()
@@ -342,6 +352,8 @@ class SimulatorService:
                 if not failure_cleanup_awaited:
                     await self._cleanup_resources()
                 raise
+            finally:
+                self._startup_task = None
 
     async def stop(self) -> CommandResult:
         command_id = str(uuid.uuid4())
@@ -707,9 +719,11 @@ class SimulatorService:
             variant = telemetry.WhichOneof("variant")
             if variant == "local_stats":
                 previous_bad = metrics.rx_bad
+                rx_bad_initialized = metrics.rx_bad_initialized
                 metrics.tx = telemetry.local_stats.num_packets_tx
                 metrics.rx = telemetry.local_stats.num_packets_rx
                 metrics.rx_bad = telemetry.local_stats.num_packets_rx_bad
+                metrics.rx_bad_initialized = True
                 metrics.rx_duplicate = telemetry.local_stats.num_rx_dupe
                 if self.traffic is not None:
                     self.traffic.record_failed_receptions(
@@ -718,7 +732,7 @@ class SimulatorService:
                     self.traffic.record_duplicate_receptions(
                         node_id, telemetry.local_stats.num_rx_dupe
                     )
-                if telemetry.local_stats.num_packets_rx_bad > previous_bad:
+                if rx_bad_initialized and telemetry.local_stats.num_packets_rx_bad > previous_bad:
                     self.event_broker.publish(
                         PacketEvent(
                             monotonicSeconds=time.monotonic(),
@@ -875,17 +889,24 @@ class SimulatorService:
         self.state = LifecycleState.FAILED
         self.message = f"{category}: {detail}"
         self._publish_lifecycle()
+        if self._startup_task is not None:
+            return
         if self._failure_cleanup_task is None or self._failure_cleanup_task.done():
             self._failure_cleanup_task = asyncio.create_task(
                 self._fail_traffic_and_cleanup(self.message), name="failed-simulation-cleanup"
             )
 
     async def _fail_traffic_and_cleanup(self, reason: str) -> None:
-        async with self._topology_lock:
-            async with self._cleanup_lock:
-                if self.traffic is not None:
-                    await self.traffic.fail(reason)
-                await self._cleanup_resources_unlocked()
+        async with self._lifecycle_lock:
+            async with self._topology_lock:
+                async with self._cleanup_lock:
+                    if self.traffic is not None:
+                        await self.traffic.fail(reason)
+                    await self._cleanup_resources_unlocked()
+
+    def _raise_if_startup_failed(self) -> None:
+        if self.state == LifecycleState.FAILED:
+            raise RuntimeError(self.message)
 
     async def _await_failure_cleanup(self) -> bool:
         task = self._failure_cleanup_task

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -918,25 +919,20 @@ class TrafficController:
         deadline = time.monotonic() + deadline_seconds
         while True:
             now = time.monotonic()
-            if (
-                self.current.request.kind == TrafficKind.DIRECT_TEXT
-                and not self._pending_submissions
-                and self._direct_messages_resolved()
-            ):
-                return
             quiet_remaining = self._last_activity_monotonic + quiet_seconds - now
-            if (
+            messages_resolved = (
                 self.current.request.kind == TrafficKind.BROADCAST_TEXT
-                and not self._pending_submissions
-                and quiet_remaining <= 0
-            ):
+                or self._direct_messages_resolved()
+            )
+            ready_to_settle = not self._pending_submissions and messages_resolved
+            if ready_to_settle and quiet_remaining <= 0:
                 return
             deadline_remaining = deadline - now
             if deadline_remaining <= 0:
                 break
             self._activity_changed.clear()
             wait_seconds = deadline_remaining
-            if self.current.request.kind == TrafficKind.BROADCAST_TEXT:
+            if ready_to_settle:
                 wait_seconds = min(wait_seconds, max(quiet_remaining, 0.001))
             try:
                 await asyncio.wait_for(self._activity_changed.wait(), timeout=wait_seconds)
@@ -1085,8 +1081,14 @@ class TrafficController:
             + "\n",
             encoding="utf-8",
         )
-        temporary.replace(destination)
-        summary_temporary.replace(summary_destination)
+        try:
+            temporary.replace(destination)
+            summary_temporary.replace(summary_destination)
+        except Exception:
+            for path in (temporary, summary_temporary, destination, summary_destination):
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
+            raise
         return frozen
 
     def _final_metrics(self) -> MetricsSnapshot:

@@ -25,6 +25,21 @@ class BuildMetadata(BaseModel):
         default=MESHTASTICATOR_COMMIT, alias="meshtasticatorCommit"
     )
 
+    @property
+    def available(self) -> bool:
+        """Report whether every field needed to identify a run is usable."""
+
+        values = (
+            self.firmware_commit,
+            self.collision_patch_sha256,
+            self.firmware_binary_sha256,
+            self.build_architecture,
+            self.client_library_version,
+            self.upstream_base_image_digest,
+            self.meshtasticator_commit,
+        )
+        return all(value.strip() not in {"", "unavailable"} for value in values)
+
     @classmethod
     def unavailable(cls) -> BuildMetadata:
         """Return an explicit local-development value when Docker metadata is absent."""

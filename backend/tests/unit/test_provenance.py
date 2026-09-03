@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from backend.app.provenance import MESHTASTICATOR_COMMIT, BuildMetadata, load_build_metadata
 
 
@@ -40,3 +42,33 @@ def test_build_metadata_loader_tracks_the_exact_image_values(tmp_path: Path) -> 
 def test_missing_build_metadata_is_explicitly_unavailable(tmp_path: Path) -> None:
     metadata = load_build_metadata(tmp_path / "missing.json")
     assert metadata == BuildMetadata.unavailable()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "firmware_commit",
+        "collision_patch_sha256",
+        "firmware_binary_sha256",
+        "build_architecture",
+        "client_library_version",
+        "upstream_base_image_digest",
+        "meshtasticator_commit",
+    ],
+)
+@pytest.mark.parametrize("value", ["", "   ", "unavailable"])
+def test_build_metadata_availability_requires_every_identity_field(
+    field: str, value: str
+) -> None:
+    metadata = BuildMetadata(
+        firmwareCommit="firmware",
+        collisionPatchSha256="patch",
+        firmwareBinarySha256="binary",
+        buildArchitecture="aarch64",
+        clientLibraryVersion="2.7.11",
+        upstreamBaseImageDigest="sha256:base",
+        meshtasticatorCommit="simulator",
+    )
+
+    assert metadata.available
+    assert not metadata.model_copy(update={field: value}).available

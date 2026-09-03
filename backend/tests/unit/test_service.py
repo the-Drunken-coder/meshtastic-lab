@@ -13,10 +13,12 @@ from backend.app.gateway import GatewayEvent
 from backend.app.metrics import EventBroker, EventType, PacketEvent
 from backend.app.models import (
     DirectedLink,
+    Scenario,
     TopologyPreset,
     apply_topology_preset,
     default_scenario,
 )
+from backend.app.provenance import BuildMetadata
 from backend.app.runtime import NativeProcessSupervisor, NodeVerification, ProcessRecord
 from backend.app.simulator import LifecycleState, SimulationConflict, SimulatorService
 from backend.app.traffic import TrafficController, TrafficRunRequest
@@ -357,6 +359,129 @@ async def test_rf_queue_overflow_fails_with_explicit_category(tmp_path: Path) ->
 
     assert service.state == LifecycleState.FAILED
     assert service.message.startswith("SIMULATOR_OVERLOAD:")
+
+
+@pytest.mark.asyncio
+async def test_process_failure_during_gateway_start_cleans_up_after_start_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "collision-marker"
+    marker.touch()
+    service = SimulatorService(
+        binary_path=tmp_path / "meshtasticd",
+        data_root=tmp_path,
+        collision_marker=marker,
+        warmup_seconds=0,
+    )
+    service.build_metadata = BuildMetadata(
+        firmwareCommit="firmware",
+        collisionPatchSha256="patch",
+        firmwareBinarySha256="binary",
+        buildArchitecture="aarch64",
+        clientLibraryVersion="2.7.11",
+        upstreamBaseImageDigest="sha256:base",
+    )
+    gateway_started = asyncio.Event()
+    release_gateways = asyncio.Event()
+    gateways: list[StartupGateway] = []
+
+    class StartupGateway:
+        def __init__(self, **_kwargs: object) -> None:
+            self.listening = False
+            gateways.append(self)
+
+        async def start(self) -> None:
+            gateway_started.set()
+            await release_gateways.wait()
+            self.listening = True
+
+        async def stop(self) -> None:
+            self.listening = False
+
+    async def start_processes(_scenario: Scenario) -> dict[str, SimpleNamespace]:
+        return {
+            node.id: SimpleNamespace(internal_port=46000 + index)
+            for index, node in enumerate(service.scenario.nodes, start=1)
+        }
+
+    async def stop_processes() -> None:
+        return
+
+    monkeypatch.setattr(service_module, "NodeGateway", StartupGateway)
+    monkeypatch.setattr(service.supervisor, "start", start_processes)
+    monkeypatch.setattr(service.supervisor, "stop", stop_processes)
+
+    start_task = asyncio.create_task(service.start())
+    await gateway_started.wait()
+    await service._on_process_failure("node-1", 1)
+
+    assert service.state == LifecycleState.FAILED
+    assert service._failure_cleanup_task is None
+    release_gateways.set()
+    with pytest.raises(RuntimeError, match="Firmware node node-1 exited"):
+        await start_task
+
+    assert gateways
+    assert not any(gateway.listening for gateway in gateways)
+    assert service.gateways == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_failure_cleanup_waits_for_lifecycle_command(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    stopped = asyncio.Event()
+
+    class StoppableGateway:
+        async def stop(self) -> None:
+            stopped.set()
+
+    service.state = LifecycleState.RUNNING
+    service.gateways = {"node-1": StoppableGateway()}  # type: ignore[dict-item]
+
+    async with service._lifecycle_lock:
+        service._schedule_runtime_failure("GATEWAY_FAILED", "boom")
+        cleanup_task = service._failure_cleanup_task
+        assert cleanup_task is not None
+        await asyncio.sleep(0)
+        assert not stopped.is_set()
+
+    await cleanup_task
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_retained_rx_bad_counter_is_baselined_before_collision_event(tmp_path: Path) -> None:
+    service = SimulatorService(data_root=tmp_path, warmup_seconds=0)
+    service.scenario = service.scenario.model_copy(update={"fresh_state": False})
+    service.node_metrics = {
+        "node-1": service_module._NodeMetrics(
+            rx_bad_initialized=service.scenario.fresh_state
+        )
+    }
+
+    async def report(total: int) -> None:
+        response = mesh_pb2.FromRadio()
+        response.packet.decoded.portnum = service_module.portnums_pb2.TELEMETRY_APP
+        telemetry = service_module.telemetry_pb2.Telemetry()
+        telemetry.local_stats.num_packets_rx_bad = total
+        response.packet.decoded.payload = telemetry.SerializeToString()
+        await service._on_from_radio("node-1", response)
+
+    await report(7)
+    assert not [
+        event
+        for event in service.event_broker.recent()
+        if event.event_type == EventType.COLLISION
+    ]
+
+    await report(8)
+    collisions = [
+        event
+        for event in service.event_broker.recent()
+        if event.event_type == EventType.COLLISION
+    ]
+    assert len(collisions) == 1
+    assert collisions[0].receiver == "node-1"
 
 
 @pytest.mark.asyncio
