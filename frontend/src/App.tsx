@@ -66,6 +66,7 @@ const emptyMetrics: Metrics = {
   dropsByReason: {},
   observedAirtimeMs: 0,
   perNodeTransmitCounts: {},
+  perNodeAirtimeMs: {},
   eventLoopLagMs: null,
 };
 
@@ -674,6 +675,7 @@ function App() {
                 <div><dt>P99</dt><dd>{formatMilliseconds(metrics.p99LatencyMs)}</dd></div>
                 <div><dt>Drops</dt><dd>{Object.keys(metrics.dropsByReason).length ? Object.entries(metrics.dropsByReason).map(([reason, count]) => `${reason}: ${count}`).join(", ") : "None observed"}</dd></div>
                 <div><dt>Per-node TX</dt><dd>{Object.keys(metrics.perNodeTransmitCounts).length ? Object.entries(metrics.perNodeTransmitCounts).map(([node, count]) => `${node}: ${count}`).join(", ") : "None observed"}</dd></div>
+                <div><dt>Per-node airtime</dt><dd>{Object.keys(metrics.perNodeAirtimeMs).length ? Object.entries(metrics.perNodeAirtimeMs).map(([node, airtime]) => `${node}: ${formatMilliseconds(airtime)}`).join(", ") : "None observed"}</dd></div>
               </dl>
             </div>
           </section>

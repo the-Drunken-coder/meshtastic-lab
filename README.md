@@ -64,8 +64,8 @@ Use **Export scenario** in the UI or `GET /api/scenario/export` to save the curr
 - Delivered counts unique generated messages exposed by an intended receiver. Receiver deliveries and receiver delivery ratio separately count every applicable node reached by each broadcast.
 - RF TX counts firmware transmitter events once, even when several receivers hear one frame. RF TX per delivery exposes flooding and retry amplification.
 - Relay TX counts transmissions where the transmitting firmware did not originate the packet.
-- Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it.
-- ACK success is separate from destination delivery. It applies only to firmware-accepted direct messages because firmware disables acknowledgments for broadcasts. Percentiles remain unavailable until their configured sample minimum is met.
+- Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it. The total is also broken down by transmitting node.
+- ACK success is separate from destination delivery. It applies only to firmware-accepted direct messages because firmware disables acknowledgments for broadcasts. Percentiles remain unavailable until their configured sample minimum is met. Live percentiles use the most recent 2,048 deliveries; completed results use the full run.
 - Duplicate and failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. A partial sample keeps the run exportable and sets `failedReceptionMetricsComplete` to false with the missing nodes listed in `missingLocalStatsNodes`. Collision results are labeled `native` only in the collision-enabled image.
 
 See [fidelity](docs/fidelity.md) for exact boundaries.

@@ -730,6 +730,8 @@ async def test_stop_cleans_resources_created_by_concurrent_restart(
     )
     service.state = LifecycleState.FAILED
     cleanup_release = asyncio.Event()
+    public_enable_started = asyncio.Event()
+    public_enable_release = asyncio.Event()
 
     class RestartGateway:
         def __init__(self, **_kwargs: object) -> None:
@@ -746,7 +748,8 @@ async def test_stop_cleans_resources_created_by_concurrent_restart(
             self.listening = False
 
         async def enable_public_clients(self) -> None:
-            return
+            public_enable_started.set()
+            await public_enable_release.wait()
 
     started_gateways: list[RestartGateway] = []
 
@@ -791,6 +794,9 @@ async def test_stop_cleans_resources_created_by_concurrent_restart(
     await asyncio.sleep(0)
     service._lifecycle_lock.release()
 
+    await public_enable_started.wait()
+    assert service.state == LifecycleState.WARMING_UP
+    public_enable_release.set()
     await start_task
     result = await stop_task
 

@@ -101,6 +101,7 @@ export interface Metrics {
   dropsByReason: Record<string, number>;
   observedAirtimeMs: number;
   perNodeTransmitCounts: Record<string, number>;
+  perNodeAirtimeMs: Record<string, number>;
   eventLoopLagMs: number | null;
 }
 

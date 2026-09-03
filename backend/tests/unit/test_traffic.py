@@ -771,7 +771,25 @@ async def test_routing_ack_rf_frames_are_correlated_with_original_message(tmp_pa
         "node-2": 1,
         "node-3": 1,
     }
+    assert result.metrics.per_node_airtime_ms == {
+        "node-1": 10,
+        "node-2": 5,
+        "node-3": 5,
+    }
     assert result.metrics.drops_by_reason == {"link-disabled": 1}
+
+
+def test_live_latency_percentiles_use_a_bounded_window(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    latencies = [float(index) for index in range(2058)]
+    controller._latencies_ms.extend(latencies)
+    controller._live_latencies_ms.extend(latencies)
+
+    metrics = controller._live_metrics_snapshot()
+
+    assert len(controller._latencies_ms) == 2058
+    assert len(controller._live_latencies_ms) == 2048
+    assert metrics.median_latency_ms == 1033.5
 
 
 @pytest.mark.asyncio

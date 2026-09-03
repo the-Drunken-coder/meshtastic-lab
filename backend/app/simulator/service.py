@@ -328,12 +328,11 @@ class SimulatorService:
                 missing_pairs, expected_pairs = await self._warm_up_nodes()
                 if self.state == LifecycleState.FAILED:
                     raise RuntimeError(self.message)
-                self.state = LifecycleState.RUNNING
                 await asyncio.gather(
                     *(gateway.enable_public_clients() for gateway in self.gateways.values())
                 )
-                if self.state == LifecycleState.FAILED:
-                    raise RuntimeError(self.message)
+                self._raise_if_startup_failed()
+                self.state = LifecycleState.RUNNING
                 self.message = f"{len(self.gateways)} native nodes are running"
                 if missing_pairs:
                     self.message += (

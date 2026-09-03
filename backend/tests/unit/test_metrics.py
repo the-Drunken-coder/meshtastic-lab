@@ -85,6 +85,7 @@ def test_metrics_count_airtime_once_per_transmitter() -> None:
     assert metrics.rf_transmissions_per_delivery == 3
     assert metrics.observed_airtime_ms == 50
     assert metrics.per_node_transmit_counts == {"node-1": 1, "node-2": 2}
+    assert metrics.per_node_airtime_ms == {"node-1": 10, "node-2": 40}
     assert metrics.drops_by_reason == {"link-disabled": 2}
 
 
@@ -108,3 +109,32 @@ async def test_bounded_event_subscription_reports_drops() -> None:
     assert latest.mesh_packet_id == 2
     assert broker.history_evictions == 1
     assert [event.mesh_packet_id for event in broker.recent()] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_drop_notices_do_not_starve_buffered_events() -> None:
+    broker = EventBroker(subscriber_buffer_size=1)
+    async with broker.subscribe() as subscription:
+        for packet_id in range(3):
+            broker.publish(
+                PacketEvent(
+                    monotonicSeconds=float(packet_id),
+                    eventType=EventType.RF_TRANSMIT,
+                    meshPacketId=packet_id,
+                )
+            )
+        first_notice = await asyncio.wait_for(subscription.next(), timeout=1)
+        broker.publish(
+            PacketEvent(
+                monotonicSeconds=3,
+                eventType=EventType.RF_TRANSMIT,
+                meshPacketId=3,
+            )
+        )
+        buffered_event = await asyncio.wait_for(subscription.next(), timeout=1)
+        second_notice = await asyncio.wait_for(subscription.next(), timeout=1)
+
+    assert first_notice.event_type == EventType.UI_EVENTS_DROPPED
+    assert buffered_event.mesh_packet_id == 3
+    assert second_notice.event_type == EventType.UI_EVENTS_DROPPED
+    assert second_notice.detail == "1 UI events dropped because the client was slow"

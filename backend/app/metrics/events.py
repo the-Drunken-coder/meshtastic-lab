@@ -61,6 +61,7 @@ class EventSubscription:
     def __init__(self, *, buffer_size: int) -> None:
         self.queue: asyncio.Queue[PacketEvent] = asyncio.Queue(maxsize=buffer_size)
         self.dropped = 0
+        self._delivered_drop_notice_last = False
 
     def publish(self, event: PacketEvent) -> None:
         try:
@@ -71,16 +72,19 @@ class EventSubscription:
             self.queue.put_nowait(event)
 
     async def next(self) -> PacketEvent:
-        if self.dropped:
+        if self.dropped and not self._delivered_drop_notice_last:
             dropped = self.dropped
             self.dropped = 0
+            self._delivered_drop_notice_last = True
             return PacketEvent(
                 monotonicSeconds=asyncio.get_running_loop().time(),
                 eventType=EventType.UI_EVENTS_DROPPED,
                 result="dropped",
                 detail=f"{dropped} UI events dropped because the client was slow",
             )
-        return await self.queue.get()
+        event = await self.queue.get()
+        self._delivered_drop_notice_last = False
+        return event
 
 
 class EventBroker:

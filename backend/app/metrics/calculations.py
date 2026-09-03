@@ -28,6 +28,7 @@ class _MetricsBase(BaseModel):
     drops_by_reason: dict[str, int] = Field(alias="dropsByReason")
     observed_airtime_ms: int = Field(alias="observedAirtimeMs")
     per_node_transmit_counts: dict[str, int] = Field(alias="perNodeTransmitCounts")
+    per_node_airtime_ms: dict[str, int] = Field(default_factory=dict, alias="perNodeAirtimeMs")
     event_loop_lag_ms: float | None = Field(default=None, alias="eventLoopLagMs")
 
 
@@ -97,6 +98,7 @@ def calculate_metrics(
     rf_transmission_count: int | None = None,
     observed_airtime_ms: int | None = None,
     per_node_transmit_counts: dict[str, int] | None = None,
+    per_node_airtime_ms: dict[str, int] | None = None,
     drops_by_reason: dict[str, int] | None = None,
 ) -> MetricsSnapshot:
     delivered = len(delivered_ids) if delivered_count is None else delivered_count
@@ -107,6 +109,11 @@ def calculate_metrics(
         else receiver_delivery_opportunities
     )
     rf_count = len(rf_transmitters) if rf_transmission_count is None else rf_transmission_count
+    if per_node_airtime_ms is None:
+        airtime_by_transmitter: Counter[str] = Counter()
+        for transmitter, packet_airtime_ms in zip(rf_transmitters, airtimes_ms, strict=True):
+            airtime_by_transmitter[transmitter] += packet_airtime_ms
+        per_node_airtime_ms = dict(airtime_by_transmitter)
     # Sort once and reuse the ordered sample for all three exact percentiles.
     ordered_latencies = sorted(latencies_ms)
     return MetricsSnapshot(
@@ -136,5 +143,6 @@ def calculate_metrics(
             if per_node_transmit_counts is None
             else per_node_transmit_counts
         ),
+        perNodeAirtimeMs=per_node_airtime_ms,
         eventLoopLagMs=event_loop_lag_ms,
     )

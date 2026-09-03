@@ -41,6 +41,7 @@ TRAFFIC_PREFIX = "ML1"
 PACKET_ID_QUARANTINE_SECONDS = 5 * 60
 MAX_QUARANTINED_PACKET_IDS_PER_SOURCE = 600 * 60
 MAX_TOPOLOGY_CHANGES_PER_RUN = 10_000
+LIVE_LATENCY_SAMPLE_SIZE = 2048
 PACKET_ID_RNG_SALT = 0x4D4C5F5041434B4554
 FIRMWARE_QUEUE_SUCCESS = {0, 35}
 INTERMEDIATE_TRANSMISSION_ATTEMPTS = 2
@@ -270,6 +271,7 @@ class TrafficController:
         self._quarantined_packet_ids: dict[str, set[int]] = {}
         self._delivered_sequences: set[int] = set()
         self._latencies_ms: list[float] = []
+        self._live_latencies_ms: deque[float] = deque(maxlen=LIVE_LATENCY_SAMPLE_SIZE)
         self._rf_transmitters: list[str] = []
         self._airtimes_ms: list[int] = []
         self._relay_transmissions = 0
@@ -291,6 +293,7 @@ class TrafficController:
         self._rf_transmission_count = 0
         self._observed_airtime_ms = 0
         self._per_node_transmit_counts: Counter[str] = Counter()
+        self._per_node_airtime_ms: Counter[str] = Counter()
         self._maximum_packet_airtime_ms = 0
         self._maximum_retransmission_delay_ms = 0
         self._last_activity_monotonic = time.monotonic()
@@ -475,6 +478,7 @@ class TrafficController:
         self._rf_transmission_count += 1
         self._observed_airtime_ms += packet_airtime_ms
         self._per_node_transmit_counts[transmitter] += 1
+        self._per_node_airtime_ms[transmitter] += packet_airtime_ms
         if origin != self.hardware_ids[transmitter]:
             self._relay_transmissions += 1
         self._note_activity()
@@ -484,6 +488,7 @@ class TrafficController:
                 "observedAirtimeMs": self._observed_airtime_ms,
                 "relayTransmissions": self._relay_transmissions,
                 "perNodeTransmitCounts": dict(self._per_node_transmit_counts),
+                "perNodeAirtimeMs": dict(self._per_node_airtime_ms),
             }
         )
         return self.current.run_id, message.sequence
@@ -602,6 +607,7 @@ class TrafficController:
                 self._unique_deliveries += 1
             latency_ms = (time.monotonic() - generated.generated_monotonic) * 1000
             self._latencies_ms.append(latency_ms)
+            self._live_latencies_ms.append(latency_ms)
             self._note_activity()
             self._publish_metric_update(
                 {
@@ -1160,7 +1166,7 @@ class TrafficController:
             delivered_count=self._unique_deliveries,
             acknowledged=self._acknowledgments,
             acknowledgment_expected=expected_acknowledgments,
-            latencies_ms=self._latencies_ms,
+            latencies_ms=list(self._live_latencies_ms),
             rf_transmitters=[],
             rf_transmission_count=self._rf_transmission_count,
             relay_transmissions=self._relay_transmissions,
@@ -1171,6 +1177,7 @@ class TrafficController:
             airtimes_ms=[],
             observed_airtime_ms=self._observed_airtime_ms,
             per_node_transmit_counts=dict(self._per_node_transmit_counts),
+            per_node_airtime_ms=dict(self._per_node_airtime_ms),
             event_loop_lag_ms=self._event_loop_lag_ms,
             receiver_deliveries=self._receiver_deliveries,
             receiver_delivery_opportunities=self._receiver_opportunities,
@@ -1388,6 +1395,7 @@ class TrafficController:
         self._routing_terminal_sequences.clear()
         self._delivered_sequences.clear()
         self._latencies_ms.clear()
+        self._live_latencies_ms.clear()
         self._rf_transmitters.clear()
         self._airtimes_ms.clear()
         self._relay_transmissions = 0
@@ -1409,6 +1417,7 @@ class TrafficController:
         self._rf_transmission_count = 0
         self._observed_airtime_ms = 0
         self._per_node_transmit_counts.clear()
+        self._per_node_airtime_ms.clear()
         self._maximum_packet_airtime_ms = 0
         self._maximum_retransmission_delay_ms = 0
         self._last_activity_monotonic = time.monotonic()
