@@ -11,6 +11,7 @@ from backend.app.metrics import (
     PacketEvent,
     airtime_ms,
     calculate_metrics,
+    maximum_retransmission_delay_ms,
     mesh_packet_payload_length,
     percentile,
 )
@@ -28,6 +29,10 @@ from backend.app.metrics import (
 )
 def test_airtime_matches_upstream_simradio_equation(preset: str, expected: int) -> None:
     assert airtime_ms(100, preset) == expected
+
+
+def test_retransmission_delay_includes_airtime_contention_and_processing() -> None:
+    assert maximum_retransmission_delay_ms(100, "LONG_SLOW") == 44051
 
 
 def test_simulator_wrapper_is_not_counted_as_extra_airtime() -> None:

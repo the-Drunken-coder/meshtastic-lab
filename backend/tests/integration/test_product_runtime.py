@@ -17,6 +17,8 @@ from backend.app.models import default_scenario
 
 PRODUCT_IMAGE = "meshtastic-lab:0.1.0"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+BOUNDED_BROADCAST_COMPLETION_SECONDS = 60
+BOUNDED_TRAFFIC_COMPLETION_SECONDS = 330
 
 
 def unused_port() -> int:
@@ -197,8 +199,14 @@ async def test_product_lifecycle_failure_and_five_node_cleanup() -> None:
                 },
             )
             collision_run.raise_for_status()
-            collision_result = await wait_for_traffic(client, 30)
+            collision_result = await wait_for_traffic(
+                client, BOUNDED_BROADCAST_COMPLETION_SECONDS
+            )
             assert collision_result["state"] == "COMPLETED"
+            assert collision_result["submissionFailed"] > 0
+            assert collision_result["requested"] == (
+                collision_result["submitted"] + collision_result["submissionFailed"]
+            )
             collision_metrics = collision_result["metrics"]
             assert isinstance(collision_metrics, dict)
             assert collision_metrics["failedReceptions"] > 0
@@ -237,8 +245,10 @@ async def test_product_lifecycle_failure_and_five_node_cleanup() -> None:
             }
             response = await client.post("/api/traffic/runs", json=traffic_request)
             response.raise_for_status()
-            result = await wait_for_traffic(client, 45)
-            assert result["state"] == "COMPLETED"
+            # The controller may wait for the pinned firmware's complete retry horizon
+            # before it freezes an unresolved accepted message.
+            result = await wait_for_traffic(client, BOUNDED_TRAFFIC_COMPLETION_SECONDS)
+            assert result["state"] == "COMPLETED", result.get("failure")
             metrics = result["metrics"]
             assert isinstance(metrics, dict)
             assert metrics["generatedApplicationMessages"] > 0

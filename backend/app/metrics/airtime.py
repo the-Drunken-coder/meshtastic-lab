@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from meshtastic.protobuf import mesh_pb2, portnums_pb2
 
 MESH_PACKET_HEADER_BYTES = 16
+MAX_RETRANSMISSION_CONTENTION_SLOTS = (1 << 8) + 2 * 8 + (1 << 5)
+RETRANSMISSION_PROCESSING_TIME_MS = 4500
+SLOT_FIXED_OVERHEAD_MS = 7.6
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,23 @@ def airtime_ms(payload_length: int, modem_preset: str, *, preamble_symbols: int 
     denominator = 4 * (params.spreading_factor - 2 * int(low_data_rate_optimization))
     payload_symbols = 8 + max(math.ceil(numerator / denominator) * params.coding_rate, 0)
     return int((preamble_time + payload_symbols * symbol_time) * 1000)
+
+
+def maximum_retransmission_delay_ms(payload_length: int, modem_preset: str) -> int:
+    """Bound the pinned firmware's delay between transmission attempts."""
+
+    try:
+        params = MODEM_PARAMETERS[modem_preset]
+    except KeyError as exc:
+        raise ValueError(f"unsupported modem preset: {modem_preset}") from exc
+    symbol_time_ms = (1 << params.spreading_factor) / params.bandwidth_khz
+    slot_time_ms = 2.5 * symbol_time_ms + SLOT_FIXED_OVERHEAD_MS
+    packet_airtime_ms = airtime_ms(payload_length, modem_preset)
+    return math.ceil(
+        2 * packet_airtime_ms
+        + MAX_RETRANSMISSION_CONTENTION_SLOTS * slot_time_ms
+        + RETRANSMISSION_PROCESSING_TIME_MS
+    )
 
 
 def mesh_packet_payload_length(packet: mesh_pb2.MeshPacket) -> int:

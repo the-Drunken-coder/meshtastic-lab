@@ -119,8 +119,14 @@ async def test_two_clients_on_different_nodes_broadcast_and_direct() -> None:
         first, second = await asyncio.gather(connect(cluster, "node-1"), connect(cluster, "node-2"))
         assert first.myInfo is not None and second.myInfo is not None
 
-        await asyncio.to_thread(first.sendText, "native-broadcast", wantAck=False)
-        assert await receive_text(cluster, received, "native-broadcast", 20) == "native-broadcast"
+        await send_until_received(
+            cluster,
+            first,
+            received,
+            "native-broadcast",
+            0xFFFFFFFF,
+            attempt_timeout_seconds=20,
+        )
 
         await send_until_received(
             cluster,

@@ -33,6 +33,7 @@ from backend.app.runtime import (
     verify_node,
 )
 from backend.app.traffic import (
+    FailedReceptionSample,
     PacketIdQuarantineCapacityError,
     TrafficController,
     TrafficRunRequest,
@@ -142,6 +143,8 @@ class SimulatorService:
         collision_marker: Path | None = None,
         build_metadata_path: Path | None = None,
         warmup_seconds: float = 5.0,
+        local_stats_deadline_seconds: float = 10.0,
+        local_stats_retry_seconds: float = 1.0,
     ) -> None:
         binary = binary_path or Path(os.environ.get("MESHTASTICD_BIN", "/usr/bin/meshtasticd"))
         root = data_root or Path(os.environ.get("MESHTASTIC_LAB_DATA", "/data"))
@@ -151,11 +154,15 @@ class SimulatorService:
         metadata_path = build_metadata_path or Path(
             os.environ.get("MESHTASTIC_BUILD_METADATA", str(DEFAULT_METADATA_PATH))
         )
+        if local_stats_deadline_seconds <= 0 or local_stats_retry_seconds <= 0:
+            raise ValueError("local-stat sampling intervals must be positive")
         self.data_root = root
         self.results_root = root / "runs"
         self.collision_marker = marker
         self.build_metadata: BuildMetadata = load_build_metadata(metadata_path)
         self.warmup_seconds = warmup_seconds
+        self.local_stats_deadline_seconds = local_stats_deadline_seconds
+        self.local_stats_retry_seconds = local_stats_retry_seconds
         self.scenario = default_scenario()
         self.state = LifecycleState.STOPPED
         self.simulation_id: str | None = None
@@ -642,33 +649,64 @@ class SimulatorService:
             elif variant == "device_metrics":
                 metrics.channel_utilization = telemetry.device_metrics.channel_utilization
 
-    async def _sample_local_stats(self) -> dict[str, int]:
+    async def _sample_local_stats(self) -> FailedReceptionSample:
         node_ids = list(self.gateways)
         if not node_ids or set(node_ids) != set(self.verifications):
             raise RuntimeError("native nodes are not ready for local-stat sampling")
-        requests = {node_id: self._local_stats_request(node_id) for node_id in node_ids}
-        await asyncio.gather(
-            *(
-                self.gateways[node_id].send_to_radio(
-                    requests[node_id], source="controller.local-stats"
-                )
-                for node_id in node_ids
-            )
-        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.local_stats_deadline_seconds
 
-        async def wait_for_sample(node_id: str) -> int:
-            async with self._local_stats_condition:
-                await asyncio.wait_for(
-                    self._local_stats_condition.wait_for(
-                        lambda: self._local_stats_response_ids.get(node_id)
-                        == requests[node_id].packet.id
-                    ),
-                    timeout=5,
-                )
-            return self.node_metrics[node_id].rx_bad
+        async def sample_node(node_id: str) -> int | None:
+            expected_packet_ids: set[int] = set()
 
-        values = await asyncio.gather(*(wait_for_sample(node_id) for node_id in node_ids))
-        return dict(zip(node_ids, values, strict=True))
+            def response_arrived() -> bool:
+                response_id = self._local_stats_response_ids.get(node_id)
+                return response_id is not None and response_id in expected_packet_ids
+
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return None
+                request = self._local_stats_request(node_id)
+                try:
+                    await self.gateways[node_id].send_to_radio(
+                        request, source="controller.local-stats"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.warning(
+                        "native local-stat request failed",
+                        exc_info=True,
+                        extra={"node_id": node_id},
+                    )
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        return None
+                    await asyncio.sleep(min(self.local_stats_retry_seconds, remaining))
+                else:
+                    expected_packet_ids.add(request.packet.id)
+                    wait_seconds = min(self.local_stats_retry_seconds, deadline - loop.time())
+                    if wait_seconds <= 0:
+                        return None
+                    try:
+                        async with self._local_stats_condition:
+                            await asyncio.wait_for(
+                                self._local_stats_condition.wait_for(response_arrived),
+                                timeout=wait_seconds,
+                            )
+                        return self.node_metrics[node_id].rx_bad
+                    except TimeoutError:
+                        pass
+
+        values = await asyncio.gather(*(sample_node(node_id) for node_id in node_ids))
+        totals = {
+            node_id: value
+            for node_id, value in zip(node_ids, values, strict=True)
+            if value is not None
+        }
+        missing = tuple(node_id for node_id in node_ids if node_id not in totals)
+        return FailedReceptionSample(totals=totals, missing_nodes=missing)
 
     def _local_stats_request(self, node_id: str) -> mesh_pb2.ToRadio:
         telemetry = telemetry_pb2.Telemetry()

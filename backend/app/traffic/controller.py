@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
@@ -26,7 +27,10 @@ from backend.app.metrics import (
     MetricsSnapshot,
     MetricsSummary,
     PacketEvent,
+    airtime_ms,
     calculate_metrics,
+    maximum_retransmission_delay_ms,
+    mesh_packet_payload_length,
 )
 from backend.app.models import DirectedLink, Scenario
 from backend.app.provenance import BuildMetadata
@@ -36,8 +40,22 @@ PACKET_ID_QUARANTINE_SECONDS = 5 * 60
 MAX_QUARANTINED_PACKET_IDS_PER_SOURCE = 600 * 60
 MAX_TOPOLOGY_CHANGES_PER_RUN = 10_000
 PACKET_ID_RNG_SALT = 0x4D4C5F5041434B4554
+FIRMWARE_QUEUE_SUCCESS = {0, 35}
+INTERMEDIATE_TRANSMISSION_ATTEMPTS = 2
+RELIABLE_UNICAST_ATTEMPTS = 3
+MAX_DRAIN_SECONDS = 300.0
 LOGGER = logging.getLogger(__name__)
-FailedReceptionSampler = Callable[[], Awaitable[Mapping[str, int]]]
+
+
+@dataclass(frozen=True, slots=True)
+class FailedReceptionSample:
+    totals: Mapping[str, int]
+    missing_nodes: tuple[str, ...] = ()
+
+
+FailedReceptionSampler = Callable[
+    [], Awaitable[FailedReceptionSample | Mapping[str, int]]
+]
 
 
 class PacketIdQuarantineCapacityError(RuntimeError):
@@ -157,6 +175,12 @@ class TrafficRunResult(_ProvenanceFields):
     submission_failed: int = Field(default=0, alias="submissionFailed")
     transmitted: int = 0
     delivered: int = 0
+    failed_reception_metrics_complete: bool = Field(
+        default=True, alias="failedReceptionMetricsComplete"
+    )
+    missing_local_stats_nodes: list[str] = Field(
+        default_factory=list, alias="missingLocalStatsNodes"
+    )
     generated_messages: list[GeneratedMessage] = Field(default_factory=list, alias="generatedMessages")
     topology_changes: list[TopologyChange] = Field(default_factory=list, alias="topologyChanges")
     metrics: MetricsSnapshot
@@ -180,6 +204,12 @@ class TrafficRunSummary(_ProvenanceFields):
     submission_failed: int = Field(default=0, alias="submissionFailed")
     transmitted: int = 0
     delivered: int = 0
+    failed_reception_metrics_complete: bool = Field(
+        default=True, alias="failedReceptionMetricsComplete"
+    )
+    missing_local_stats_nodes: list[str] = Field(
+        default_factory=list, alias="missingLocalStatsNodes"
+    )
     metrics: MetricsSummary
     failure: str | None = None
 
@@ -209,7 +239,7 @@ class TrafficController:
         event_broker: EventBroker,
         results_root: Path,
         build_metadata: BuildMetadata | None = None,
-        settle_seconds: float = 3.0,
+        settle_seconds: float | None = None,
         failed_reception_sampler: FailedReceptionSampler | None = None,
     ) -> None:
         self.scenario = scenario
@@ -228,6 +258,8 @@ class TrafficController:
         self._sequence = 0
         self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
         self._messages_by_key: dict[tuple[str, int], GeneratedMessage] = {}
+        self._pending_submissions: dict[tuple[str, int], GeneratedMessage] = {}
+        self._routing_terminal_sequences: set[int] = set()
         self._packet_ids_by_source: dict[str, dict[int, float]] = {}
         self._packet_id_quarantine: dict[str, deque[tuple[float, int]]] = {}
         self._quarantined_packet_ids: dict[str, set[int]] = {}
@@ -253,6 +285,10 @@ class TrafficController:
         self._rf_transmission_count = 0
         self._observed_airtime_ms = 0
         self._per_node_transmit_counts: Counter[str] = Counter()
+        self._maximum_packet_airtime_ms = 0
+        self._maximum_retransmission_delay_ms = 0
+        self._last_activity_monotonic = time.monotonic()
+        self._activity_changed = asyncio.Event()
         self._metrics: MetricsSnapshot | None = None
 
     def start(
@@ -260,7 +296,7 @@ class TrafficController:
         request: TrafficRunRequest,
         *,
         scenario_snapshot: Scenario | None = None,
-        failed_reception_baseline: Mapping[str, int] | None = None,
+        failed_reception_baseline: FailedReceptionSample | Mapping[str, int] | None = None,
     ) -> str:
         if self._task is not None and not self._task.done():
             raise RuntimeError("a traffic run is already active")
@@ -275,8 +311,17 @@ class TrafficController:
                 f"{marker_size} for sequence {max_sequence}"
             )
         self._reset_accumulators()
-        self._latest_failed_receptions.update(failed_reception_baseline or {})
+        baseline = self._normalize_failed_reception_sample(failed_reception_baseline)
+        self._latest_failed_receptions.update(baseline.totals)
         self._run_scenario = snapshot
+        expected_stats_nodes = {node.id for node in snapshot.nodes}
+        missing_stats_nodes = set(baseline.missing_nodes)
+        if self.failed_reception_sampler is None:
+            missing_stats_nodes.update(expected_stats_nodes)
+        elif failed_reception_baseline is None:
+            missing_stats_nodes.update(expected_stats_nodes)
+        else:
+            missing_stats_nodes.update(expected_stats_nodes - set(baseline.totals))
         self.current = TrafficRunResult(
             runId=run_id,
             state=TrafficRunState.RUNNING,
@@ -291,6 +336,8 @@ class TrafficController:
             clientLibraryVersion=self.build_metadata.client_library_version,
             startedAt=datetime.now(UTC),
             randomSeed=request.seed,
+            failedReceptionMetricsComplete=not missing_stats_nodes,
+            missingLocalStatsNodes=sorted(missing_stats_nodes),
             metrics=self._live_metrics_snapshot(),
         )
         self._frozen_result = None
@@ -304,7 +351,7 @@ class TrafficController:
             return
         if self.state == TrafficRunState.FAILED:
             await self._cancel_run_task()
-            await self._sample_final_failed_receptions(required=False)
+            await self._sample_final_failed_receptions()
             if self._frozen_result is None:
                 await self._finish(TrafficRunState.FAILED)
             return
@@ -312,12 +359,8 @@ class TrafficController:
             return
         self.state = TrafficRunState.STOPPING
         await self._cancel_run_task()
-        try:
-            await self._sample_final_failed_receptions(required=True)
-        except RuntimeError as exc:
-            self.state = TrafficRunState.FAILED
-            if self.current is not None:
-                self.current.failure = str(exc)
+        self._finalize_pending_submissions()
+        await self._sample_final_failed_receptions()
         if self._frozen_result is None:
             terminal = (
                 TrafficRunState.FAILED
@@ -338,7 +381,8 @@ class TrafficController:
         self.state = TrafficRunState.FAILED
         self.current.failure = reason
         await self._cancel_run_task()
-        await self._sample_final_failed_receptions(required=False)
+        self._finalize_pending_submissions()
+        await self._sample_final_failed_receptions()
         if self._frozen_result is None:
             await self._finish(TrafficRunState.FAILED)
 
@@ -382,6 +426,8 @@ class TrafficController:
             ),
             transmitted=self._transmitted_count if self._frozen_result is None else result.transmitted,
             delivered=self._unique_deliveries if self._frozen_result is None else result.delivered,
+            failedReceptionMetricsComplete=result.failed_reception_metrics_complete,
+            missingLocalStatsNodes=result.missing_local_stats_nodes,
             metrics=metrics,
             failure=result.failure,
         )
@@ -404,7 +450,7 @@ class TrafficController:
         if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
             return
         message = self._message_for_packet_identity(packet)
-        if message is None:
+        if message is None or not message.submitted:
             return
         origin = self._packet_origin(packet)
         if not message.transmitted:
@@ -417,15 +463,18 @@ class TrafficController:
         self._per_node_transmit_counts[transmitter] += 1
         if origin != self.hardware_ids[transmitter]:
             self._relay_transmissions += 1
+        self._note_activity()
 
     def record_drop(self, transmitter: str, packet: mesh_pb2.MeshPacket, reason: str) -> None:
         del transmitter
         if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
             return
-        if self._message_for_packet_identity(packet) is None:
+        message = self._message_for_packet_identity(packet)
+        if message is None or not message.submitted:
             return
         self._drop_reasons.append(reason)
         self._drop_counts[reason] += 1
+        self._note_activity()
 
     def record_failed_receptions(self, node_id: str, total: int) -> None:
         if self.current is None or self.state not in {
@@ -471,18 +520,23 @@ class TrafficController:
             self._event_loop_lag_ms = lag_ms
 
     async def handle_from_radio(self, node_id: str, message: mesh_pb2.FromRadio) -> None:
-        if (
-            self.current is None
-            or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}
-            or message.WhichOneof("payload_variant") != "packet"
-        ):
+        if self.current is None or self.state not in {
+            TrafficRunState.RUNNING,
+            TrafficRunState.STOPPING,
+        }:
+            return
+        variant = message.WhichOneof("payload_variant")
+        if variant == "queueStatus":
+            self._record_queue_status(node_id, message.queueStatus)
+            return
+        if variant != "packet":
             return
         packet = message.packet
         if packet.WhichOneof("payload_variant") != "decoded":
             return
         if packet.decoded.portnum == portnums_pb2.TEXT_MESSAGE_APP:
             generated = self._correlated_delivery_message(packet)
-            if generated is None:
+            if generated is None or not generated.submitted:
                 return
             is_applicable_receiver = (
                 node_id == generated.destination_node
@@ -501,6 +555,7 @@ class TrafficController:
                 self._delivered_sequences.add(sequence)
                 self._unique_deliveries += 1
             self._latencies_ms.append((time.monotonic() - generated.generated_monotonic) * 1000)
+            self._note_activity()
             self.event_broker.publish(
                 PacketEvent(
                     monotonicSeconds=time.monotonic(),
@@ -521,10 +576,21 @@ class TrafficController:
             generated = self._messages_by_packet.get(
                 (acknowledgment_origin, packet.decoded.request_id)
             )
-            if generated is None or not generated.submitted or not generated.transmitted:
+            if generated is None:
                 return
             routing = mesh_pb2.Routing()
             routing.ParseFromString(packet.decoded.payload)
+            if (
+                routing.error_reason == mesh_pb2.Routing.Error.RATE_LIMIT_EXCEEDED
+                and not generated.transmitted
+            ):
+                self._record_pretransmission_rejection(
+                    node_id,
+                    generated,
+                    reason="firmware text-message rate limit exceeded",
+                )
+            elif not generated.transmitted:
+                return
             if routing.error_reason == mesh_pb2.Routing.Error.NONE:
                 response_origin = self._packet_origin(packet)
                 if self.current.request.kind == TrafficKind.DIRECT_TEXT:
@@ -540,8 +606,10 @@ class TrafficController:
             else:
                 event_type = EventType.ROUTING_ERROR
                 result = mesh_pb2.Routing.Error.Name(routing.error_reason)
+                self._routing_terminal_sequences.add(generated.sequence)
                 self._drop_reasons.append(result)
                 self._drop_counts[result] += 1
+            self._note_activity()
             self.event_broker.publish(
                 PacketEvent(
                     monotonicSeconds=time.monotonic(),
@@ -553,6 +621,38 @@ class TrafficController:
                     result=result,
                 )
             )
+
+    def _record_pretransmission_rejection(
+        self,
+        source: str,
+        generated: GeneratedMessage,
+        *,
+        reason: str,
+    ) -> None:
+        if self.current is None or generated.submission_error is not None:
+            return
+        self._pending_submissions.pop((source, generated.packet_id), None)
+        if generated.submitted:
+            generated.submitted = False
+            self._submitted_count -= 1
+            self.current.submitted = self._submitted_count
+        generated.submission_error = reason
+        self._submission_failed_count += 1
+        self.current.submission_failed = self._submission_failed_count
+        self._note_activity()
+        self.event_broker.publish(
+            PacketEvent(
+                monotonicSeconds=time.monotonic(),
+                eventType=EventType.TRAFFIC,
+                transmitter=source,
+                intendedDestination=generated.destination_node,
+                meshPacketId=generated.packet_id,
+                trafficRunId=self.current.run_id,
+                trafficSequence=generated.sequence,
+                result="submission-failed",
+                detail=reason,
+            )
+        )
 
     async def _run(self) -> None:
         if self.current is None:
@@ -582,8 +682,8 @@ class TrafficController:
                     del next_tick[source]
                 else:
                     next_tick[source] = tick + 1
-            await asyncio.sleep(self.settle_seconds)
-            await self._sample_final_failed_receptions(required=True)
+            await self._drain()
+            await self._sample_final_failed_receptions()
             self.state = TrafficRunState.COMPLETED
             await self._finish(TrafficRunState.COMPLETED)
         except asyncio.CancelledError:
@@ -609,10 +709,17 @@ class TrafficController:
         packet = mesh_pb2.MeshPacket(
             id=packet_id,
             to=0xFFFFFFFF if destination == "broadcast" else self.hardware_ids[destination],
-            want_ack=self.current.request.acknowledgment_requested,
+            want_ack=(
+                self.current.request.kind == TrafficKind.DIRECT_TEXT
+                and self.current.request.acknowledgment_requested
+            ),
             hop_limit=self._run_scenario.rf.hop_limit,
             priority=mesh_pb2.MeshPacket.Priority.RELIABLE,
         )
+        # PhoneAPI sends text-rate-limit errors before MeshService normalizes the
+        # source. Addressing the request as this local node makes that rejection
+        # observable on the same Client API stream without changing RF identity.
+        setattr(packet, "from", self.hardware_ids[source])
         packet.decoded.portnum = portnums_pb2.TEXT_MESSAGE_APP
         packet.decoded.payload = payload
         generated = GeneratedMessage(
@@ -633,29 +740,190 @@ class TrafficController:
         self.current.requested = self._generated_count
         self._messages_by_packet[(self.hardware_ids[source], packet_id)] = generated
         self._messages_by_key[(self.current.run_id, self._sequence)] = generated
+        self._pending_submissions[(source, packet_id)] = generated
+        packet_length = mesh_packet_payload_length(packet)
+        modem_preset = self._run_scenario.rf.modem_preset
+        self._maximum_packet_airtime_ms = max(
+            self._maximum_packet_airtime_ms,
+            airtime_ms(packet_length, modem_preset),
+        )
+        self._maximum_retransmission_delay_ms = max(
+            self._maximum_retransmission_delay_ms,
+            maximum_retransmission_delay_ms(packet_length, modem_preset),
+        )
+        self._note_activity()
         request = mesh_pb2.ToRadio()
         request.packet.CopyFrom(packet)
         try:
             await self.gateways[source].send_to_radio(request, source="traffic")
+        except Exception as exc:
+            self._pending_submissions.pop((source, packet_id), None)
+            self._resolve_submission(
+                source,
+                generated,
+                error=f"gateway submission failed: {exc}",
+            )
+
+    def _record_queue_status(self, node_id: str, status: mesh_pb2.QueueStatus) -> None:
+        packet_id = int(status.mesh_packet_id)
+        if packet_id == 0:
+            return
+        generated = self._pending_submissions.pop((node_id, packet_id), None)
+        if generated is None:
+            return
+        result = int(status.res)
+        if result in FIRMWARE_QUEUE_SUCCESS:
+            self._resolve_submission(node_id, generated)
+            return
+        self._resolve_submission(
+            node_id,
+            generated,
+            error=self._firmware_queue_error(result),
+        )
+
+    def _resolve_submission(
+        self,
+        source: str,
+        generated: GeneratedMessage,
+        *,
+        error: str | None = None,
+    ) -> None:
+        if self.current is None or generated.submitted or generated.submission_error is not None:
+            return
+        if error is None:
             generated.submitted = True
             self._submitted_count += 1
             self.current.submitted = self._submitted_count
-        except Exception as exc:
-            generated.submission_error = str(exc)
+            result = "submitted"
+        else:
+            generated.submission_error = error
             self._submission_failed_count += 1
             self.current.submission_failed = self._submission_failed_count
+            result = "submission-failed"
+        self._note_activity()
         self.event_broker.publish(
             PacketEvent(
-                monotonicSeconds=generated.generated_monotonic,
+                monotonicSeconds=time.monotonic(),
                 eventType=EventType.TRAFFIC,
                 transmitter=source,
-                intendedDestination=destination,
-                meshPacketId=packet_id,
+                intendedDestination=generated.destination_node,
+                meshPacketId=generated.packet_id,
                 trafficRunId=self.current.run_id,
-                trafficSequence=self._sequence,
-                result="submitted" if generated.submitted else "submission-failed",
+                trafficSequence=generated.sequence,
+                result=result,
+                detail=error,
             )
         )
+
+    @staticmethod
+    def _firmware_queue_error(result: int) -> str:
+        errno_names = {
+            32: "queue-full-or-unknown",
+            33: "no-interface",
+            34: "radio-disabled",
+        }
+        if result in errno_names:
+            name = errno_names[result]
+        else:
+            try:
+                name = mesh_pb2.Routing.Error.Name(result).lower().replace("_", "-")
+            except ValueError:
+                name = "unknown"
+        return f"firmware queue rejected packet: {name} (res={result})"
+
+    async def _drain(self) -> None:
+        if self.settle_seconds is not None:
+            await asyncio.sleep(self.settle_seconds)
+            self._finalize_pending_submissions()
+            return
+        if self.current is None:
+            return
+        quiet_seconds, deadline_seconds = self._drain_windows()
+        deadline = time.monotonic() + deadline_seconds
+        while True:
+            now = time.monotonic()
+            if (
+                self.current.request.kind == TrafficKind.DIRECT_TEXT
+                and not self._pending_submissions
+                and self._direct_messages_resolved()
+            ):
+                return
+            quiet_remaining = self._last_activity_monotonic + quiet_seconds - now
+            if (
+                self.current.request.kind == TrafficKind.BROADCAST_TEXT
+                and not self._pending_submissions
+                and quiet_remaining <= 0
+            ):
+                return
+            deadline_remaining = deadline - now
+            if deadline_remaining <= 0:
+                break
+            self._activity_changed.clear()
+            wait_seconds = deadline_remaining
+            if self.current.request.kind == TrafficKind.BROADCAST_TEXT:
+                wait_seconds = min(wait_seconds, max(quiet_remaining, 0.001))
+            try:
+                await asyncio.wait_for(self._activity_changed.wait(), timeout=wait_seconds)
+            except TimeoutError:
+                pass
+        self._finalize_pending_submissions()
+
+    def _drain_windows(self) -> tuple[float, float]:
+        if self.current is None:
+            return 0.0, 0.0
+        packet_airtime_seconds = max(self._maximum_packet_airtime_ms, 1) / 1000
+        retransmission_delay_seconds = max(
+            self._maximum_retransmission_delay_ms, self._maximum_packet_airtime_ms, 1
+        ) / 1000
+        quiet_seconds = max(3.0, retransmission_delay_seconds)
+        hop_transmissions = self._run_scenario.rf.hop_limit + 1
+        origin_attempts = (
+            RELIABLE_UNICAST_ATTEMPTS
+            if self.current.request.kind == TrafficKind.DIRECT_TEXT
+            and self.current.request.acknowledgment_requested
+            else 1
+        )
+        intermediate_attempts = (
+            INTERMEDIATE_TRANSMISSION_ATTEMPTS
+            if self._run_scenario.rf.hop_limit > 0
+            else 1
+        )
+        attempt_budget = max(origin_attempts, intermediate_attempts)
+        deadline_seconds = (
+            retransmission_delay_seconds * hop_transmissions * attempt_budget
+            + packet_airtime_seconds
+            + quiet_seconds
+        )
+        return quiet_seconds, min(MAX_DRAIN_SECONDS, max(quiet_seconds, deadline_seconds))
+
+    def _direct_messages_resolved(self) -> bool:
+        if self.current is None:
+            return True
+        acknowledgment_required = self.current.request.acknowledgment_requested
+        for message in self.current.generated_messages:
+            if message.submission_error is not None:
+                continue
+            if message.sequence in self._routing_terminal_sequences:
+                continue
+            delivered = message.destination_node in message.delivered_to
+            if not message.submitted or not delivered:
+                return False
+            if acknowledgment_required and not message.acknowledged:
+                return False
+        return True
+
+    def _finalize_pending_submissions(self) -> None:
+        for (source, _packet_id), generated in tuple(self._pending_submissions.items()):
+            self._resolve_submission(
+                source,
+                generated,
+                error="firmware queue admission timed out",
+            )
+        self._pending_submissions.clear()
+
+    def _note_activity(self) -> None:
+        self._last_activity_monotonic = time.monotonic()
+        self._activity_changed.set()
 
     def _destination_for(
         self,
@@ -681,6 +949,7 @@ class TrafficController:
     async def _finish(self, state: TrafficRunState) -> None:
         if self.current is None or self._frozen_result is not None:
             return
+        self._finalize_pending_submissions()
         self.state = state
         current = self.current
         current.state = state
@@ -745,8 +1014,10 @@ class TrafficController:
             else {}
         )
         expected_acknowledgments = (
-            self._generated_count
-            if self.current is not None and self.current.request.acknowledgment_requested
+            self._submitted_count
+            if self.current is not None
+            and self.current.request.kind == TrafficKind.DIRECT_TEXT
+            and self.current.request.acknowledgment_requested
             else 0
         )
         return calculate_metrics(
@@ -772,8 +1043,10 @@ class TrafficController:
 
     def _live_metrics_snapshot(self) -> MetricsSnapshot:
         expected_acknowledgments = (
-            self._generated_count
-            if self.current is not None and self.current.request.acknowledgment_requested
+            self._submitted_count
+            if self.current is not None
+            and self.current.request.kind == TrafficKind.DIRECT_TEXT
+            and self.current.request.acknowledgment_requested
             else 0
         )
         complete = calculate_metrics(
@@ -852,22 +1125,42 @@ class TrafficController:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    async def _sample_final_failed_receptions(self, *, required: bool) -> None:
+    async def _sample_final_failed_receptions(self) -> None:
         if self.failed_reception_sampler is None:
             return
         try:
-            totals = await self.failed_reception_sampler()
-        except Exception as exc:
-            detail = f"final native local statistics unavailable: {exc}"
-            if required:
-                raise RuntimeError(detail) from exc
-            if self.current is not None:
-                self.current.failure = (
-                    f"{self.current.failure}; {detail}" if self.current.failure else detail
-                )
+            sample = self._normalize_failed_reception_sample(
+                await self.failed_reception_sampler()
+            )
+        except Exception:
+            LOGGER.exception("final native local-stat sampling failed")
+            sample = FailedReceptionSample(
+                totals={},
+                missing_nodes=tuple(node.id for node in self._run_scenario.nodes),
+            )
+        if self.current is None:
             return
-        for node_id, total in totals.items():
+        missing = set(self.current.missing_local_stats_nodes)
+        missing.update(sample.missing_nodes)
+        for node_id, total in sample.totals.items():
+            if node_id not in self._latest_failed_receptions:
+                missing.add(node_id)
+                continue
             self.record_failed_receptions(node_id, total)
+        expected = {node.id for node in self._run_scenario.nodes}
+        missing.update(expected - set(sample.totals))
+        self.current.missing_local_stats_nodes = sorted(missing)
+        self.current.failed_reception_metrics_complete = not missing
+
+    @staticmethod
+    def _normalize_failed_reception_sample(
+        sample: FailedReceptionSample | Mapping[str, int] | None,
+    ) -> FailedReceptionSample:
+        if sample is None:
+            return FailedReceptionSample(totals={})
+        if isinstance(sample, FailedReceptionSample):
+            return sample
+        return FailedReceptionSample(totals=sample)
 
     def _retire_packet_ids(self) -> None:
         now = time.monotonic()
@@ -954,6 +1247,8 @@ class TrafficController:
         self._sequence = 0
         self._messages_by_packet.clear()
         self._messages_by_key.clear()
+        self._pending_submissions.clear()
+        self._routing_terminal_sequences.clear()
         self._delivered_sequences.clear()
         self._latencies_ms.clear()
         self._rf_transmitters.clear()
@@ -976,4 +1271,8 @@ class TrafficController:
         self._rf_transmission_count = 0
         self._observed_airtime_ms = 0
         self._per_node_transmit_counts.clear()
+        self._maximum_packet_airtime_ms = 0
+        self._maximum_retransmission_delay_ms = 0
+        self._last_activity_monotonic = time.monotonic()
+        self._activity_changed.clear()
         self._metrics = None

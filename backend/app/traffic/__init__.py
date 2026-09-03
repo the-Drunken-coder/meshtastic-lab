@@ -2,6 +2,7 @@
 
 from .controller import (
     DestinationStrategy,
+    FailedReceptionSample,
     PacketIdQuarantineCapacityError,
     TopologyChange,
     TrafficController,
@@ -15,6 +16,7 @@ from .controller import (
 
 __all__ = [
     "DestinationStrategy",
+    "FailedReceptionSample",
     "PacketIdQuarantineCapacityError",
     "TopologyChange",
     "TrafficController",

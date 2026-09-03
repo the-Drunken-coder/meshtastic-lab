@@ -261,7 +261,8 @@ async def test_local_stats_sampler_waits_for_fresh_per_node_responses(tmp_path: 
 
     result = await service._sample_local_stats()
 
-    assert result == {"node-1": 3, "node-2": 5}
+    assert result.totals == {"node-1": 3, "node-2": 5}
+    assert result.missing_nodes == ()
     for gateway in gateways.values():
         packet = gateway.requests[0].packet
         assert packet.to in {1, 2}
@@ -269,6 +270,55 @@ async def test_local_stats_sampler_waits_for_fresh_per_node_responses(tmp_path: 
         assert packet.decoded.want_response
         assert service._local_stats_response_ids[gateway.node_id] == packet.id
         assert gateway.reply_task is not None and gateway.reply_task.done()
+
+
+@pytest.mark.asyncio
+async def test_local_stats_sampler_retries_and_preserves_partial_results(tmp_path: Path) -> None:
+    service = SimulatorService(
+        data_root=tmp_path,
+        warmup_seconds=0,
+        local_stats_deadline_seconds=0.08,
+        local_stats_retry_seconds=0.01,
+    )
+    service.node_metrics = {
+        "node-1": service_module._NodeMetrics(),
+        "node-2": service_module._NodeMetrics(),
+    }
+    service.verifications = {
+        "node-1": SimpleNamespace(node_number=1),
+        "node-2": SimpleNamespace(node_number=2),
+    }  # type: ignore[assignment]
+
+    class RetryingStatsGateway:
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self.request_count = 0
+
+        async def send_to_radio(self, request: mesh_pb2.ToRadio, *, source: str) -> None:
+            assert source == "controller.local-stats"
+            self.request_count += 1
+            if self.node_id != "node-1" or self.request_count != 2:
+                return
+            response = mesh_pb2.FromRadio()
+            response.packet.decoded.portnum = service_module.portnums_pb2.TELEMETRY_APP
+            response.packet.decoded.request_id = request.packet.id
+            telemetry = service_module.telemetry_pb2.Telemetry()
+            telemetry.local_stats.num_packets_rx_bad = 7
+            response.packet.decoded.payload = telemetry.SerializeToString()
+            await service._on_from_radio(self.node_id, response)
+
+    gateways = {
+        "node-1": RetryingStatsGateway("node-1"),
+        "node-2": RetryingStatsGateway("node-2"),
+    }
+    service.gateways = gateways  # type: ignore[assignment]
+
+    result = await service._sample_local_stats()
+
+    assert result.totals == {"node-1": 7}
+    assert result.missing_nodes == ("node-2",)
+    assert gateways["node-1"].request_count == 2
+    assert gateways["node-2"].request_count > 1
 
 
 @pytest.mark.asyncio

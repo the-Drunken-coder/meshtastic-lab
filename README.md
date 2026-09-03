@@ -60,13 +60,13 @@ Use **Export scenario** in the UI or `GET /api/scenario/export` to save the curr
 
 ## Metrics
 
-- Generated is application messages created by the offered traffic schedule. Submitted and submission failed show whether the firmware Client API accepted each request.
+- Generated is application messages created by the offered traffic schedule. Submitted and submission failed come from the firmware admission response for each request, including queue status and pre-transmission rate-limit errors, not from socket writes.
 - Delivered counts unique generated messages exposed by an intended receiver. Receiver deliveries and receiver delivery ratio separately count every applicable node reached by each broadcast.
 - RF TX counts firmware transmitter events once, even when several receivers hear one frame. RF TX per delivery exposes flooding and retry amplification.
 - Relay TX counts transmissions where the transmitting firmware did not originate the packet.
 - Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it.
-- ACK success is separate from destination delivery. Percentiles remain unavailable until their configured sample minimum is met.
-- Failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. Collision results are labeled `native` only in the collision-enabled image.
+- ACK success is separate from destination delivery. It applies only to firmware-accepted direct messages because firmware disables acknowledgments for broadcasts. Percentiles remain unavailable until their configured sample minimum is met.
+- Failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. A partial sample keeps the run exportable and sets `failedReceptionMetricsComplete` to false with the missing nodes listed in `missingLocalStatsNodes`. Collision results are labeled `native` only in the collision-enabled image.
 
 See [fidelity](docs/fidelity.md) for exact boundaries.
 

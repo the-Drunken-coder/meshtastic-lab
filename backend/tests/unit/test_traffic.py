@@ -11,6 +11,7 @@ from backend.app.metrics import EventBroker
 from backend.app.models import Scenario, default_scenario
 from backend.app.traffic import (
     DestinationStrategy,
+    FailedReceptionSample,
     TrafficController,
     TrafficKind,
     TrafficRunRequest,
@@ -20,20 +21,30 @@ from backend.app.traffic import (
 
 
 class FakeGateway:
-    def __init__(self) -> None:
+    def __init__(self, node_id: str = "", *, queue_result: int = 0) -> None:
+        self.node_id = node_id
+        self.queue_result = queue_result
+        self.controller: TrafficController | None = None
         self.sent: list[mesh_pb2.ToRadio] = []
+        self.sent_event = asyncio.Event()
 
     async def send_to_radio(self, message: mesh_pb2.ToRadio, *, source: str = "controller") -> None:
         del source
         copy = mesh_pb2.ToRadio()
         copy.CopyFrom(message)
         self.sent.append(copy)
+        self.sent_event.set()
+        if self.controller is not None and message.WhichOneof("payload_variant") == "packet":
+            status = mesh_pb2.FromRadio()
+            status.queueStatus.res = self.queue_result
+            status.queueStatus.mesh_packet_id = message.packet.id
+            await self.controller.handle_from_radio(self.node_id, status)
 
 
 @pytest.mark.asyncio
 async def test_deterministic_traffic_schedule_and_persistence(tmp_path: Path) -> None:
     scenario = default_scenario(3)
-    gateways = {node.id: FakeGateway() for node in scenario.nodes}
+    gateways = {node.id: FakeGateway(node.id) for node in scenario.nodes}
     controller = TrafficController(
         scenario=scenario,
         gateways=gateways,  # type: ignore[arg-type]
@@ -42,6 +53,8 @@ async def test_deterministic_traffic_schedule_and_persistence(tmp_path: Path) ->
         results_root=tmp_path,
         settle_seconds=0,
     )
+    for gateway in gateways.values():
+        gateway.controller = controller
     request = TrafficRunRequest(
         kind=TrafficKind.DIRECT_TEXT,
         sourceNodes=["node-1"],
@@ -90,8 +103,8 @@ def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:
 
 def _controller(tmp_path: Path, scenario: Scenario | None = None) -> TrafficController:
     selected = default_scenario(3) if scenario is None else scenario
-    gateways = {node.id: FakeGateway() for node in selected.nodes}
-    return TrafficController(
+    gateways = {node.id: FakeGateway(node.id) for node in selected.nodes}
+    controller = TrafficController(
         scenario=selected,
         gateways=gateways,  # type: ignore[arg-type]
         hardware_ids={node.id: index for index, node in enumerate(selected.nodes, start=1)},
@@ -99,6 +112,9 @@ def _controller(tmp_path: Path, scenario: Scenario | None = None) -> TrafficCont
         results_root=tmp_path,
         settle_seconds=0,
     )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    return controller
 
 
 def _text_from_radio(
@@ -346,7 +362,7 @@ async def test_final_local_stats_are_measured_against_explicit_baseline(tmp_path
     selected = default_scenario(3)
     controller = TrafficController(
         scenario=selected,
-        gateways={node.id: FakeGateway() for node in selected.nodes},  # type: ignore[arg-type]
+        gateways={node.id: FakeGateway(node.id) for node in selected.nodes},  # type: ignore[arg-type]
         hardware_ids={node.id: index for index, node in enumerate(selected.nodes, start=1)},
         event_broker=EventBroker(),
         results_root=tmp_path,
@@ -548,3 +564,345 @@ async def test_traffic_start_captures_scenario_snapshot(tmp_path: Path) -> None:
     assert controller.current is not None
     assert controller.current.scenario_snapshot["rf"]["hopLimit"] == 2
     await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_firmware_queue_rejection_is_a_submission_failure(tmp_path: Path) -> None:
+    scenario = default_scenario(2)
+    gateways = {
+        node.id: FakeGateway(node.id, queue_result=32) for node in scenario.nodes
+    }
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+
+    controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1"],
+            fixedDestination="node-2",
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+    )
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.requested == 1
+    assert result.submitted == 0
+    assert result.submission_failed == 1
+    assert result.transmitted == 0
+    assert result.generated_messages[0].submitted is False
+    assert "res=32" in (result.generated_messages[0].submission_error or "")
+
+
+@pytest.mark.asyncio
+async def test_text_rate_limit_reclassifies_zero_queue_status_as_rejected(
+    tmp_path: Path,
+) -> None:
+    scenario = default_scenario(2)
+    gateways = {node.id: FakeGateway(node.id) for node in scenario.nodes}
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=10,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1"],
+            fixedDestination="node-2",
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+    )
+    await gateways["node-1"].sent_event.wait()
+    generated = controller.current.generated_messages[0] if controller.current else None
+    assert generated is not None and generated.submitted
+    assert int(getattr(gateways["node-1"].sent[0].packet, "from")) == 1
+
+    rejection = mesh_pb2.FromRadio()
+    setattr(rejection.packet, "from", 1)
+    rejection.packet.decoded.portnum = portnums_pb2.ROUTING_APP
+    rejection.packet.decoded.request_id = generated.packet_id
+    rejection.packet.decoded.payload = mesh_pb2.Routing(
+        error_reason=mesh_pb2.Routing.Error.RATE_LIMIT_EXCEEDED
+    ).SerializeToString()
+    await controller.handle_from_radio("node-1", rejection)
+    await controller.stop()
+
+    result = controller.result()
+    assert result is not None
+    assert result.requested == 1
+    assert result.submitted == 0
+    assert result.submission_failed == 1
+    assert result.transmitted == 0
+    assert "rate limit" in (result.generated_messages[0].submission_error or "")
+
+
+@pytest.mark.asyncio
+async def test_broadcast_acknowledgment_ratio_is_unavailable(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.BROADCAST_TEXT,
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+            acknowledgmentRequested=True,
+        )
+    )
+    result = await controller.wait(deadline_seconds=2)
+
+    gateway = controller.gateways["node-1"]
+    assert isinstance(gateway, FakeGateway)
+    assert gateway.sent[0].packet.want_ack is False
+    assert result.metrics.acknowledgment_success_ratio is None
+
+
+@pytest.mark.asyncio
+async def test_direct_ack_ratio_uses_firmware_accepted_submissions(tmp_path: Path) -> None:
+    scenario = default_scenario(3)
+    gateways = {
+        "node-1": FakeGateway("node-1"),
+        "node-2": FakeGateway("node-2", queue_result=32),
+        "node-3": FakeGateway("node-3"),
+    }
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2, "node-3": 3},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=10,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    run_id = controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1", "node-2"],
+            fixedDestination="node-3",
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+            acknowledgmentRequested=True,
+        )
+    )
+    await asyncio.gather(
+        gateways["node-1"].sent_event.wait(), gateways["node-2"].sent_event.wait()
+    )
+    assert controller.current is not None
+    accepted = next(
+        message
+        for message in controller.current.generated_messages
+        if message.source_node == "node-1"
+    )
+    controller.record_rf_transmission(
+        "node-1",
+        _rf_packet(
+            run_id=run_id,
+            sequence=accepted.sequence,
+            packet_id=accepted.packet_id,
+            origin=1,
+        ),
+        10,
+    )
+    acknowledgment = mesh_pb2.FromRadio()
+    setattr(acknowledgment.packet, "from", 3)
+    acknowledgment.packet.decoded.portnum = portnums_pb2.ROUTING_APP
+    acknowledgment.packet.decoded.request_id = accepted.packet_id
+    acknowledgment.packet.decoded.payload = mesh_pb2.Routing(
+        error_reason=mesh_pb2.Routing.Error.NONE
+    ).SerializeToString()
+    await controller.handle_from_radio("node-1", acknowledgment)
+    await controller.stop()
+
+    result = controller.result()
+    assert result is not None
+    assert result.submitted == 1
+    assert result.submission_failed == 1
+    assert result.metrics.acknowledgment_success_ratio == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_final_local_stats_do_not_fail_run(tmp_path: Path) -> None:
+    async def sample_local_stats() -> FailedReceptionSample:
+        return FailedReceptionSample(
+            totals={"node-1": 12, "node-3": 1},
+            missing_nodes=("node-2",),
+        )
+
+    scenario = default_scenario(3)
+    gateways = {node.id: FakeGateway(node.id) for node in scenario.nodes}
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2, "node-3": 3},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0,
+        failed_reception_sampler=sample_local_stats,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    run_id = controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        ),
+        failed_reception_baseline={"node-1": 10, "node-2": 4, "node-3": 0},
+    )
+
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.state == TrafficRunState.COMPLETED
+    assert result.failure is None
+    assert result.metrics.failed_receptions == 3
+    assert result.failed_reception_metrics_complete is False
+    assert result.missing_local_stats_nodes == ["node-2"]
+    assert (tmp_path / f"{run_id}.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_long_slow_direct_delivery_after_three_seconds_is_included(tmp_path: Path) -> None:
+    scenario = default_scenario(2)
+    scenario = scenario.model_copy(
+        deep=True,
+        update={"rf": scenario.rf.model_copy(update={"modem_preset": "LONG_SLOW"})},
+    )
+    gateways = {node.id: FakeGateway(node.id) for node in scenario.nodes}
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    run_id = controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1"],
+            fixedDestination="node-2",
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+            acknowledgmentRequested=False,
+        )
+    )
+
+    async def deliver_after_old_settle_window() -> None:
+        await gateways["node-1"].sent_event.wait()
+        await asyncio.sleep(3.1)
+        assert controller.current is not None
+        generated = controller.current.generated_messages[0]
+        await controller.handle_from_radio(
+            "node-2",
+            _text_from_radio(
+                run_id=run_id,
+                sequence=generated.sequence,
+                packet_id=generated.packet_id,
+                origin=1,
+            ),
+        )
+
+    delivery = asyncio.create_task(deliver_after_old_settle_window())
+    result = await controller.wait(deadline_seconds=5)
+    await delivery
+
+    assert result.state == TrafficRunState.COMPLETED
+    assert result.delivered == 1
+    assert controller.settle_seconds is None
+    assert controller._drain_windows()[0] > 3
+
+
+@pytest.mark.asyncio
+async def test_drain_covers_pinned_origin_and_intermediate_retry_budgets(
+    tmp_path: Path,
+) -> None:
+    scenario = default_scenario(2)
+    scenario = scenario.model_copy(
+        deep=True,
+        update={"rf": scenario.rf.model_copy(update={"hop_limit": 1})},
+    )
+    gateways = {node.id: FakeGateway(node.id) for node in scenario.nodes}
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1"],
+            fixedDestination="node-2",
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+            acknowledgmentRequested=True,
+        )
+    )
+    await gateways["node-1"].sent_event.wait()
+
+    quiet_seconds, deadline_seconds = controller._drain_windows()
+    retransmission_delay_seconds = controller._maximum_retransmission_delay_ms / 1000
+
+    assert quiet_seconds >= retransmission_delay_seconds
+    assert deadline_seconds >= retransmission_delay_seconds * 2 * 3 + quiet_seconds
+    await controller.stop()
+
+    broadcast_gateways = {
+        node.id: FakeGateway(node.id) for node in scenario.nodes
+    }
+    broadcast = TrafficController(
+        scenario=scenario,
+        gateways=broadcast_gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0,
+    )
+    for gateway in broadcast_gateways.values():
+        gateway.controller = broadcast
+    broadcast.start(
+        TrafficRunRequest(
+            kind=TrafficKind.BROADCAST_TEXT,
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+            acknowledgmentRequested=False,
+        )
+    )
+    await broadcast_gateways["node-1"].sent_event.wait()
+
+    broadcast_quiet, broadcast_deadline = broadcast._drain_windows()
+    broadcast_retry_delay = broadcast._maximum_retransmission_delay_ms / 1000
+
+    assert broadcast_deadline >= broadcast_retry_delay * 2 * 2 + broadcast_quiet
+    broadcast._maximum_retransmission_delay_ms = 300_000
+    assert broadcast._drain_windows()[1] == 300
+    await broadcast.stop()

@@ -139,6 +139,8 @@ interface TrafficRunSummary {
   submissionFailed: number;
   transmitted: number;
   delivered: number;
+  failedReceptionMetricsComplete: boolean;
+  missingLocalStatsNodes: string[];
   metrics: Metrics;
   failure: string | null;
 }

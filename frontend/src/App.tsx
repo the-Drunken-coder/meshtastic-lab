@@ -536,7 +536,7 @@ function App() {
                 <div><dt>Receivers / broadcast</dt><dd>Completed export</dd></div>
                 <div><dt>Relay TX</dt><dd>{metrics.relayTransmissions}</dd></div>
                 <div><dt>Duplicate RX</dt><dd>{metrics.duplicateReceptions}</dd></div>
-                <div><dt>Failed/bad RX</dt><dd>{metrics.failedReceptions}</dd></div>
+                <div><dt>Failed/bad RX</dt><dd>{metrics.failedReceptions}{traffic.state !== "IDLE" && !traffic.failedReceptionMetricsComplete ? ` (incomplete: ${traffic.missingLocalStatsNodes.join(", ")})` : ""}</dd></div>
                 <div><dt>P99</dt><dd>{formatMilliseconds(metrics.p99LatencyMs)}</dd></div>
                 <div><dt>Drops</dt><dd>{Object.keys(metrics.dropsByReason).length ? Object.entries(metrics.dropsByReason).map(([reason, count]) => `${reason}: ${count}`).join(", ") : "None observed"}</dd></div>
                 <div><dt>Per-node TX</dt><dd>{Object.keys(metrics.perNodeTransmitCounts).length ? Object.entries(metrics.perNodeTransmitCounts).map(([node, count]) => `${node}: ${count}`).join(", ") : "None observed"}</dd></div>

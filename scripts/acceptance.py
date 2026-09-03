@@ -256,7 +256,7 @@ async def run(base_url: str, *, start_stack: bool) -> dict[str, Any]:
             traffic_started = await client.post("/api/traffic/runs", json=traffic_request)
             traffic_started.raise_for_status()
             run_id = traffic_started.json()["runId"]
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + 330
             result: dict[str, Any] = {}
             while time.monotonic() < deadline:
                 result = (await client.get("/api/traffic/runs/current")).json()
