@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator
@@ -90,6 +91,24 @@ class EventSubscription:
             self.queue.get_nowait()
             self.queue.put_nowait(event)
 
+    def restart(self, stream_id: str) -> None:
+        """Drop queued evidence and tell the client to restart its cursor."""
+
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.stream_id = stream_id
+        self.dropped = 0
+        self._delivered_drop_notice_last = False
+        self.queue.put_nowait(
+            PacketEvent(
+                streamId=stream_id,
+                monotonicSeconds=time.monotonic(),
+                eventType=EventType.UI_EVENTS_DROPPED,
+                result="stream-reset",
+                detail="packet evidence was cleared by simulation reset",
+            )
+        )
+
     async def next(self) -> PacketEvent:
         if self.dropped and not self._delivered_drop_notice_last:
             dropped = self.dropped
@@ -135,6 +154,16 @@ class EventBroker:
         for subscriber in self._subscribers:
             subscriber.publish(sequenced)
         return sequenced
+
+    def clear(self) -> None:
+        """Clear retained evidence and restart every connected client cursor."""
+
+        self._history.clear()
+        self._sequence = 0
+        self.history_evictions = 0
+        self.stream_id = str(uuid.uuid4())
+        for subscriber in self._subscribers:
+            subscriber.restart(self.stream_id)
 
     def recent(
         self,

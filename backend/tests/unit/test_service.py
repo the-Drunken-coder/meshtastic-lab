@@ -951,12 +951,21 @@ async def test_archived_process_logs_survive_cleanup_until_reset(tmp_path: Path)
     saved_result = service.results_root / "saved.json"
     saved_result.write_text("{}\n", encoding="utf-8")
     service.scenario = service.scenario.model_copy(update={"name": "edited"})
+    old_stream_id = service.event_broker.stream_id
+    service.event_broker.publish(
+        PacketEvent(monotonicSeconds=1, eventType=EventType.RF_TRANSMIT)
+    )
 
     result = await service.reset()
 
-    assert result.detail == "Scenario reset to the five-node full mesh; saved runs were preserved"
+    assert result.detail == (
+        "Scenario reset to the five-node full mesh; packet evidence and daemon logs were cleared; "
+        "saved runs were preserved"
+    )
     assert service.scenario.name == "five-node-full-mesh"
     assert not service.supervisor.has_logs("node-1")
+    assert service.event_broker.recent() == []
+    assert service.event_broker.stream_id != old_stream_id
     assert saved_result.read_text(encoding="utf-8") == "{}\n"
 
 

@@ -54,7 +54,7 @@ V1 permits one external client per node. A second client to that same node is re
 
 ## Scenarios and runs
 
-Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. Reset is also stopped-only. It restores the five-node full-mesh scenario and clears archived in-memory daemon logs. It does not delete completed run files. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running, including during traffic runs. Completed exports keep the starting scenario and an ordered timeline of changes made during the run.
+Scenario fields are editable only while stopped. Use the node-count and RF controls, assign roles, and save. Reset is also stopped-only. It restores the five-node full-mesh scenario and clears packet evidence and archived in-memory daemon logs. It does not delete completed run files. The topology matrix is directed: a row can transmit to a column when its cell is on. Link cells and the Full mesh, Line, Star, and All isolated presets remain available while running, including during traffic runs. Completed exports keep the starting scenario and an ordered timeline of changes made during the run.
 
 The checked-in JSON scenarios under `scenarios/` are valid API payloads. To load one without the UI:
 
@@ -64,21 +64,26 @@ curl -X PUT http://127.0.0.1:8080/api/scenario \
   --data-binary @scenarios/five-node-line.json
 ```
 
-Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. A request may schedule at most 10,000 messages, with at most 600 messages per minute per source and a one-hour duration. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
+Use **Export scenario** in the UI or `GET /api/scenario/export` to save the current definition. Completed traffic results are persisted under the Compose data volume at `/data/runs/<run-id>.json` and are available from the UI or `GET /api/traffic/runs/<run-id>/export`. A terminal traffic status means the immutable export is already available. A request may schedule at most 10,000 messages, with at most 600 messages per minute per source and a one-hour duration. The live traffic endpoint returns bounded counters and aggregates. Per-message records appear only in the completed export.
 
 Packet events and traffic-result exports use `schemaVersion: 1`. Packet cursors pair a per-process `streamId` with the event sequence. Reconnecting clients send both values to `/api/events/ws`; the server replays retained events after the cursor. A changed stream clears the old client history before replay, while an expired sequence reports a history gap. The UI refreshes the authoritative lifecycle, scenario, node, and traffic snapshots after any drop notice.
 
 ## Metrics
 
 - Generated is application messages created by the offered traffic schedule. Submitted and submission failed come from the firmware admission response for each request, including queue status and pre-transmission rate-limit errors, not from socket writes.
+- `sourceTiming` controls multi-source phasing without changing the per-source rate or message count. `aligned` preserves simultaneous worst-case bursts, `evenly-staggered` spreads sources over one interval, and `deterministic-jitter` assigns each source a seeded offset on a separate random stream. A non-aligned run can extend generation by less than one message interval.
+- A traffic request can replace the legacy single source definition with named `flows`. Flows run concurrently under one run ID and may use different source sets, rates, timing, and destination policies. Packet type, payload size, duration, acknowledgment policy, and seed remain run-wide.
 - Delivered counts unique generated messages exposed by an intended receiver. Receiver deliveries and receiver delivery ratio separately count every applicable node reached by each broadcast.
 - RF TX counts firmware transmitter events once, even when several receivers hear one frame. RF TX per delivery exposes flooding and retry amplification.
 - Relay TX counts transmissions where the transmitting firmware did not originate the packet.
 - Airtime uses the actual firmware-produced packet length and the selected modem preset. Receiver count does not multiply it. The total is also broken down by transmitting node.
 - ACK success is separate from destination delivery. It applies only to firmware-accepted direct messages because firmware disables acknowledgments for broadcasts. Percentiles remain unavailable until their configured sample minimum is met. Live percentiles use the most recent 2,048 deliveries; completed results use the full run.
 - Duplicate and failed or bad receptions come from native firmware local statistics sampled immediately before and after each traffic run. A partial sample keeps the run exportable and sets `failedReceptionMetricsComplete` to false with the missing nodes listed in `missingLocalStatsNodes`. Collision results are labeled `native` only in the collision-enabled image.
+- Live summaries expose `phase`, `pendingFirmwareAdmissions`, `unresolvedDirectMessages`, and `drainDeadlineSecondsRemaining` so an apparently idle run distinguishes generation, RF drain, result finalization, and terminal state.
 
 See [fidelity](docs/fidelity.md) for exact boundaries.
+
+For repeatable preset sweeps, see the config-driven [system bench](experiments/README.md).
 
 ## Test and acceptance commands
 

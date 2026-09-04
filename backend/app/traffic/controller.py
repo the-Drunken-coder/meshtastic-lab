@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import random
@@ -44,6 +45,8 @@ MAX_TOPOLOGY_CHANGES_PER_RUN = 10_000
 MAX_TRAFFIC_MESSAGES_PER_RUN = 10_000
 LIVE_LATENCY_SAMPLE_SIZE = 2048
 PACKET_ID_RNG_SALT = 0x4D4C5F5041434B4554
+SOURCE_TIMING_RNG_SALT = 0x4D4C5F534F55524345
+FLOW_DESTINATION_RNG_SALT = 0x4D4C5F464C4F575F
 FIRMWARE_QUEUE_SUCCESS = {0, 35}
 INTERMEDIATE_TRANSMISSION_ATTEMPTS = 2
 RELIABLE_UNICAST_ATTEMPTS = 3
@@ -87,6 +90,12 @@ class DestinationStrategy(StrEnum):
     DETERMINISTIC_RANDOM = "deterministic-random"
 
 
+class SourceTiming(StrEnum):
+    ALIGNED = "aligned"
+    EVENLY_STAGGERED = "evenly-staggered"
+    DETERMINISTIC_JITTER = "deterministic-jitter"
+
+
 class TrafficRunState(StrEnum):
     IDLE = "IDLE"
     RUNNING = "RUNNING"
@@ -96,11 +105,35 @@ class TrafficRunState(StrEnum):
     FAILED = "FAILED"
 
 
+class TrafficRunPhase(StrEnum):
+    GENERATING = "GENERATING"
+    DRAINING = "DRAINING"
+    FINALIZING = "FINALIZING"
+    TERMINAL = "TERMINAL"
+
+
+class TrafficFlow(BaseModel):
+    """One source cadence and destination policy within a traffic run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")]
+    source_nodes: list[str] = Field(alias="sourceNodes", min_length=1, max_length=10)
+    destination_strategy: DestinationStrategy = Field(
+        default=DestinationStrategy.FIXED, alias="destinationStrategy"
+    )
+    fixed_destination: str | None = Field(default=None, alias="fixedDestination")
+    messages_per_minute: Annotated[float, Field(gt=0, le=600)] = Field(
+        default=6, alias="messagesPerMinute"
+    )
+    source_timing: SourceTiming = Field(default=SourceTiming.ALIGNED, alias="sourceTiming")
+
+
 class TrafficRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: TrafficKind = TrafficKind.BROADCAST_TEXT
-    source_nodes: list[str] = Field(alias="sourceNodes", min_length=1, max_length=10)
+    source_nodes: list[str] = Field(default_factory=list, alias="sourceNodes", max_length=10)
     destination_strategy: DestinationStrategy = Field(
         default=DestinationStrategy.FIXED, alias="destinationStrategy"
     )
@@ -113,20 +146,58 @@ class TrafficRunRequest(BaseModel):
         default=10, alias="durationSeconds"
     )
     acknowledgment_requested: bool = Field(default=True, alias="acknowledgmentRequested")
+    source_timing: SourceTiming = Field(default=SourceTiming.ALIGNED, alias="sourceTiming")
+    flows: list[TrafficFlow] = Field(default_factory=list, max_length=10)
     seed: int = 1
 
     @model_validator(mode="after")
     def validate_request(self) -> TrafficRunRequest:
+        if self.flows and self.source_nodes:
+            raise ValueError("use either flows or sourceNodes, not both")
+        if not self.flows and not self.source_nodes:
+            raise ValueError("at least one traffic source or flow is required")
+        if len({flow.name for flow in self.flows}) != len(self.flows):
+            raise ValueError("traffic flow names must be unique")
         if self.kind == TrafficKind.DIRECT_TEXT:
-            if self.destination_strategy == DestinationStrategy.FIXED and self.fixed_destination is None:
-                raise ValueError("fixedDestination is required for fixed direct traffic")
+            destinations = (
+                [
+                    (flow.name, flow.destination_strategy, flow.fixed_destination)
+                    for flow in self.flows
+                ]
+                if self.flows
+                else [("default", self.destination_strategy, self.fixed_destination)]
+            )
+            missing = [
+                name
+                for name, strategy, destination in destinations
+                if strategy == DestinationStrategy.FIXED and destination is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"fixedDestination is required for fixed direct traffic flow: {missing[0]}"
+                )
         return self
+
+    def scheduling_flows(self) -> list[TrafficFlow]:
+        if self.flows:
+            return self.flows
+        return [
+            TrafficFlow(
+                name="default",
+                sourceNodes=self.source_nodes,
+                destinationStrategy=self.destination_strategy,
+                fixedDestination=self.fixed_destination,
+                messagesPerMinute=self.messages_per_minute,
+                sourceTiming=self.source_timing,
+            )
+        ]
 
 
 class GeneratedMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sequence: int
+    flow: str = "default"
     source_node: str = Field(alias="sourceNode")
     destination_node: str = Field(alias="destinationNode")
     packet_id: int = Field(alias="packetId")
@@ -136,6 +207,7 @@ class GeneratedMessage(BaseModel):
     transmitted: bool = False
     delivered_to: list[str] = Field(default_factory=list, alias="deliveredTo")
     acknowledged: bool = False
+    latency_ms: float | None = Field(default=None, alias="latencyMs")
 
 
 class TopologyChange(BaseModel):
@@ -209,6 +281,7 @@ class TrafficRunSummary(_ProvenanceFields):
 
     run_id: str = Field(alias="runId")
     state: TrafficRunState
+    phase: TrafficRunPhase = TrafficRunPhase.TERMINAL
     request: TrafficRunRequest
     scenario_snapshot: dict[str, object] = Field(alias="scenarioSnapshot")
     started_at: datetime = Field(alias="startedAt")
@@ -224,6 +297,11 @@ class TrafficRunSummary(_ProvenanceFields):
     )
     missing_local_stats_nodes: list[str] = Field(
         default_factory=list, alias="missingLocalStatsNodes"
+    )
+    pending_firmware_admissions: int = Field(default=0, alias="pendingFirmwareAdmissions")
+    unresolved_direct_messages: int = Field(default=0, alias="unresolvedDirectMessages")
+    drain_deadline_seconds_remaining: float | None = Field(
+        default=None, alias="drainDeadlineSecondsRemaining"
     )
     metrics: MetricsSummary
     failure: str | None = None
@@ -276,6 +354,8 @@ class TrafficController:
         self._finalization_done = asyncio.Event()
         self._finalization_done.set()
         self._finalization_wait_timed_out = False
+        self._phase = TrafficRunPhase.TERMINAL
+        self._drain_deadline_monotonic: float | None = None
         self._run_scenario = scenario
         self._sequence = 0
         self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
@@ -372,6 +452,7 @@ class TrafficController:
         )
         self._frozen_result = None
         self.state = TrafficRunState.RUNNING
+        self._phase = TrafficRunPhase.GENERATING
         self._task = asyncio.create_task(self._run(), name=f"traffic-{run_id}")
         LOGGER.info("traffic run started", extra={"traffic_run_id": run_id})
         return run_id
@@ -413,7 +494,7 @@ class TrafficController:
             TrafficRunState.FAILED,
         }:
             return True
-        self.state = TrafficRunState.FAILED
+        self.state = TrafficRunState.STOPPING
         self.current.failure = reason
         await self._cancel_run_task()
         self._finalize_pending_submissions()
@@ -466,7 +547,8 @@ class TrafficController:
         metrics = self._live_metrics()
         return TrafficRunSummary(
             runId=result.run_id,
-            state=result.state,
+            state=self.state,
+            phase=self._phase,
             request=result.request,
             scenarioSnapshot=result.scenario_snapshot,
             firmwareCommit=result.firmware_commit,
@@ -486,6 +568,9 @@ class TrafficController:
             delivered=self._unique_deliveries,
             failedReceptionMetricsComplete=result.failed_reception_metrics_complete,
             missingLocalStatsNodes=result.missing_local_stats_nodes,
+            pendingFirmwareAdmissions=len(self._pending_submissions),
+            unresolvedDirectMessages=self._unresolved_direct_messages(),
+            drainDeadlineSecondsRemaining=self._drain_deadline_seconds_remaining(),
             metrics=metrics,
             failure=result.failure,
         )
@@ -508,7 +593,7 @@ class TrafficController:
     def record_rf_transmission(
         self, transmitter: str, packet: mesh_pb2.MeshPacket, packet_airtime_ms: int
     ) -> tuple[str, int] | None:
-        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+        if self.current is None or not self._accepts_run_events():
             return None
         message = self._message_for_packet_identity(packet, transmitter=transmitter)
         if message is None or not message.submitted:
@@ -538,7 +623,7 @@ class TrafficController:
         return self.current.run_id, message.sequence
 
     def record_drop(self, transmitter: str, packet: mesh_pb2.MeshPacket, reason: str) -> None:
-        if self.current is None or self.state not in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+        if self.current is None or not self._accepts_run_events():
             return
         message = self._message_for_packet_identity(packet, transmitter=transmitter)
         if message is None or not message.submitted:
@@ -549,11 +634,7 @@ class TrafficController:
         self._publish_metric_update({"dropsByReason": dict(self._drop_counts)})
 
     def record_failed_receptions(self, node_id: str, total: int) -> None:
-        if self.current is None or self.state not in {
-            TrafficRunState.RUNNING,
-            TrafficRunState.STOPPING,
-            TrafficRunState.FAILED,
-        }:
+        if self.current is None or not self._accepts_run_events(allow_failed=True):
             return
         previous = self._latest_failed_receptions.get(node_id)
         self._latest_failed_receptions[node_id] = total
@@ -565,11 +646,7 @@ class TrafficController:
             self._publish_metric_update({"failedReceptions": self._failed_receptions})
 
     def record_duplicate_receptions(self, node_id: str, total: int) -> None:
-        if self.current is None or self.state not in {
-            TrafficRunState.RUNNING,
-            TrafficRunState.STOPPING,
-            TrafficRunState.FAILED,
-        }:
+        if self.current is None or not self._accepts_run_events(allow_failed=True):
             return
         previous = self._latest_duplicate_receptions.get(node_id)
         self._latest_duplicate_receptions[node_id] = total
@@ -581,10 +658,7 @@ class TrafficController:
             self._publish_metric_update({"duplicateReceptions": self._duplicates})
 
     def ensure_topology_change_capacity(self, additional_changes: int) -> None:
-        if self.current is None or self.state not in {
-            TrafficRunState.RUNNING,
-            TrafficRunState.STOPPING,
-        }:
+        if self.current is None or not self._accepts_run_events():
             return
         if len(self.current.topology_changes) + additional_changes > MAX_TOPOLOGY_CHANGES_PER_RUN:
             raise RuntimeError(
@@ -592,10 +666,7 @@ class TrafficController:
             )
 
     def record_topology_change(self, event: PacketEvent, link: DirectedLink) -> None:
-        if self.current is None or self.state not in {
-            TrafficRunState.RUNNING,
-            TrafficRunState.STOPPING,
-        }:
+        if self.current is None or not self._accepts_run_events():
             return
         self.ensure_topology_change_capacity(1)
         self.current.topology_changes.append(
@@ -607,15 +678,12 @@ class TrafficController:
         )
 
     def set_event_loop_lag(self, lag_ms: float) -> None:
-        if self.current is not None and self.state in {TrafficRunState.RUNNING, TrafficRunState.STOPPING}:
+        if self.current is not None and self._accepts_run_events():
             self._event_loop_lag_ms = lag_ms
             self._publish_metric_update({"eventLoopLagMs": lag_ms})
 
     async def handle_from_radio(self, node_id: str, message: mesh_pb2.FromRadio) -> None:
-        if self.current is None or self.state not in {
-            TrafficRunState.RUNNING,
-            TrafficRunState.STOPPING,
-        }:
+        if self.current is None or not self._accepts_run_events():
             return
         variant = message.WhichOneof("payload_variant")
         if variant == "queueStatus":
@@ -649,6 +717,7 @@ class TrafficController:
                 self._delivered_sequences.add(sequence)
                 self._unique_deliveries += 1
             latency_ms = (time.monotonic() - generated.generated_monotonic) * 1000
+            generated.latency_ms = latency_ms
             self._latencies_ms.append(latency_ms)
             self._live_latencies_ms.append(latency_ms)
             self._note_activity()
@@ -772,33 +841,83 @@ class TrafficController:
         if self.current is None:
             return
         request = self.current.request
-        destination_randomizer = random.Random(request.seed)
+        flows = request.scheduling_flows()
         packet_id_randomizer = random.Random(request.seed ^ PACKET_ID_RNG_SALT)
-        interval = 60 / request.messages_per_minute
         started = time.monotonic()
-        messages_per_source = self._messages_per_source(request)
-        next_tick = {source: 0 for source in request.source_nodes}
-        round_robin = {source: 0 for source in request.source_nodes}
+        intervals = {
+            index: 60 / flow.messages_per_minute for index, flow in enumerate(flows)
+        }
+        messages_per_source = {
+            index: self._messages_per_flow(request, flow) for index, flow in enumerate(flows)
+        }
+        source_offsets = {
+            index: self._flow_source_offsets(
+                flow,
+                intervals[index],
+                self._flow_seed(request.seed, flow.name, SOURCE_TIMING_RNG_SALT),
+            )
+            for index, flow in enumerate(flows)
+        }
+        schedule_order = {
+            (flow_index, source): (flow_index, source_index)
+            for flow_index, flow in enumerate(flows)
+            for source_index, source in enumerate(flow.source_nodes)
+        }
+        next_tick = dict.fromkeys(schedule_order, 0)
+        round_robin = {
+            index: dict.fromkeys(flow.source_nodes, 0) for index, flow in enumerate(flows)
+        }
+        destination_randomizers = {
+            index: random.Random(
+                request.seed
+                if not request.flows
+                else self._flow_seed(
+                    request.seed,
+                    flows[index].name,
+                    FLOW_DESTINATION_RNG_SALT,
+                )
+            )
+            for index in range(len(flows))
+        }
         try:
             while next_tick:
-                source = min(next_tick, key=next_tick.__getitem__)
-                tick = next_tick[source]
-                scheduled = started + tick * interval
-                await asyncio.sleep(max(0, scheduled - time.monotonic()))
-                destination = self._destination_for(
-                    request,
-                    source,
-                    randomizer=destination_randomizer,
-                    round_robin=round_robin,
+                flow_index, source = min(
+                    next_tick,
+                    key=lambda candidate: (
+                        source_offsets[candidate[0]][candidate[1]]
+                        + next_tick[candidate] * intervals[candidate[0]],
+                        schedule_order[candidate],
+                    ),
                 )
-                await self._submit(source, destination, packet_id_randomizer)
-                if tick + 1 == messages_per_source:
-                    del next_tick[source]
+                key = (flow_index, source)
+                flow = flows[flow_index]
+                tick = next_tick[key]
+                scheduled = (
+                    started
+                    + source_offsets[flow_index][source]
+                    + tick * intervals[flow_index]
+                )
+                await asyncio.sleep(max(0, scheduled - time.monotonic()))
+                destination = self._flow_destination_for(
+                    request.kind,
+                    flow,
+                    source,
+                    randomizer=destination_randomizers[flow_index],
+                    round_robin=round_robin[flow_index],
+                )
+                await self._submit(
+                    source,
+                    destination,
+                    packet_id_randomizer,
+                    flow_name=flow.name,
+                )
+                if tick + 1 == messages_per_source[flow_index]:
+                    del next_tick[key]
                 else:
-                    next_tick[source] = tick + 1
+                    next_tick[key] = tick + 1
+            self._phase = TrafficRunPhase.DRAINING
             await self._drain()
             await self._sample_final_failed_receptions()
-            self.state = TrafficRunState.COMPLETED
             await self._finish(TrafficRunState.COMPLETED)
         except asyncio.CancelledError:
             raise
@@ -807,12 +926,19 @@ class TrafficController:
                 "traffic run failed",
                 extra={"traffic_run_id": self.current.run_id if self.current is not None else None},
             )
-            self.state = TrafficRunState.FAILED
+            self.state = TrafficRunState.STOPPING
             if self.current is not None:
                 self.current.failure = str(exc)
             await self._finish(TrafficRunState.FAILED)
 
-    async def _submit(self, source: str, destination: str, randomizer: random.Random) -> None:
+    async def _submit(
+        self,
+        source: str,
+        destination: str,
+        randomizer: random.Random,
+        *,
+        flow_name: str = "default",
+    ) -> None:
         if self.current is None:
             return
         self._sequence += 1
@@ -842,6 +968,7 @@ class TrafficController:
         packet.decoded.payload = payload
         generated = GeneratedMessage(
             sequence=self._sequence,
+            flow=flow_name,
             sourceNode=source,
             destinationNode=destination,
             packetId=packet_id,
@@ -959,35 +1086,43 @@ class TrafficController:
 
     async def _drain(self) -> None:
         if self.settle_seconds is not None:
-            await asyncio.sleep(self.settle_seconds)
-            self._finalize_pending_submissions()
+            self._drain_deadline_monotonic = time.monotonic() + self.settle_seconds
+            try:
+                await asyncio.sleep(self.settle_seconds)
+                self._finalize_pending_submissions()
+            finally:
+                self._drain_deadline_monotonic = None
             return
         if self.current is None:
             return
         quiet_seconds, deadline_seconds = self._drain_windows()
         deadline = time.monotonic() + deadline_seconds
-        while True:
-            now = time.monotonic()
-            quiet_remaining = self._last_activity_monotonic + quiet_seconds - now
-            messages_resolved = (
-                self.current.request.kind == TrafficKind.BROADCAST_TEXT
-                or self._direct_messages_resolved()
-            )
-            ready_to_settle = not self._pending_submissions and messages_resolved
-            if ready_to_settle and quiet_remaining <= 0:
-                return
-            deadline_remaining = deadline - now
-            if deadline_remaining <= 0:
-                break
-            self._activity_changed.clear()
-            wait_seconds = deadline_remaining
-            if ready_to_settle:
-                wait_seconds = min(wait_seconds, max(quiet_remaining, 0.001))
-            try:
-                await asyncio.wait_for(self._activity_changed.wait(), timeout=wait_seconds)
-            except TimeoutError:
-                pass
-        self._finalize_pending_submissions()
+        self._drain_deadline_monotonic = deadline
+        try:
+            while True:
+                now = time.monotonic()
+                quiet_remaining = self._last_activity_monotonic + quiet_seconds - now
+                messages_resolved = (
+                    self.current.request.kind == TrafficKind.BROADCAST_TEXT
+                    or self._direct_messages_resolved()
+                )
+                ready_to_settle = not self._pending_submissions and messages_resolved
+                if ready_to_settle and quiet_remaining <= 0:
+                    return
+                deadline_remaining = deadline - now
+                if deadline_remaining <= 0:
+                    break
+                self._activity_changed.clear()
+                wait_seconds = deadline_remaining
+                if ready_to_settle:
+                    wait_seconds = min(wait_seconds, max(quiet_remaining, 0.001))
+                try:
+                    await asyncio.wait_for(self._activity_changed.wait(), timeout=wait_seconds)
+                except TimeoutError:
+                    pass
+            self._finalize_pending_submissions()
+        finally:
+            self._drain_deadline_monotonic = None
 
     def _drain_windows(self) -> tuple[float, float]:
         if self.current is None:
@@ -1018,9 +1153,15 @@ class TrafficController:
         return quiet_seconds, min(MAX_DRAIN_SECONDS, max(quiet_seconds, deadline_seconds))
 
     def _direct_messages_resolved(self) -> bool:
+        return self._unresolved_direct_messages() == 0
+
+    def _unresolved_direct_messages(self) -> int:
         if self.current is None:
-            return True
+            return 0
+        if self.current.request.kind != TrafficKind.DIRECT_TEXT:
+            return 0
         acknowledgment_required = self.current.request.acknowledgment_requested
+        unresolved = 0
         for message in self.current.generated_messages:
             if message.submission_error is not None:
                 continue
@@ -1028,10 +1169,15 @@ class TrafficController:
                 continue
             delivered = message.destination_node in message.delivered_to
             if not message.submitted or not delivered:
-                return False
-            if acknowledgment_required and not message.acknowledged:
-                return False
-        return True
+                unresolved += 1
+            elif acknowledgment_required and not message.acknowledged:
+                unresolved += 1
+        return unresolved
+
+    def _drain_deadline_seconds_remaining(self) -> float | None:
+        if self._drain_deadline_monotonic is None:
+            return None
+        return max(0.0, self._drain_deadline_monotonic - time.monotonic())
 
     def _finalize_pending_submissions(self) -> None:
         for (source, _packet_id), generated in tuple(self._pending_submissions.items()):
@@ -1046,6 +1192,15 @@ class TrafficController:
         self._last_activity_monotonic = time.monotonic()
         self._activity_changed.set()
 
+    def _accepts_run_events(self, *, allow_failed: bool = False) -> bool:
+        states = {TrafficRunState.RUNNING, TrafficRunState.STOPPING}
+        if allow_failed:
+            states.add(TrafficRunState.FAILED)
+        return self._phase in {
+            TrafficRunPhase.GENERATING,
+            TrafficRunPhase.DRAINING,
+        } and self.state in states
+
     def _destination_for(
         self,
         request: TrafficRunRequest,
@@ -1054,14 +1209,51 @@ class TrafficController:
         randomizer: random.Random,
         round_robin: dict[str, int],
     ) -> str:
-        if request.kind == TrafficKind.BROADCAST_TEXT:
+        return self._choose_destination(
+            kind=request.kind,
+            destination_strategy=request.destination_strategy,
+            fixed_destination=request.fixed_destination,
+            source=source,
+            randomizer=randomizer,
+            round_robin=round_robin,
+        )
+
+    def _flow_destination_for(
+        self,
+        kind: TrafficKind,
+        flow: TrafficFlow,
+        source: str,
+        *,
+        randomizer: random.Random,
+        round_robin: dict[str, int],
+    ) -> str:
+        return self._choose_destination(
+            kind=kind,
+            destination_strategy=flow.destination_strategy,
+            fixed_destination=flow.fixed_destination,
+            source=source,
+            randomizer=randomizer,
+            round_robin=round_robin,
+        )
+
+    def _choose_destination(
+        self,
+        *,
+        kind: TrafficKind,
+        destination_strategy: DestinationStrategy,
+        fixed_destination: str | None,
+        source: str,
+        randomizer: random.Random,
+        round_robin: dict[str, int],
+    ) -> str:
+        if kind == TrafficKind.BROADCAST_TEXT:
             return "broadcast"
         candidates = [node.id for node in self._run_scenario.nodes if node.id != source]
-        if request.destination_strategy == DestinationStrategy.FIXED:
-            if request.fixed_destination is None:
+        if destination_strategy == DestinationStrategy.FIXED:
+            if fixed_destination is None:
                 raise RuntimeError("fixed destination was not validated")
-            return request.fixed_destination
-        if request.destination_strategy == DestinationStrategy.ROUND_ROBIN:
+            return fixed_destination
+        if destination_strategy == DestinationStrategy.ROUND_ROBIN:
             index = round_robin[source]
             round_robin[source] += 1
             return candidates[index % len(candidates)]
@@ -1073,41 +1265,43 @@ class TrafficController:
         if not await self._wait_for_active_finalization():
             return False
         self._finalization_done.clear()
+        self._phase = TrafficRunPhase.FINALIZING
         try:
             self._finalize_pending_submissions()
-            self.state = state
             current = self.current
-            current.state = state
-            current.finished_at = datetime.now(UTC)
-            current.requested = self._generated_count
-            current.submitted = self._submitted_count
-            current.submission_failed = self._submission_failed_count
-            current.transmitted = self._transmitted_count
-            current.delivered = self._unique_deliveries
             self._metrics = await asyncio.to_thread(self._final_metrics)
-            current.metrics = self._metrics
+            terminal = current.model_copy(deep=True)
+            terminal.state = state
+            terminal.finished_at = datetime.now(UTC)
+            terminal.requested = self._generated_count
+            terminal.submitted = self._submitted_count
+            terminal.submission_failed = self._submission_failed_count
+            terminal.transmitted = self._transmitted_count
+            terminal.delivered = self._unique_deliveries
+            terminal.metrics = self._metrics
             self._publish_metric_update(
                 self._summary_metrics(self._metrics).model_dump(mode="python", by_alias=True),
                 result="snapshot",
             )
             try:
-                frozen = await asyncio.to_thread(self._freeze_and_persist, current)
+                frozen = await asyncio.to_thread(self._freeze_and_persist, terminal)
             except Exception as exc:
-                self.state = TrafficRunState.FAILED
-                current.state = TrafficRunState.FAILED
+                terminal.state = TrafficRunState.FAILED
                 persistence_failure = f"result persistence failed: {exc}"
-                current.failure = (
-                    f"{current.failure}; {persistence_failure}"
-                    if current.failure
+                terminal.failure = (
+                    f"{terminal.failure}; {persistence_failure}"
+                    if terminal.failure
                     else persistence_failure
                 )
-                frozen = await asyncio.to_thread(current.model_copy, deep=True)
+                frozen = await asyncio.to_thread(terminal.model_copy, deep=True)
                 LOGGER.exception(
                     "traffic result persistence failed",
-                    extra={"traffic_run_id": current.run_id},
+                    extra={"traffic_run_id": terminal.run_id},
                 )
             self._frozen_result = frozen
             self.current = frozen
+            self.state = frozen.state
+            self._phase = TrafficRunPhase.TERMINAL
         finally:
             self._finalization_done.set()
         return True
@@ -1256,24 +1450,35 @@ class TrafficController:
     ) -> None:
         scenario = scenario_snapshot or self.scenario
         known = {node.id for node in scenario.nodes}
-        unknown_sources = set(request.source_nodes) - known
-        if unknown_sources:
-            raise ValueError(f"unknown traffic sources: {sorted(unknown_sources)}")
-        if len(set(request.source_nodes)) != len(request.source_nodes):
-            raise ValueError("traffic source nodes must be unique")
-        if (
-            request.kind == TrafficKind.DIRECT_TEXT
-            and request.destination_strategy == DestinationStrategy.FIXED
-            and request.fixed_destination is not None
-        ):
-            if request.fixed_destination not in known:
-                raise ValueError(f"unknown fixed destination: {request.fixed_destination}")
-            if request.fixed_destination in request.source_nodes:
-                raise ValueError("direct traffic destination cannot be one of its source nodes")
+        for flow in request.scheduling_flows():
+            unknown_sources = set(flow.source_nodes) - known
+            if unknown_sources:
+                raise ValueError(
+                    f"unknown traffic sources in flow {flow.name}: {sorted(unknown_sources)}"
+                )
+            if len(set(flow.source_nodes)) != len(flow.source_nodes):
+                raise ValueError(f"traffic source nodes in flow {flow.name} must be unique")
+            if (
+                request.kind == TrafficKind.DIRECT_TEXT
+                and flow.destination_strategy == DestinationStrategy.FIXED
+                and flow.fixed_destination is not None
+            ):
+                if flow.fixed_destination not in known:
+                    raise ValueError(
+                        f"unknown fixed destination in flow {flow.name}: {flow.fixed_destination}"
+                    )
+                if flow.fixed_destination in flow.source_nodes:
+                    raise ValueError(
+                        "direct traffic destination cannot be one of its source nodes "
+                        f"in flow {flow.name}"
+                    )
 
     @staticmethod
     def _maximum_sequence(request: TrafficRunRequest) -> int:
-        return len(request.source_nodes) * TrafficController._messages_per_source(request)
+        return sum(
+            len(flow.source_nodes) * TrafficController._messages_per_flow(request, flow)
+            for flow in request.scheduling_flows()
+        )
 
     @staticmethod
     def _messages_per_source(request: TrafficRunRequest) -> int:
@@ -1281,6 +1486,53 @@ class TrafficController:
             duration_seconds=request.duration_seconds,
             messages_per_minute=request.messages_per_minute,
         )
+
+    @staticmethod
+    def _messages_per_flow(request: TrafficRunRequest, flow: TrafficFlow) -> int:
+        return _messages_per_source(
+            duration_seconds=request.duration_seconds,
+            messages_per_minute=flow.messages_per_minute,
+        )
+
+    @staticmethod
+    def _source_offsets(request: TrafficRunRequest, interval: float) -> dict[str, float]:
+        return TrafficController._source_offsets_for(
+            request.source_nodes,
+            request.source_timing,
+            interval,
+            request.seed ^ SOURCE_TIMING_RNG_SALT,
+        )
+
+    @staticmethod
+    def _flow_source_offsets(
+        flow: TrafficFlow, interval: float, seed: int
+    ) -> dict[str, float]:
+        return TrafficController._source_offsets_for(
+            flow.source_nodes,
+            flow.source_timing,
+            interval,
+            seed,
+        )
+
+    @staticmethod
+    def _source_offsets_for(
+        source_nodes: list[str], timing: SourceTiming, interval: float, seed: int
+    ) -> dict[str, float]:
+        if timing == SourceTiming.ALIGNED:
+            return dict.fromkeys(source_nodes, 0.0)
+        if timing == SourceTiming.EVENLY_STAGGERED:
+            source_count = len(source_nodes)
+            return {
+                source: index * interval / source_count
+                for index, source in enumerate(source_nodes)
+            }
+        randomizer = random.Random(seed)
+        return {source: randomizer.random() * interval for source in source_nodes}
+
+    @staticmethod
+    def _flow_seed(run_seed: int, flow_name: str, salt: int) -> int:
+        name_seed = int.from_bytes(hashlib.sha256(flow_name.encode()).digest()[:8])
+        return run_seed ^ salt ^ name_seed
 
     def _allocate_packet_id(self, source: str, randomizer: random.Random) -> int:
         now = time.monotonic()

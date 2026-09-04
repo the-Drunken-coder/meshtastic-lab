@@ -221,6 +221,12 @@ function App() {
     });
   }, []);
 
+  const clearEventEvidence = useCallback((streamId: string | null = null) => {
+    eventStreamId.current = streamId;
+    latestEventSequence.current = 0;
+    setEvents([]);
+  }, []);
+
   const reconcileScenario = useCallback((nextScenario: Scenario, lifecycleState: Lifecycle["state"]) => {
     setScenarioEditor((current) => {
       const hasLocalEdits = Boolean(
@@ -324,6 +330,11 @@ function App() {
       });
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as PacketEvent;
+        if (event.eventType === "ui_events_dropped" && event.result === "stream-reset") {
+          clearEventEvidence(event.streamId);
+          refreshCore().catch(() => undefined);
+          return;
+        }
         acceptEvents([event], event.streamId);
         if (event.eventType === "ui_events_dropped") {
           refreshCore().catch(() => undefined);
@@ -341,7 +352,7 @@ function App() {
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [acceptEvents, refreshCore]);
+  }, [acceptEvents, clearEventEvidence, refreshCore]);
 
   useEffect(() => {
     let active = true;
@@ -410,6 +421,7 @@ function App() {
       if (command === "stop") await api.stop();
       if (command === "reset") {
         await api.reset();
+        clearEventEvidence();
         const updated = await api.scenario();
         acceptScenario(updated);
         setTrafficDraft((current) => trafficDraftForScenario(current, updated));

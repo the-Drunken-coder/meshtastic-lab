@@ -133,4 +133,12 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
   await page.getByRole("button", { name: "Stop", exact: true }).click();
   await expect(page.getByText("STOPPED", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".daemon-log")).toContainText("polled log sentinel");
+
+  await expect(page.locator(".evidence-table tbody tr").first()).not.toContainText(
+    "No packet events match these filters.",
+  );
+  await page.getByRole("button", { name: "Reset" }).click();
+  await expect(page.getByText("No packet events match these filters.")).toBeVisible();
+  const evidenceAfterReset = await request.get("/api/events?limit=500");
+  expect(await evidenceAfterReset.json()).toEqual([]);
 });

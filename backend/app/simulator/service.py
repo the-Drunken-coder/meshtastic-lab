@@ -382,8 +382,12 @@ class SimulatorService:
                 raise SimulationConflict("INVALID_LIFECYCLE_STATE", "reset is allowed only while stopped")
             self.scenario = default_scenario()
             self.supervisor.clear_archived_logs()
-            self.message = "Scenario reset to the five-node full mesh; saved runs were preserved"
+            self.message = (
+                "Scenario reset to the five-node full mesh; packet evidence and daemon logs "
+                "were cleared; saved runs were preserved"
+            )
             self._publish_lifecycle()
+            self.event_broker.clear()
             return CommandResult(commandId=str(uuid.uuid4()), state=self.state, detail=self.message)
 
     def replace_scenario(self, scenario: Scenario) -> Scenario:
