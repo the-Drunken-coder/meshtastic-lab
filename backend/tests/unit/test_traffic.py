@@ -142,6 +142,24 @@ def test_traffic_request_rejects_mixed_legacy_sources_and_named_flows() -> None:
         )
 
 
+def test_traffic_request_rejects_combined_flow_rate_above_per_source_cap() -> None:
+    with pytest.raises(ValueError, match="combined traffic flow rate exceeds 600"):
+        TrafficRunRequest(
+            flows=[
+                TrafficFlow(
+                    name="first",
+                    sourceNodes=["node-1"],
+                    messagesPerMinute=400,
+                ),
+                TrafficFlow(
+                    name="second",
+                    sourceNodes=["node-1"],
+                    messagesPerMinute=250,
+                ),
+            ]
+        )
+
+
 def test_source_timing_offsets_are_separate_and_deterministic(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     aligned = TrafficRunRequest(
@@ -533,7 +551,13 @@ async def test_broadcast_delivery_ratio_counts_messages_once(tmp_path: Path) -> 
     await controller._submit("node-1", "broadcast", FixedRandom())  # type: ignore[arg-type]
     received = _text_from_radio(run_id=run_id, sequence=1, packet_id=7, origin=1)
     await controller.handle_from_radio("node-2", received)
+    generated = controller.current.generated_messages[0] if controller.current is not None else None
+    assert generated is not None
+    first_delivery_latency = generated.latency_ms
+    assert first_delivery_latency is not None
+    generated.generated_monotonic -= 1
     await controller.handle_from_radio("node-3", received)
+    assert generated.latency_ms == first_delivery_latency
     live = controller.summary()
     assert live is not None
     assert live.metrics.median_latency_ms is not None
@@ -550,6 +574,7 @@ async def test_broadcast_delivery_ratio_counts_messages_once(tmp_path: Path) -> 
     assert result.metrics.delivery_ratio == 1
     assert result.metrics.receiver_deliveries == 2
     assert result.metrics.receivers_per_broadcast == {"1": 2}
+    assert result.generated_messages[0].latency_ms == first_delivery_latency
 
 
 @pytest.mark.asyncio

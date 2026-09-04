@@ -20,13 +20,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from backend.app.metrics import percentile
 from backend.app.models import RFSettings, TopologyPreset, apply_topology_preset, default_scenario
-from backend.app.traffic import TrafficRunRequest
+from backend.app.traffic import MAX_DRAIN_SECONDS, SourceTiming, TrafficRunRequest
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = ROOT / "data" / "experiments"
 BASE_URL = "http://127.0.0.1:8080"
 CONTAINER = "meshtastic-lab-meshtastic-lab-1"
 TERMINAL_TRAFFIC_STATES = {"COMPLETED", "FAILED", "CANCELLED"}
+TRAFFIC_WAIT_GRACE_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -273,8 +274,30 @@ async def export_result(client: httpx.AsyncClient, run_id: str) -> dict[str, Any
     return cast(dict[str, Any], response.json())
 
 
+def traffic_wait_deadline(request: dict[str, Any]) -> float:
+    validated = TrafficRunRequest.model_validate(request)
+    maximum_phase_offset = max(
+        (
+            0.0
+            if flow.source_timing == SourceTiming.ALIGNED
+            else 60 / flow.messages_per_minute
+        )
+        for flow in validated.scheduling_flows()
+    )
+    return (
+        validated.duration_seconds
+        + maximum_phase_offset
+        + MAX_DRAIN_SECONDS
+        + TRAFFIC_WAIT_GRACE_SECONDS
+    )
+
+
 def summarize_flows(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
     request = cast(dict[str, Any], result["request"])
+    acknowledgments_expected = (
+        request.get("kind") == "direct-text"
+        and bool(request.get("acknowledgmentRequested"))
+    )
     configured = request.get("flows") or [
         {
             "name": "default",
@@ -327,7 +350,7 @@ def summarize_flows(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "onTimeDeliveryRatio": (on_time_deliveries / requested_count if requested_count else None),
             "acknowledgmentSuccessRatio": (
                 sum(bool(message["acknowledged"]) for message in submitted) / submitted_count
-                if submitted_count
+                if acknowledgments_expected and submitted_count
                 else None
             ),
             "medianLatencyMs": percentile(latencies, 0.5),
@@ -346,8 +369,15 @@ async def run_experiment(
     started = time.monotonic()
     link_task = asyncio.create_task(apply_link_schedule(client, experiment.link_schedule, started))
     status_samples: list[dict[str, Any]] = []
-    _, samples, elapsed = await timed_resource_capture(wait_for_traffic(client, 420, status_samples))
-    await link_task
+    try:
+        _, samples, elapsed = await timed_resource_capture(
+            wait_for_traffic(client, traffic_wait_deadline(experiment.request), status_samples)
+        )
+        await link_task
+    except BaseException:
+        link_task.cancel()
+        await asyncio.gather(link_task, return_exceptions=True)
+        raise
     exported = await export_result(client, run_id)
     flows = summarize_flows(exported)
     artifact_name = experiment.name if experiment.repetitions == 1 else f"{experiment.name}-r{trial}"

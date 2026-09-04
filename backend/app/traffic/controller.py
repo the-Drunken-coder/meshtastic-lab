@@ -158,6 +158,18 @@ class TrafficRunRequest(BaseModel):
             raise ValueError("at least one traffic source or flow is required")
         if len({flow.name for flow in self.flows}) != len(self.flows):
             raise ValueError("traffic flow names must be unique")
+        source_rates: dict[str, float] = {}
+        for flow in self.flows:
+            for source in flow.source_nodes:
+                source_rates[source] = source_rates.get(source, 0.0) + flow.messages_per_minute
+        overloaded_sources = sorted(
+            source for source, rate in source_rates.items() if rate > 600
+        )
+        if overloaded_sources:
+            raise ValueError(
+                "combined traffic flow rate exceeds 600 messages per minute for source: "
+                f"{overloaded_sources[0]}"
+            )
         if self.kind == TrafficKind.DIRECT_TEXT:
             destinations = (
                 [
@@ -717,7 +729,8 @@ class TrafficController:
                 self._delivered_sequences.add(sequence)
                 self._unique_deliveries += 1
             latency_ms = (time.monotonic() - generated.generated_monotonic) * 1000
-            generated.latency_ms = latency_ms
+            if generated.latency_ms is None:
+                generated.latency_ms = latency_ms
             self._latencies_ms.append(latency_ms)
             self._live_latencies_ms.append(latency_ms)
             self._note_activity()

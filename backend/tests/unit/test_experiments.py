@@ -1,13 +1,22 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 import experiments.run_system_bench as system_bench
-from backend.app.traffic import TrafficController
+from backend.app.traffic import (
+    MAX_DRAIN_SECONDS,
+    SourceTiming,
+    TrafficController,
+    TrafficFlow,
+    TrafficRunRequest,
+)
 from experiments.run_system_bench import (
     Experiment,
     load_workload,
     summarize_flows,
     summarize_trials,
+    traffic_wait_deadline,
     workload_scenario,
 )
 
@@ -90,6 +99,107 @@ def test_flow_summary_keeps_uplink_and_downlink_results_separate() -> None:
     assert flows["telemetry-to-core"]["maximumLatencyMs"] == 1200
     assert flows["core-commands"]["admissionRatio"] == 0
     assert flows["core-commands"]["deliveryRatio"] == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "acknowledgment_requested"),
+    [("broadcast-text", True), ("direct-text", False)],
+)
+def test_flow_summary_omits_ack_ratio_when_acknowledgments_are_not_expected(
+    kind: str, acknowledgment_requested: bool
+) -> None:
+    destination = "broadcast" if kind == "broadcast-text" else "node-2"
+    request = TrafficRunRequest(
+        kind=kind,
+        sourceNodes=["node-1"],
+        fixedDestination="node-2" if kind == "direct-text" else None,
+        acknowledgmentRequested=acknowledgment_requested,
+    )
+    result = {
+        "request": request.model_dump(mode="json", by_alias=True),
+        "generatedMessages": [
+            {
+                "flow": "default",
+                "sourceNode": "node-1",
+                "destinationNode": destination,
+                "submitted": True,
+                "submissionError": None,
+                "transmitted": True,
+                "deliveredTo": ["node-2"],
+                "acknowledged": False,
+                "latencyMs": 100,
+            }
+        ],
+    }
+
+    assert summarize_flows(result)["default"]["acknowledgmentSuccessRatio"] is None
+
+
+def test_traffic_wait_deadline_covers_duration_phase_offset_and_drain() -> None:
+    request = TrafficRunRequest(
+        flows=[
+            TrafficFlow(
+                name="slow-jittered",
+                sourceNodes=["node-1"],
+                messagesPerMinute=0.1,
+                sourceTiming=SourceTiming.DETERMINISTIC_JITTER,
+            )
+        ],
+        durationSeconds=3600,
+    ).model_dump(mode="json", by_alias=True)
+
+    assert traffic_wait_deadline(request) == 3600 + 600 + MAX_DRAIN_SECONDS + 30
+
+
+@pytest.mark.asyncio
+async def test_failed_experiment_awaits_cancelled_link_schedule(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    link_started = asyncio.Event()
+    link_finished = asyncio.Event()
+
+    async def fake_link_schedule(*_args) -> None:
+        link_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            link_finished.set()
+
+    async def failing_wait(*_args):
+        await link_started.wait()
+        raise RuntimeError("traffic capture failed")
+
+    async def fake_resource_sampler(_samples, stop, _started) -> None:
+        await stop.wait()
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"runId": "failed-run"}
+
+    class FakeClient:
+        async def post(self, *_args, **_kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr(system_bench, "apply_link_schedule", fake_link_schedule)
+    monkeypatch.setattr(system_bench, "wait_for_traffic", failing_wait)
+    monkeypatch.setattr(system_bench, "sample_resources", fake_resource_sampler)
+    request = TrafficRunRequest(
+        sourceNodes=["node-1"],
+        durationSeconds=1,
+    ).model_dump(mode="json", by_alias=True)
+
+    with pytest.raises(RuntimeError, match="traffic capture failed"):
+        await system_bench.run_experiment(
+            FakeClient(),  # type: ignore[arg-type]
+            Experiment("cleanup", request),
+            tmp_path,
+            1,
+        )
+
+    assert link_finished.is_set()
 
 
 def test_trial_summary_reports_mixed_flow_timing() -> None:
