@@ -295,6 +295,45 @@ async def test_stop_bounds_wait_for_terminal_persistence(
     assert controller.result_is_finalized(result.run_id)
 
 
+@pytest.mark.asyncio
+async def test_late_finalization_does_not_publish_after_event_stream_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path, finalization_wait_seconds=0.01)
+    broker = controller.event_broker
+    metrics_started = threading.Event()
+    release_metrics = threading.Event()
+    final_metrics = controller._final_metrics
+
+    def blocking_final_metrics():
+        metrics_started.set()
+        if not release_metrics.wait(timeout=2):
+            raise RuntimeError("test did not release final metrics")
+        return final_metrics()
+
+    monkeypatch.setattr(controller, "_final_metrics", blocking_final_metrics)
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+    )
+    assert await asyncio.to_thread(metrics_started.wait, 1)
+
+    try:
+        assert await controller.stop() is False
+        broker.clear()
+    finally:
+        release_metrics.set()
+
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.state == TrafficRunState.COMPLETED
+    assert broker.recent() == []
+
+
 def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:
     scenario = default_scenario(2)
     controller = TrafficController(

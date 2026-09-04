@@ -9,6 +9,7 @@ import json
 import statistics
 import subprocess
 import time
+from collections import Counter
 from collections.abc import Awaitable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ BASE_URL = "http://127.0.0.1:8080"
 CONTAINER = "meshtastic-lab-meshtastic-lab-1"
 TERMINAL_TRAFFIC_STATES = {"COMPLETED", "FAILED", "CANCELLED"}
 TRAFFIC_WAIT_GRACE_SECONDS = 30.0
+DOCKER_STATS_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -105,38 +107,44 @@ def load_workload(path: Path) -> WorkloadDefinition:
 
 
 async def wait_for_state(client: httpx.AsyncClient, expected: str, deadline_seconds: float) -> dict[str, Any]:
-    deadline = time.monotonic() + deadline_seconds
     last: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        response = await client.get("/api/state")
-        response.raise_for_status()
-        last = response.json()
-        if last.get("state") == expected:
-            return last
-        if last.get("state") == "FAILED":
-            raise RuntimeError(f"simulation failed while waiting for {expected}: {last}")
-        await asyncio.sleep(0.5)
-    raise TimeoutError(f"timed out waiting for {expected}: {last}")
+    try:
+        async with asyncio.timeout(deadline_seconds):
+            while True:
+                response = await client.get("/api/state")
+                response.raise_for_status()
+                last = response.json()
+                if last.get("state") == expected:
+                    return last
+                if last.get("state") == "FAILED":
+                    raise RuntimeError(f"simulation failed while waiting for {expected}: {last}")
+                await asyncio.sleep(0.5)
+    except TimeoutError as exc:
+        raise TimeoutError(f"timed out waiting for {expected}: {last}") from exc
 
 
 async def sample_resources(samples: list[ResourceSample], stop: asyncio.Event, started: float) -> None:
     while not stop.is_set():
-        completed = await asyncio.to_thread(
-            subprocess.run,
-            [
-                "docker",
-                "stats",
-                "--no-stream",
-                "--format",
-                "{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}",
-                CONTAINER,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        fields = completed.stdout.strip().split("|")
-        if completed.returncode == 0 and len(fields) == 3:
+        try:
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "docker",
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}",
+                    CONTAINER,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=DOCKER_STATS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            completed = None
+        fields = completed.stdout.strip().split("|") if completed is not None else []
+        if completed is not None and completed.returncode == 0 and len(fields) == 3:
             samples.append(
                 ResourceSample(
                     monotonic_seconds=time.monotonic() - started,
@@ -236,34 +244,37 @@ async def apply_link_schedule(
 
 async def wait_for_traffic(
     client: httpx.AsyncClient,
+    run_id: str,
     deadline_seconds: float,
     samples: list[dict[str, Any]],
 ) -> dict[str, Any]:
     started = time.monotonic()
-    deadline = time.monotonic() + deadline_seconds
     last: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        response = await client.get("/api/traffic/runs/current")
-        response.raise_for_status()
-        last = response.json()
-        drain_remaining = last.get("drainDeadlineSecondsRemaining")
-        sample = {
-            "elapsedSeconds": round(time.monotonic() - started, 3),
-            "state": last.get("state"),
-            "phase": last.get("phase"),
-            "requested": last.get("requested"),
-            "submitted": last.get("submitted"),
-            "pendingFirmwareAdmissions": last.get("pendingFirmwareAdmissions"),
-            "unresolvedDirectMessages": last.get("unresolvedDirectMessages"),
-            "drainDeadlineSecondsRemaining": (
-                round(float(drain_remaining), 1) if drain_remaining is not None else None
-            ),
-        }
-        samples.append(sample)
-        if last.get("state") in TERMINAL_TRAFFIC_STATES:
-            return last
-        await asyncio.sleep(0.5)
-    raise TimeoutError(f"traffic did not finish: {last}")
+    try:
+        async with asyncio.timeout(deadline_seconds):
+            while True:
+                response = await client.get(f"/api/traffic/runs/{run_id}")
+                response.raise_for_status()
+                last = response.json()
+                drain_remaining = last.get("drainDeadlineSecondsRemaining")
+                sample = {
+                    "elapsedSeconds": round(time.monotonic() - started, 3),
+                    "state": last.get("state"),
+                    "phase": last.get("phase"),
+                    "requested": last.get("requested"),
+                    "submitted": last.get("submitted"),
+                    "pendingFirmwareAdmissions": last.get("pendingFirmwareAdmissions"),
+                    "unresolvedDirectMessages": last.get("unresolvedDirectMessages"),
+                    "drainDeadlineSecondsRemaining": (
+                        round(float(drain_remaining), 1) if drain_remaining is not None else None
+                    ),
+                }
+                samples.append(sample)
+                if last.get("state") in TERMINAL_TRAFFIC_STATES:
+                    return last
+                await asyncio.sleep(0.5)
+    except TimeoutError as exc:
+        raise TimeoutError(f"traffic run {run_id} did not finish: {last}") from exc
 
 
 async def export_result(client: httpx.AsyncClient, run_id: str) -> dict[str, Any]:
@@ -371,7 +382,12 @@ async def run_experiment(
     status_samples: list[dict[str, Any]] = []
     try:
         _, samples, elapsed = await timed_resource_capture(
-            wait_for_traffic(client, traffic_wait_deadline(experiment.request), status_samples)
+            wait_for_traffic(
+                client,
+                run_id,
+                traffic_wait_deadline(experiment.request),
+                status_samples,
+            )
         )
         await link_task
     except BaseException:
@@ -410,9 +426,16 @@ async def run_experiment(
 
 
 def summarize_trials(experiment: Experiment, artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    terminal_state_counts = Counter(
+        str(artifact.get("result", {}).get("state", "UNKNOWN")) for artifact in artifacts
+    )
+    completed_artifacts = [
+        artifact for artifact in artifacts if artifact.get("result", {}).get("state") == "COMPLETED"
+    ]
+
     def values(path: tuple[str, ...]) -> list[float]:
         selected: list[float] = []
-        for artifact in artifacts:
+        for artifact in completed_artifacts:
             value: Any = artifact
             for key in path:
                 if not isinstance(value, dict) or key not in value:
@@ -445,8 +468,12 @@ def summarize_trials(experiment: Experiment, artifacts: list[dict[str, Any]]) ->
     return {
         "name": experiment.name,
         "trials": len(artifacts),
+        "completedTrials": len(completed_artifacts),
+        "incompleteTrials": len(artifacts) - len(completed_artifacts),
+        "terminalStateCounts": dict(sorted(terminal_state_counts.items())),
         "failedReceptionMetricsCompleteTrials": sum(
-            bool(artifact["result"]["failedReceptionMetricsComplete"]) for artifact in artifacts
+            bool(artifact["result"]["failedReceptionMetricsComplete"])
+            for artifact in completed_artifacts
         ),
         "sourceTiming": source_timing,
         "submitted": distribution(("result", "submitted")),
@@ -470,7 +497,11 @@ def summarize_trials(experiment: Experiment, artifacts: list[dict[str, Any]]) ->
                 "maximumLatencyMs": distribution(("flows", name, "maximumLatencyMs")),
             }
             for name in sorted(
-                {name for artifact in artifacts for name in cast(dict[str, Any], artifact["flows"])}
+                {
+                    name
+                    for artifact in completed_artifacts
+                    for name in cast(dict[str, Any], artifact["flows"])
+                }
             )
         },
     }
@@ -748,6 +779,11 @@ async def main(
     summary["finishedAt"] = datetime.now(UTC).isoformat()
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"results: {output_dir}")
+    incomplete_trials = sum(aggregate["incompleteTrials"] for aggregate in summary["aggregates"])
+    if incomplete_trials:
+        raise RuntimeError(
+            f"{incomplete_trials} traffic trial(s) did not complete; results: {output_dir}"
+        )
 
 
 if __name__ == "__main__":

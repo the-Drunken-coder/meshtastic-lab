@@ -1,4 +1,7 @@
 import asyncio
+import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -152,6 +155,82 @@ def test_traffic_wait_deadline_covers_duration_phase_offset_and_drain() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resource_sampler_bounds_stalled_docker_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invoked = threading.Event()
+    observed_timeouts: list[float] = []
+
+    def stalled_docker_stats(command: list[str], **kwargs: object) -> None:
+        timeout = float(kwargs["timeout"])
+        observed_timeouts.append(timeout)
+        invoked.set()
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(system_bench.subprocess, "run", stalled_docker_stats)
+    stop = asyncio.Event()
+    samples: list[system_bench.ResourceSample] = []
+    sampler = asyncio.create_task(system_bench.sample_resources(samples, stop, time.monotonic()))
+
+    assert await asyncio.to_thread(invoked.wait, 1)
+    stop.set()
+    await asyncio.wait_for(sampler, timeout=2)
+
+    assert observed_timeouts == [system_bench.DOCKER_STATS_TIMEOUT_SECONDS]
+    assert samples == []
+
+
+@pytest.mark.asyncio
+async def test_traffic_waiter_polls_the_created_run() -> None:
+    requested_paths: list[str] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, str]:
+            return {"state": "COMPLETED", "phase": "TERMINAL"}
+
+    class FakeClient:
+        async def get(self, path: str) -> FakeResponse:
+            requested_paths.append(path)
+            return FakeResponse()
+
+    samples: list[dict[str, object]] = []
+    result = await system_bench.wait_for_traffic(
+        FakeClient(),  # type: ignore[arg-type]
+        "created-run",
+        1,
+        samples,  # type: ignore[arg-type]
+    )
+
+    assert result["state"] == "COMPLETED"
+    assert requested_paths == ["/api/traffic/runs/created-run"]
+
+
+@pytest.mark.asyncio
+async def test_polling_deadlines_include_pending_http_requests() -> None:
+    class SlowClient:
+        async def get(self, _path: str) -> None:
+            await asyncio.sleep(1)
+
+    with pytest.raises(TimeoutError, match="timed out waiting for STOPPED"):
+        await system_bench.wait_for_state(
+            SlowClient(),  # type: ignore[arg-type]
+            "STOPPED",
+            0.01,
+        )
+
+    with pytest.raises(TimeoutError, match="traffic run slow-run did not finish"):
+        await system_bench.wait_for_traffic(
+            SlowClient(),  # type: ignore[arg-type]
+            "slow-run",
+            0.01,
+            [],
+        )
+
+
+@pytest.mark.asyncio
 async def test_failed_experiment_awaits_cancelled_link_schedule(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -208,6 +287,7 @@ def test_trial_summary_reports_mixed_flow_timing() -> None:
     experiment = Experiment("core-telemetry", request)
     artifact = {
         "result": {
+            "state": "COMPLETED",
             "failedReceptionMetricsComplete": True,
             "submitted": 0,
             "delivered": 0,
@@ -221,6 +301,56 @@ def test_trial_summary_reports_mixed_flow_timing() -> None:
     summary = summarize_trials(experiment, [artifact])
 
     assert summary["sourceTiming"] == "mixed"
+
+
+def test_trial_summary_excludes_incomplete_runs_from_distributions() -> None:
+    experiment = Experiment("completion-aware", {"sourceTiming": "aligned"})
+
+    def artifact(state: str, delivery_ratio: float) -> dict[str, object]:
+        return {
+            "result": {
+                "state": state,
+                "failedReceptionMetricsComplete": True,
+                "submitted": 1,
+                "delivered": 1,
+                "metrics": {"receiverDeliveryRatio": delivery_ratio},
+            },
+            "elapsedSeconds": 1,
+            "resources": {},
+            "flows": {
+                "default": {
+                    "requested": 1,
+                    "deliveryRatio": delivery_ratio,
+                }
+            },
+        }
+
+    summary = summarize_trials(
+        experiment,
+        [
+            artifact("COMPLETED", 0.5),  # type: ignore[arg-type]
+            artifact("CANCELLED", 1.0),  # type: ignore[arg-type]
+            artifact("FAILED", 1.0),  # type: ignore[arg-type]
+        ],
+    )
+
+    assert summary["completedTrials"] == 1
+    assert summary["incompleteTrials"] == 2
+    assert summary["terminalStateCounts"] == {
+        "CANCELLED": 1,
+        "COMPLETED": 1,
+        "FAILED": 1,
+    }
+    assert summary["receiverDeliveryRatio"] == {
+        "median": 0.5,
+        "minimum": 0.5,
+        "maximum": 0.5,
+    }
+    assert summary["flows"]["default"]["deliveryRatio"] == {
+        "median": 0.5,
+        "minimum": 0.5,
+        "maximum": 0.5,
+    }
 
 
 def test_fresh_trials_restart_native_firmware_for_each_repetition(

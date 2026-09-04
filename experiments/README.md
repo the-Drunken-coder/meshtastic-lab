@@ -44,6 +44,10 @@ separately, samples container resources, and leaves the simulation stopped. Use
 `--trials 1-10` to override the workload's repetition count. Repetitions do not
 share firmware queues, NodeDB state, routes, or timers.
 
+The aggregate records completed, failed, and cancelled trial counts. Statistical
+distributions include only completed trials, and the command exits unsuccessfully
+after writing all artifacts if any trial did not complete.
+
 The matrix covers 10-node `LONG_FAST` fan-out and contention, a 1,000-message
 ingest stress, the equivalent `SHORT_FAST` contention case, a four-hop direct
 route, partition and recovery, and a hidden-terminal collision. Baseline and

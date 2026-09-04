@@ -368,6 +368,7 @@ class TrafficController:
         self._finalization_wait_timed_out = False
         self._phase = TrafficRunPhase.TERMINAL
         self._drain_deadline_monotonic: float | None = None
+        self._event_stream_id: str | None = None
         self._run_scenario = scenario
         self._sequence = 0
         self._messages_by_packet: dict[tuple[int, int], GeneratedMessage] = {}
@@ -432,6 +433,7 @@ class TrafficController:
                 f"{marker_size} for sequence {max_sequence}"
             )
         self._reset_accumulators()
+        self._event_stream_id = self.event_broker.stream_id
         baseline = self._normalize_failed_reception_sample(failed_reception_baseline)
         self._latest_failed_receptions.update(baseline.totals)
         self._latest_duplicate_receptions.update(baseline.duplicate_totals)
@@ -1446,7 +1448,7 @@ class TrafficController:
         *,
         result: str = "update",
     ) -> None:
-        if self.current is None:
+        if self.current is None or self._event_stream_id != self.event_broker.stream_id:
             return
         self.event_broker.publish(
             PacketEvent(

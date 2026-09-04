@@ -189,6 +189,7 @@ function App() {
   const [events, setEvents] = useState<PacketEvent[]>([]);
   const latestEventSequence = useRef(0);
   const eventStreamId = useRef<string | null>(null);
+  const eventEvidenceGeneration = useRef(0);
   const [streamConnected, setStreamConnected] = useState(false);
   const [nodeFilter, setNodeFilter] = useState("");
   const [eventFilter, setEventFilter] = useState("");
@@ -222,6 +223,7 @@ function App() {
   }, []);
 
   const clearEventEvidence = useCallback((streamId: string | null = null) => {
+    eventEvidenceGeneration.current += 1;
     eventStreamId.current = streamId;
     latestEventSequence.current = 0;
     setEvents([]);
@@ -258,6 +260,7 @@ function App() {
     let active = true;
     let retryTimer: number | undefined;
     const loadInitialState = () => {
+      const requestedEvidenceGeneration = eventEvidenceGeneration.current;
       Promise.all([
         api.capabilities(),
         api.lifecycle(),
@@ -272,7 +275,9 @@ function App() {
           setLifecycle(nextLifecycle);
           acceptScenario(nextScenario);
           setNodes(nextNodes);
-          acceptEvents(eventHistory.events, eventHistory.streamId);
+          if (eventEvidenceGeneration.current === requestedEvidenceGeneration) {
+            acceptEvents(eventHistory.events, eventHistory.streamId);
+          }
           setTraffic(nextTraffic);
           setTrafficDraft((current) => trafficDraftForScenario(current, nextScenario));
           setNotice(null);
