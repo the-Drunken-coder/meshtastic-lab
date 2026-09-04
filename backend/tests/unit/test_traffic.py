@@ -14,8 +14,11 @@ from backend.app.models import Scenario, default_scenario
 from backend.app.traffic import (
     DestinationStrategy,
     FailedReceptionSample,
+    SourceTiming,
     TrafficController,
+    TrafficFlow,
     TrafficKind,
+    TrafficRunPhase,
     TrafficRunRequest,
     TrafficRunResult,
     TrafficRunState,
@@ -88,6 +91,103 @@ async def test_deterministic_traffic_schedule_and_persistence(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_named_flows_run_concurrently_with_independent_rates(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    request = TrafficRunRequest(
+        kind=TrafficKind.DIRECT_TEXT,
+        flows=[
+            TrafficFlow(
+                name="telemetry-to-core",
+                sourceNodes=["node-2", "node-3"],
+                fixedDestination="node-1",
+                messagesPerMinute=600,
+                sourceTiming=SourceTiming.EVENLY_STAGGERED,
+            ),
+            TrafficFlow(
+                name="core-commands",
+                sourceNodes=["node-1"],
+                destinationStrategy=DestinationStrategy.DETERMINISTIC_RANDOM,
+                messagesPerMinute=300,
+            ),
+        ],
+        payloadBytes=64,
+        durationSeconds=0.11,
+        acknowledgmentRequested=True,
+        seed=7,
+    )
+
+    controller.start(request)
+    result = await controller.wait(deadline_seconds=2)
+    by_flow = {
+        flow: [message for message in result.generated_messages if message.flow == flow]
+        for flow in ("telemetry-to-core", "core-commands")
+    }
+    assert result.requested == 5
+    assert len(by_flow["telemetry-to-core"]) == 4
+    assert {message.source_node for message in by_flow["telemetry-to-core"]} == {
+        "node-2",
+        "node-3",
+    }
+    assert {message.destination_node for message in by_flow["telemetry-to-core"]} == {"node-1"}
+    assert len(by_flow["core-commands"]) == 1
+    assert by_flow["core-commands"][0].source_node == "node-1"
+    assert by_flow["core-commands"][0].destination_node in {"node-2", "node-3"}
+
+
+def test_traffic_request_rejects_mixed_legacy_sources_and_named_flows() -> None:
+    with pytest.raises(ValueError, match="either flows or sourceNodes"):
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            flows=[TrafficFlow(name="extra", sourceNodes=["node-2"])],
+        )
+
+
+def test_traffic_request_rejects_combined_flow_rate_above_per_source_cap() -> None:
+    with pytest.raises(ValueError, match="combined traffic flow rate exceeds 600"):
+        TrafficRunRequest(
+            flows=[
+                TrafficFlow(
+                    name="first",
+                    sourceNodes=["node-1"],
+                    messagesPerMinute=400,
+                ),
+                TrafficFlow(
+                    name="second",
+                    sourceNodes=["node-1"],
+                    messagesPerMinute=250,
+                ),
+            ]
+        )
+
+
+def test_source_timing_offsets_are_separate_and_deterministic(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    aligned = TrafficRunRequest(
+        sourceNodes=["node-1", "node-2", "node-3"],
+        sourceTiming=SourceTiming.ALIGNED,
+    )
+    staggered = aligned.model_copy(update={"source_timing": SourceTiming.EVENLY_STAGGERED})
+    jittered = aligned.model_copy(
+        update={"source_timing": SourceTiming.DETERMINISTIC_JITTER, "seed": 17}
+    )
+
+    assert controller._source_offsets(aligned, 6) == {
+        "node-1": 0,
+        "node-2": 0,
+        "node-3": 0,
+    }
+    assert controller._source_offsets(staggered, 6) == {
+        "node-1": 0,
+        "node-2": 2,
+        "node-3": 4,
+    }
+    first_jitter = controller._source_offsets(jittered, 6)
+    assert first_jitter == controller._source_offsets(jittered, 6)
+    assert len(set(first_jitter.values())) == 3
+    assert all(0 <= offset < 6 for offset in first_jitter.values())
+
+
+@pytest.mark.asyncio
 async def test_stop_waits_for_terminal_persistence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -115,6 +215,27 @@ async def test_stop_waits_for_terminal_persistence(
         )
     )
     assert await asyncio.to_thread(persistence_started.wait, 1)
+    active_summary = controller.summary()
+    assert active_summary is not None
+    assert active_summary.state == TrafficRunState.RUNNING
+    assert active_summary.phase == TrafficRunPhase.FINALIZING
+    assert not controller.result_is_finalized(active_summary.run_id)
+    assert not (tmp_path / f"{active_summary.run_id}.json").exists()
+    assert controller.current is not None
+    generated = controller.current.generated_messages[0]
+    assert (
+        controller.record_rf_transmission(
+            "node-1",
+            _rf_packet(
+                run_id=active_summary.run_id,
+                sequence=generated.sequence,
+                packet_id=generated.packet_id,
+                origin=1,
+            ),
+            10,
+        )
+        is None
+    )
 
     stop_task = asyncio.create_task(controller.stop())
     await asyncio.sleep(0)
@@ -127,7 +248,12 @@ async def test_stop_waits_for_terminal_persistence(
     result = controller.result()
     assert result is not None
     assert result.state == TrafficRunState.COMPLETED
+    assert result.metrics.rf_transmissions == 0
     assert persist_calls == 1
+    terminal_summary = controller.summary()
+    assert terminal_summary is not None
+    assert terminal_summary.phase == TrafficRunPhase.TERMINAL
+    assert (tmp_path / f"{result.run_id}.json").is_file()
 
 
 @pytest.mark.asyncio
@@ -167,6 +293,45 @@ async def test_stop_bounds_wait_for_terminal_persistence(
     result = await controller.wait(deadline_seconds=2)
     assert result.state == TrafficRunState.COMPLETED
     assert controller.result_is_finalized(result.run_id)
+
+
+@pytest.mark.asyncio
+async def test_late_finalization_does_not_publish_after_event_stream_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path, finalization_wait_seconds=0.01)
+    broker = controller.event_broker
+    metrics_started = threading.Event()
+    release_metrics = threading.Event()
+    final_metrics = controller._final_metrics
+
+    def blocking_final_metrics():
+        metrics_started.set()
+        if not release_metrics.wait(timeout=2):
+            raise RuntimeError("test did not release final metrics")
+        return final_metrics()
+
+    monkeypatch.setattr(controller, "_final_metrics", blocking_final_metrics)
+    controller.start(
+        TrafficRunRequest(
+            sourceNodes=["node-1"],
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+        )
+    )
+    assert await asyncio.to_thread(metrics_started.wait, 1)
+
+    try:
+        assert await controller.stop() is False
+        broker.clear()
+    finally:
+        release_metrics.set()
+
+    result = await controller.wait(deadline_seconds=2)
+
+    assert result.state == TrafficRunState.COMPLETED
+    assert broker.recent() == []
 
 
 def test_payload_is_validated_after_identifier_encoding(tmp_path: Path) -> None:
@@ -425,7 +590,13 @@ async def test_broadcast_delivery_ratio_counts_messages_once(tmp_path: Path) -> 
     await controller._submit("node-1", "broadcast", FixedRandom())  # type: ignore[arg-type]
     received = _text_from_radio(run_id=run_id, sequence=1, packet_id=7, origin=1)
     await controller.handle_from_radio("node-2", received)
+    generated = controller.current.generated_messages[0] if controller.current is not None else None
+    assert generated is not None
+    first_delivery_latency = generated.latency_ms
+    assert first_delivery_latency is not None
+    generated.generated_monotonic -= 1
     await controller.handle_from_radio("node-3", received)
+    assert generated.latency_ms == first_delivery_latency
     live = controller.summary()
     assert live is not None
     assert live.metrics.median_latency_ms is not None
@@ -442,6 +613,7 @@ async def test_broadcast_delivery_ratio_counts_messages_once(tmp_path: Path) -> 
     assert result.metrics.delivery_ratio == 1
     assert result.metrics.receiver_deliveries == 2
     assert result.metrics.receivers_per_broadcast == {"1": 2}
+    assert result.generated_messages[0].latency_ms == first_delivery_latency
 
 
 @pytest.mark.asyncio
@@ -473,6 +645,7 @@ async def test_direct_relay_observation_counts_only_destination_delivery(tmp_pat
     result = controller.result()
     assert result is not None
     assert result.generated_messages[0].delivered_to == ["node-3"]
+    assert result.generated_messages[0].latency_ms is not None
     assert result.metrics.receiver_deliveries == 1
     assert result.metrics.receiver_delivery_ratio == 1
     assert result.metrics.median_latency_ms is not None
@@ -588,6 +761,15 @@ async def test_repeat_seed_keeps_destinations_stable_with_bounded_packet_quarant
     retained = sum(len(values) for values in controller._quarantined_packet_ids.values())
     assert retained == len(first.generated_messages)
     assert retained <= 36_000 * len(request.source_nodes)
+
+    jittered = request.model_copy(
+        update={"source_timing": SourceTiming.DETERMINISTIC_JITTER}
+    )
+    controller.start(jittered)
+    third = await controller.wait(deadline_seconds=2)
+    assert [message.destination_node for message in first.generated_messages] == [
+        message.destination_node for message in third.generated_messages
+    ]
 
 
 @pytest.mark.asyncio
@@ -1146,6 +1328,49 @@ async def test_missing_final_local_stats_do_not_fail_run(tmp_path: Path) -> None
     assert result.failed_reception_metrics_complete is False
     assert result.missing_local_stats_nodes == ["node-2"]
     assert (tmp_path / f"{run_id}.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_live_summary_explains_direct_drain(tmp_path: Path) -> None:
+    scenario = default_scenario(2)
+    gateways = {node.id: FakeGateway(node.id) for node in scenario.nodes}
+    controller = TrafficController(
+        scenario=scenario,
+        gateways=gateways,  # type: ignore[arg-type]
+        hardware_ids={"node-1": 1, "node-2": 2},
+        event_broker=EventBroker(),
+        results_root=tmp_path,
+        settle_seconds=0.2,
+    )
+    for gateway in gateways.values():
+        gateway.controller = controller
+    controller.start(
+        TrafficRunRequest(
+            kind=TrafficKind.DIRECT_TEXT,
+            sourceNodes=["node-1"],
+            fixedDestination="node-2",
+            messagesPerMinute=600,
+            durationSeconds=0.01,
+            payloadBytes=64,
+            acknowledgmentRequested=True,
+        )
+    )
+    await gateways["node-1"].sent_event.wait()
+    for _ in range(10):
+        summary = controller.summary()
+        if summary is not None and summary.phase == TrafficRunPhase.DRAINING:
+            break
+        await asyncio.sleep(0)
+
+    summary = controller.summary()
+    assert summary is not None
+    assert summary.phase == TrafficRunPhase.DRAINING
+    assert summary.pending_firmware_admissions == 0
+    assert summary.unresolved_direct_messages == 1
+    assert summary.drain_deadline_seconds_remaining is not None
+    assert 0 < summary.drain_deadline_seconds_remaining <= 0.2
+
+    await controller.stop()
 
 
 @pytest.mark.asyncio

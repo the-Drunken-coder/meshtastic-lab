@@ -211,3 +211,42 @@ async def test_drop_notices_do_not_starve_buffered_events() -> None:
     assert buffered_event.mesh_packet_id == 3
     assert second_notice.event_type == EventType.UI_EVENTS_DROPPED
     assert second_notice.detail == "1 UI events dropped because the client was slow"
+
+
+@pytest.mark.asyncio
+async def test_clear_discards_history_and_restarts_connected_subscriptions() -> None:
+    broker = EventBroker(stream_id="old-stream")
+    broker.publish(
+        PacketEvent(
+            monotonicSeconds=1,
+            eventType=EventType.RF_TRANSMIT,
+            meshPacketId=1,
+        )
+    )
+
+    async with broker.subscribe() as subscription:
+        broker.publish(
+            PacketEvent(
+                monotonicSeconds=2,
+                eventType=EventType.RF_TRANSMIT,
+                meshPacketId=2,
+            )
+        )
+        broker.clear()
+        reset = await asyncio.wait_for(subscription.next(), timeout=1)
+        next_event = broker.publish(
+            PacketEvent(
+                monotonicSeconds=3,
+                eventType=EventType.RF_TRANSMIT,
+                meshPacketId=3,
+            )
+        )
+        delivered = await asyncio.wait_for(subscription.next(), timeout=1)
+
+    assert broker.stream_id != "old-stream"
+    assert reset.event_type == EventType.UI_EVENTS_DROPPED
+    assert reset.result == "stream-reset"
+    assert reset.stream_id == broker.stream_id
+    assert broker.recent() == [next_event]
+    assert next_event.sequence == 1
+    assert delivered == next_event

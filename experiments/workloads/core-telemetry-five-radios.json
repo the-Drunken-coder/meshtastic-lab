@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "name": "core-telemetry-five-radios",
+  "scenario": {
+    "nodeCount": 5,
+    "topology": "full-mesh",
+    "region": "US",
+    "frequencySlot": 20,
+    "hopLimit": 4,
+    "freshState": true
+  },
+  "modemPresets": [
+    "SHORT_TURBO",
+    "SHORT_FAST",
+    "SHORT_SLOW",
+    "MEDIUM_FAST",
+    "MEDIUM_SLOW",
+    "LONG_TURBO",
+    "LONG_FAST"
+  ],
+  "traffic": {
+    "kind": "direct-text",
+    "payloadBytes": 64,
+    "durationSeconds": 60,
+    "acknowledgmentRequested": true,
+    "flows": [
+      {
+        "name": "telemetry-to-core",
+        "sourceNodes": ["node-2", "node-3", "node-4", "node-5"],
+        "destinationStrategy": "fixed",
+        "fixedDestination": "node-1",
+        "messagesPerMinute": 12,
+        "sourceTiming": "evenly-staggered"
+      },
+      {
+        "name": "core-commands",
+        "sourceNodes": ["node-1"],
+        "destinationStrategy": "deterministic-random",
+        "messagesPerMinute": 4,
+        "sourceTiming": "aligned"
+      }
+    ],
+    "seed": 20260904
+  },
+  "trials": 1
+}

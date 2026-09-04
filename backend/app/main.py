@@ -271,6 +271,8 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
                     )
                 for event in history.events:
                     await websocket.send_json(event.model_dump(mode="json", by_alias=True))
+                sent_stream_id = history.stream_id
+                sent_sequence = history.latest_sequence
                 while True:
                     event_task = asyncio.create_task(subscription.next())
                     receive_task = asyncio.create_task(websocket.receive())
@@ -287,9 +289,13 @@ def create_app(service: SimulatorService | None = None) -> FastAPI:
                             return
                     if event_task in done:
                         event = event_task.result()
-                        if event.sequence and event.sequence <= history.latest_sequence:
+                        if event.stream_id != sent_stream_id:
+                            sent_stream_id = event.stream_id
+                            sent_sequence = 0
+                        if event.sequence and event.sequence <= sent_sequence:
                             continue
                         await websocket.send_json(event.model_dump(mode="json", by_alias=True))
+                        sent_sequence = max(sent_sequence, event.sequence)
         except WebSocketDisconnect:
             return
         except asyncio.CancelledError:

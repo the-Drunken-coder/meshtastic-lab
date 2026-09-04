@@ -107,6 +107,7 @@ export interface Metrics {
 }
 
 export type TrafficState = "IDLE" | "RUNNING" | "STOPPING" | "COMPLETED" | "CANCELLED" | "FAILED";
+export type TrafficPhase = "GENERATING" | "DRAINING" | "FINALIZING" | "TERMINAL";
 
 interface IdleTrafficResult {
   state: "IDLE";
@@ -124,6 +125,7 @@ interface TrafficRunSummary {
   schemaVersion: 1;
   runId: string;
   state: Exclude<TrafficState, "IDLE">;
+  phase: TrafficPhase;
   request: TrafficRequest;
   scenarioSnapshot: Scenario;
   firmwareCommit: string;
@@ -144,6 +146,9 @@ interface TrafficRunSummary {
   delivered: number;
   failedReceptionMetricsComplete: boolean;
   missingLocalStatsNodes: string[];
+  pendingFirmwareAdmissions: number;
+  unresolvedDirectMessages: number;
+  drainDeadlineSecondsRemaining: number | null;
   metrics: Metrics;
   failure: string | null;
 }
@@ -196,6 +201,15 @@ export interface TrafficRequest {
   payloadBytes: number;
   durationSeconds: number;
   acknowledgmentRequested: boolean;
+  sourceTiming?: "aligned" | "evenly-staggered" | "deterministic-jitter";
+  flows?: Array<{
+    name: string;
+    sourceNodes: string[];
+    destinationStrategy: "fixed" | "round-robin" | "deterministic-random";
+    fixedDestination?: string;
+    messagesPerMinute: number;
+    sourceTiming: "aligned" | "evenly-staggered" | "deterministic-jitter";
+  }>;
   seed: number;
 }
 

@@ -92,7 +92,7 @@ def configure_and_verify_node(
         commit_edit = admin_pb2.AdminMessage(commit_edit_settings=True)
         _send_admin_and_wait(interface, commit_edit, deadline)
     finally:
-        interface.close()
+        _close_interface(interface)
 
     verified = _connect(hostname, port, time.monotonic() + deadline_seconds)
     try:
@@ -104,7 +104,7 @@ def configure_and_verify_node(
             verified.localNode.reboot(1)
         return result
     finally:
-        verified.close()
+        _close_interface(verified)
 
 
 def verify_node(
@@ -123,7 +123,7 @@ def verify_node(
     try:
         return _verify(interface, node=node, rf=rf, channel=channel)
     finally:
-        interface.close()
+        _close_interface(interface)
 
 
 def request_node_info(
@@ -143,7 +143,23 @@ def request_node_info(
         )
         return int(packet.id)
     finally:
-        interface.close()
+        _close_interface(interface)
+
+
+def _close_interface(interface: tcp_interface.TCPInterface) -> None:
+    """Close without letting a late config-complete frame start a heartbeat."""
+
+    _disable_late_heartbeat(interface)
+    interface.close()
+
+
+def _disable_late_heartbeat(interface: tcp_interface.TCPInterface) -> None:
+    # The pinned client can finish decoding config after close begins. Its
+    # config-complete handler starts a heartbeat immediately, after TCPInterface
+    # has half-closed the socket, which emits a BrokenPipe traceback for an
+    # expected one-shot disconnect. Disable only that late per-instance action;
+    # close still cancels any heartbeat that was already scheduled.
+    interface._startHeartbeat = lambda: None
 
 
 def _connect(hostname: str, port: int, deadline: float) -> tcp_interface.TCPInterface:
@@ -152,11 +168,20 @@ def _connect(hostname: str, port: int, deadline: float) -> tcp_interface.TCPInte
     while time.monotonic() < deadline:
         attempted = True
         try:
-            return tcp_interface.TCPInterface(
+            interface = tcp_interface.TCPInterface(
                 hostname=hostname,
                 portNumber=port,
                 timeout=max(1, int(deadline - time.monotonic())),
+                connectNow=False,
             )
+            _disable_late_heartbeat(interface)
+            try:
+                interface.connect()
+                interface.waitForConfig()
+            except Exception:
+                _close_interface(interface)
+                raise
+            return interface
         except Exception as exc:
             last_error = exc
             time.sleep(0.1)

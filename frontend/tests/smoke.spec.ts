@@ -133,4 +133,90 @@ test("five-node line lifecycle and traffic", async ({ page, request }) => {
   await page.getByRole("button", { name: "Stop", exact: true }).click();
   await expect(page.getByText("STOPPED", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".daemon-log")).toContainText("polled log sentinel");
+
+  await expect(page.locator(".evidence-table tbody tr").first()).not.toContainText(
+    "No packet events match these filters.",
+  );
+  await page.getByRole("button", { name: "Reset" }).click();
+  await expect(page.getByText("No packet events match these filters.")).toBeVisible();
+  const evidenceAfterReset = await request.get("/api/events?limit=500");
+  expect(await evidenceAfterReset.json()).toEqual([]);
+});
+
+test("reset invalidates delayed initial packet history", async ({ page, request }) => {
+  await request.post("/api/simulation/stop");
+  const initialReset = await request.post("/api/simulation/reset");
+  expect(initialReset.ok()).toBeTruthy();
+
+  let markHistoryRequested!: () => void;
+  const historyRequested = new Promise<void>((resolve) => {
+    markHistoryRequested = resolve;
+  });
+  let releaseHistory!: () => void;
+  const historyReleased = new Promise<void>((resolve) => {
+    releaseHistory = resolve;
+  });
+  const webSocketOpened = new Promise<void>((resolve) => {
+    page.once("websocket", () => resolve());
+  });
+
+  await page.route(
+    (url) => url.pathname === "/api/events/history",
+    async (route) => {
+      markHistoryRequested();
+      await historyReleased;
+      await route.fulfill({
+        status: 200,
+        json: {
+          schemaVersion: 1,
+          streamId: "stale-stream",
+          streamChanged: false,
+          events: [
+            {
+              schemaVersion: 1,
+              streamId: "stale-stream",
+              sequence: 1,
+              utcTimestamp: "2026-01-01T00:00:00Z",
+              monotonicSeconds: 1,
+              eventType: "traffic",
+              transmitter: "node-1",
+              intendedDestination: "broadcast",
+              receiver: null,
+              receiverSet: [],
+              meshPacketId: 1,
+              trafficRunId: "old-run",
+              trafficSequence: 1,
+              hopLimit: null,
+              hopStart: null,
+              rssiDbm: null,
+              snrDb: null,
+              portNumber: null,
+              packetLength: null,
+              airtimeMs: null,
+              metricUpdate: {},
+              result: "stale-before-reset",
+              detail: null,
+            },
+          ],
+          firstAvailableSequence: 1,
+          latestSequence: 1,
+          historyGap: false,
+          hasMore: false,
+        },
+      });
+    },
+  );
+
+  const navigation = page.goto("/");
+  await historyRequested;
+  await webSocketOpened;
+  await page.waitForTimeout(100);
+  const externalReset = await request.post("/api/simulation/reset");
+  expect(externalReset.ok()).toBeTruthy();
+  await page.waitForTimeout(100);
+  releaseHistory();
+  await navigation;
+
+  await expect(page.getByText("No packet events match these filters.")).toBeVisible();
+  await expect(page.getByText("stale-before-reset")).toHaveCount(0);
 });

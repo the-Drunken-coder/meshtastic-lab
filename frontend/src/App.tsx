@@ -189,6 +189,7 @@ function App() {
   const [events, setEvents] = useState<PacketEvent[]>([]);
   const latestEventSequence = useRef(0);
   const eventStreamId = useRef<string | null>(null);
+  const eventEvidenceGeneration = useRef(0);
   const [streamConnected, setStreamConnected] = useState(false);
   const [nodeFilter, setNodeFilter] = useState("");
   const [eventFilter, setEventFilter] = useState("");
@@ -219,6 +220,13 @@ function App() {
     setEvents((current) => {
       return mergeEvents(streamChanged ? [] : current, matchingEvents);
     });
+  }, []);
+
+  const clearEventEvidence = useCallback((streamId: string | null = null) => {
+    eventEvidenceGeneration.current += 1;
+    eventStreamId.current = streamId;
+    latestEventSequence.current = 0;
+    setEvents([]);
   }, []);
 
   const reconcileScenario = useCallback((nextScenario: Scenario, lifecycleState: Lifecycle["state"]) => {
@@ -252,6 +260,7 @@ function App() {
     let active = true;
     let retryTimer: number | undefined;
     const loadInitialState = () => {
+      const requestedEvidenceGeneration = eventEvidenceGeneration.current;
       Promise.all([
         api.capabilities(),
         api.lifecycle(),
@@ -266,7 +275,9 @@ function App() {
           setLifecycle(nextLifecycle);
           acceptScenario(nextScenario);
           setNodes(nextNodes);
-          acceptEvents(eventHistory.events, eventHistory.streamId);
+          if (eventEvidenceGeneration.current === requestedEvidenceGeneration) {
+            acceptEvents(eventHistory.events, eventHistory.streamId);
+          }
           setTraffic(nextTraffic);
           setTrafficDraft((current) => trafficDraftForScenario(current, nextScenario));
           setNotice(null);
@@ -324,6 +335,11 @@ function App() {
       });
       socket.addEventListener("message", (message) => {
         const event = JSON.parse(String(message.data)) as PacketEvent;
+        if (event.eventType === "ui_events_dropped" && event.result === "stream-reset") {
+          clearEventEvidence(event.streamId);
+          refreshCore().catch(() => undefined);
+          return;
+        }
         acceptEvents([event], event.streamId);
         if (event.eventType === "ui_events_dropped") {
           refreshCore().catch(() => undefined);
@@ -341,7 +357,7 @@ function App() {
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [acceptEvents, refreshCore]);
+  }, [acceptEvents, clearEventEvidence, refreshCore]);
 
   useEffect(() => {
     let active = true;
@@ -410,6 +426,7 @@ function App() {
       if (command === "stop") await api.stop();
       if (command === "reset") {
         await api.reset();
+        clearEventEvidence();
         const updated = await api.scenario();
         acceptScenario(updated);
         setTrafficDraft((current) => trafficDraftForScenario(current, updated));
