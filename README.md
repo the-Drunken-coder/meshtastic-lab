@@ -1,5 +1,7 @@
 # Meshtastic Lab
 
+For the current evidence map, project boundaries and continuation state, see [project context](docs/project-context.md).
+
 Meshtastic Lab is a firmware-in-the-loop network simulator for controlled Meshtastic experiments. One container runs 2 to 10 isolated native firmware processes, a standard Client API gateway for each node, a deterministic directed-link RF medium, a typed API, and the web experiment console.
 
 The firmware still creates, encrypts, queues, retries, floods, relays, acknowledges, and suppresses packets. Meshtastic Lab only decides which configured receivers hear each emitted RF frame. It answers how the pinned firmware behaves under an explicit connectivity graph and traffic pattern. It does not predict outdoor range or model terrain.
